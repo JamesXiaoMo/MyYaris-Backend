@@ -1,0 +1,21 @@
+[Unit]
+Description=MyYaris Navigation Backend Service
+After=network.target tailscaled.service
+
+[Service]
+Type=simple
+User=myyaris-user
+WorkingDirectory=/path/to/user/桌面/MyYaris/backend
+ExecStart=/path/to/user/桌面/MyYaris/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/path/to/user/桌面/MyYaris/backend/.env
+
+# Basic sandboxing
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/path/to/user/.local/share/myyaris /path/to/user/桌面/MyYaris/backend
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+from app.config import settings
+from app.providers.base import (
+    BaseASRProvider,
+    BaseMapsProvider,
+    BaseNLPProvider,
+    ProviderNotConfiguredError,
+)
+from app.providers.mock_providers import (
+    MockASRProvider,
+    MockMapsProvider,
+    MockNLPProvider,
+)
+
+
+def get_asr_provider() -> BaseASRProvider:
+    if settings.ASR_PROVIDER == "mock" or settings.ALLOW_MOCK_FALLBACK:
+        return MockASRProvider()
+    raise ProviderNotConfiguredError("ASR provider is not configured.")
+
+
+def get_nlp_provider() -> BaseNLPProvider:
+    if settings.NLP_PROVIDER == "mock" or settings.ALLOW_MOCK_FALLBACK:
+        return MockNLPProvider()
+    raise ProviderNotConfiguredError("NLP provider is not configured.")
+
+
+def get_maps_provider() -> BaseMapsProvider:
+    if settings.MAPS_PROVIDER == "mock" or settings.ALLOW_MOCK_FALLBACK:
+        return MockMapsProvider()
+    raise ProviderNotConfiguredError("Maps provider is not configured.")
