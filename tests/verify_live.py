@@ -119,6 +119,57 @@ async def run_integration_scenario():
         assert unauth_ack.status_code == 403
         print("    -> OK: Car token unauthorized to ack other device's task (403 Forbidden)")
 
+        # 10. Test route without destination parameter (avoids selecting origin as destination)
+        print("[10] Testing route link without destination parameter ...")
+        route_url = "https://www.google.com/maps/dir/35.6812,139.7671/35.6586,139.7454/data=!4m2!4m1!3e0"
+        route_res = await client.post(
+            "/destinations",
+            json={"input_type": "share_link", "url": route_url, "target_device_id": "car_p3pro"},
+            headers=headers_phone,
+        )
+        assert route_res.status_code == 200
+        assert route_res.json()["status"] == "needs_clarification"
+        assert route_res.json()["task_id"] is None
+        assert "路线导航链接" in route_res.json()["clarification_question"]
+        print("    -> OK: Route link without destination required clarification without selecting origin")
+
+        # 11. Test ll + q (explicit destination pin in query despite ll map center)
+        print("[11] Testing ll + q explicit coordinate resolution ...")
+        ll_q_url = "https://maps.google.com/?ll=35.6812,139.7671&q=35.6586,139.7454"
+        ll_q_res = await client.post(
+            "/destinations",
+            json={"input_type": "share_link", "url": ll_q_url, "target_device_id": "car_p3pro"},
+            headers=headers_phone,
+        )
+        assert ll_q_res.status_code == 200
+        assert ll_q_res.json()["status"] == "resolved"
+        assert ll_q_res.json()["task_id"] is not None
+        assert abs(ll_q_res.json()["candidates"][0]["latitude"] - 35.6586) < 1e-4
+        print(f"    -> OK: Resolved explicit destination {ll_q_res.json()['candidates'][0]['latitude']}, {ll_q_res.json()['candidates'][0]['longitude']}")
+
+        # 12. Test integer coordinates in direct coords payload and in map URL
+        print("[12] Testing integer coordinates handling ...")
+        int_res = await client.post(
+            "/destinations",
+            json={"input_type": "coords", "coordinate": {"latitude": 35, "longitude": 139}, "target_device_id": "car_p3pro"},
+            headers=headers_phone,
+        )
+        assert int_res.status_code == 200
+        assert int_res.json()["status"] == "resolved"
+        assert int_res.json()["candidates"][0]["latitude"] == 35.0
+        assert int_res.json()["candidates"][0]["longitude"] == 139.0
+
+        int_url_res = await client.post(
+            "/destinations",
+            json={"input_type": "share_link", "url": "https://maps.google.com/?q=35,139", "target_device_id": "car_p3pro"},
+            headers=headers_phone,
+        )
+        assert int_url_res.status_code == 200
+        assert int_url_res.json()["status"] == "resolved"
+        assert int_url_res.json()["candidates"][0]["latitude"] == 35.0
+        assert int_url_res.json()["candidates"][0]["longitude"] == 139.0
+        print("    -> OK: Integer coordinates supported across direct payload and map URLs")
+
     print("\n>>> All live API scenarios passed successfully! <<<\n")
 
 

@@ -112,3 +112,157 @@ def test_unknown_text_does_not_fabricate_coordinates(client, phone_headers):
     assert data["status"] == "needs_clarification"
     assert len(data["candidates"]) == 0
     assert data["task_id"] is None
+
+
+def test_integer_coordinates_via_payload(client, phone_headers):
+    payload = {
+        "input_type": "coords",
+        "coordinate": {
+            "latitude": 35,
+            "longitude": 139,
+            "coord_system": "wgs84",
+        },
+        "target_device_id": "car_p3pro",
+    }
+    response = client.post("/destinations", json=payload, headers=phone_headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "resolved"
+    assert data["task_id"] is not None
+    assert len(data["candidates"]) == 1
+    assert data["candidates"][0]["latitude"] == 35.0
+    assert data["candidates"][0]["longitude"] == 139.0
+
+
+def test_share_link_ll_only_rejected_as_clarification(client, phone_headers):
+    # Parameter ll alone represents center, NOT destination
+    url = "https://maps.google.com/?ll=35.6812,139.7671&z=15"
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "needs_clarification"
+    assert data["task_id"] is None
+    assert len(data["candidates"]) == 0
+    assert "视野中心" in data["clarification_question"]
+
+
+def test_share_link_ll_with_explicit_q_resolves(client, phone_headers):
+    # Parameter ll present as viewport, but q has explicit pinpoint coordinates
+    url = "https://maps.google.com/?ll=35.6812,139.7671&q=35.6586,139.7454"
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "resolved"
+    assert data["task_id"] is not None
+    assert abs(data["candidates"][0]["latitude"] - 35.6586) < 1e-4
+    assert abs(data["candidates"][0]["longitude"] - 139.7454) < 1e-4
+
+    # Integer coordinates in q
+    url_int = "https://maps.google.com/?ll=36,140&q=35,139"
+    resp_int = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url_int, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp_int.status_code == 200
+    data_int = resp_int.json()
+    assert data_int["status"] == "resolved"
+    assert data_int["candidates"][0]["latitude"] == 35.0
+    assert data_int["candidates"][0]["longitude"] == 139.0
+
+
+def test_share_link_route_with_destination_resolves(client, phone_headers):
+    # Route link with explicit destination coordinates
+    url = "https://www.google.com/maps/dir/?api=1&origin=35.6812,139.7671&destination=35.6586,139.7454"
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "resolved"
+    assert data["task_id"] is not None
+    assert abs(data["candidates"][0]["latitude"] - 35.6586) < 1e-4
+    assert abs(data["candidates"][0]["longitude"] - 139.7454) < 1e-4
+
+    # Route with daddr integer coordinates
+    url_daddr = "https://maps.google.com/?saddr=35.6812,139.7671&daddr=35,139"
+    resp_daddr = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url_daddr, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp_daddr.status_code == 200
+    data_daddr = resp_daddr.json()
+    assert data_daddr["status"] == "resolved"
+    assert data_daddr["candidates"][0]["latitude"] == 35.0
+    assert data_daddr["candidates"][0]["longitude"] == 139.0
+
+
+def test_share_link_route_without_destination_rejected_as_clarification(client, phone_headers):
+    # Route link with coordinates in path/protobuf but lacking explicit destination parameter
+    # System MUST NOT pick the origin (first coordinate pair) as destination!
+    url = "https://www.google.com/maps/dir/35.6812,139.7671/35.6586,139.7454/data=!4m2!4m1!3e0"
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "needs_clarification"
+    assert data["task_id"] is None
+    assert len(data["candidates"]) == 0
+    assert "路线导航链接" in data["clarification_question"]
+
+
+def test_share_link_multiple_locations_rejected_as_clarification(client, phone_headers):
+    # Multiple distinct protobuf coordinates in URL
+    url = "https://www.google.com/maps/data=!3d35.1!4d139.1!3d35.2!4d139.2"
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "needs_clarification"
+    assert data["task_id"] is None
+    assert len(data["candidates"]) == 0
+    assert "多个地点坐标" in data["clarification_question"]
+
+
+def test_share_link_exhausted_hops_returns_failed(client, phone_headers, monkeypatch):
+    import httpx
+
+    class FakeResponse:
+        def __init__(self, status_code, headers, url):
+            self.status_code = status_code
+            self.headers = headers
+            self.url = url
+            self.is_redirect = True
+
+    async def fake_head(self, url, headers=None):
+        return FakeResponse(302, {"location": "https://maps.google.com/loop_next"}, url)
+
+    monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
+
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": "https://maps.google.com/loop_start", "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "failed"
+    assert "重定向跳数过多" in data["error_message"]
+

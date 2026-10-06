@@ -150,7 +150,15 @@ async def create_destination_request(
             db.commit()
             raise HTTPException(status_code=400, detail=f"SSRF security violation: {e}")
 
-        # 1. Unambiguous destination coordinates extracted
+        # 1. Error during resolution (e.g. redirect hops exhausted)
+        if resolution.error:
+            parse_request.status = "failed"
+            parse_request.error_message = resolution.error
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
+
+        # 2. Unambiguous destination coordinates extracted
         if resolution.candidate:
             cand = Candidate(
                 candidate_id=str(uuid.uuid4()),
@@ -180,7 +188,27 @@ async def create_destination_request(
             db.refresh(parse_request)
             return _build_query_response(parse_request)
 
-        # 2. Viewport-only center URL (camera position, not destination)
+        # 3. Route link without unambiguous destination parameter (avoid guessing origin as destination)
+        if resolution.is_route_ambiguous:
+            parse_request.status = "needs_clarification"
+            parse_request.clarification_question = (
+                "所分享链接为路线导航链接，且未包含明确终点坐标参数（为避免误将出发地设为终点，系统不予自动猜选）。请直接分享终点地点的图钉链接或明确坐标。"
+            )
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
+
+        # 4. Multiple distinct coordinates found without explicit destination
+        if resolution.has_multiple_locations:
+            parse_request.status = "needs_clarification"
+            parse_request.clarification_question = (
+                "所分享链接包含多个地点坐标且无法确认最终目的地。请单独分享目的地图钉或直接输入明确经纬度。"
+            )
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
+
+        # 5. Viewport-only center URL (camera position, not destination)
         if resolution.is_viewport_only:
             parse_request.status = "needs_clarification"
             parse_request.clarification_question = (
@@ -190,7 +218,7 @@ async def create_destination_request(
             db.refresh(parse_request)
             return _build_query_response(parse_request)
 
-        # 3. Place name extracted from URL but no coordinates
+        # 6. Place name extracted from URL but no coordinates
         if resolution.place_name:
             try:
                 maps = get_maps_provider()
@@ -223,7 +251,7 @@ async def create_destination_request(
                 db.refresh(parse_request)
                 return _build_query_response(parse_request)
 
-        # 4. Fallback when neither coordinates nor place name could be resolved
+        # 7. Fallback when neither coordinates nor place name could be resolved
         parse_request.status = "needs_clarification"
         parse_request.clarification_question = (
             "未能从该地图链接提取有效目的地坐标。请尝试直接在地图上放置图钉后分享，或输入明确经纬度。"
