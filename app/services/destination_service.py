@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.providers.base import PlaceCandidateItem, ProviderNotConfiguredError, SSRFSecurityError
 from app.providers.google_maps_parser import resolve_and_parse_map_url
-from app.providers.plus_code_parser import parse_plus_code
+from app.providers.plus_code_parser import resolve_plus_code
 from app.providers.provider_factory import get_maps_provider, get_nlp_provider
 from app.repositories.models import Candidate, ParseRequest, Task, utc_now
 from app.schemas.destination import (
@@ -141,23 +141,25 @@ async def create_destination_request(
         return _build_query_response(parse_request)
 
     elif req.input_type == DestinationInputType.PLUS_CODE:
-        result = parse_plus_code(req.plus_code or "", req.reference_coordinate)
+        results = await resolve_plus_code(req.plus_code or "", req.reference_coordinate)
+        result = results[0]
         if result.error:
             parse_request.status = "failed"
             parse_request.error_message = result.error
-        elif result.question and result.latitude is None:
+        elif result.latitude is None:
             parse_request.status = "needs_clarification"
             parse_request.clarification_question = result.question
         else:
-            cand = Candidate(
-                candidate_id=str(uuid.uuid4()), request_id=request_id,
-                title=f"Plus Code {result.full_code}",
-                address="Plus Code 编码区域中心（并非原始图钉的无限精度坐标）",
-                latitude=result.latitude, longitude=result.longitude,
-                coord_system="wgs84", source="plus_code",
-            )
-            db.add(cand)
-            if result.question:
+            for item in results:
+                cand = Candidate(
+                    candidate_id=str(uuid.uuid4()), request_id=request_id,
+                    title=f"Plus Code {item.full_code}",
+                    address=item.address or "Plus Code 编码区域中心（并非原始图钉的无限精度坐标）",
+                    latitude=item.latitude, longitude=item.longitude,
+                    coord_system="wgs84", source="plus_code",
+                )
+                db.add(cand)
+            if result.question or len(results) > 1:
                 parse_request.status = "needs_clarification"
                 parse_request.clarification_question = result.question
             else:

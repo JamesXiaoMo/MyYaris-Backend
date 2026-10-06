@@ -65,3 +65,66 @@ def test_plus_code_retry_idempotent(client, phone_headers):
     first = submit(client, phone_headers, **fields).json()
     second = submit(client, phone_headers, **fields).json()
     assert first['task_id'] == second['task_id']
+
+
+def mock_locality(monkeypatch, refs):
+    from app.config import settings
+    from app.providers import nominatim_provider
+    monkeypatch.setattr(settings, 'MAPS_PROVIDER', 'nominatim')
+    class Provider:
+        async def search(self, text, *, locality_only=False):
+            assert locality_only
+            return refs
+    monkeypatch.setattr(nominatim_provider, 'get_nominatim_provider', lambda: Provider())
+
+
+def locality_ref(lat=34.42, lon=132.74, address='東広島市, 広島県, 日本'):
+    from app.providers.base import PlaceCandidateItem
+    return PlaceCandidateItem(title='城市参照', address=address, latitude=lat, longitude=lon)
+
+
+def test_google_copied_city_prefecture_auto_resolves(client, phone_headers, monkeypatch):
+    mock_locality(monkeypatch, [locality_ref()])
+    data = submit(client, phone_headers, plus_code='CPF8+Q7 东广岛市 广岛县').json()
+    assert data['status'] == 'resolved'
+    assert data['task_id']
+    assert '8Q6JCPF8+Q7' in data['candidates'][0]['title']
+    assert abs(data['candidates'][0]['latitude'] - 34.4244375) < 1e-8
+
+
+def test_fuzzy_wrong_prefecture_no_dispatch(client, phone_headers, monkeypatch):
+    mock_locality(monkeypatch, [locality_ref(address='東広島市, 岡山県, 日本')])
+    data = submit(client, phone_headers, plus_code='CPF8+Q7 东广岛市 广岛县').json()
+    assert data['status'] == 'needs_clarification'
+    assert not data['candidates']
+    assert not data['task_id']
+
+
+def test_ambiguous_city_candidates_not_auto_sent(client, phone_headers, monkeypatch):
+    mock_locality(monkeypatch, [locality_ref(), locality_ref(lat=35.42)])
+    data = submit(client, phone_headers, plus_code='CPF8+Q7 东广岛市 广岛县').json()
+    assert data['status'] == 'needs_clarification'
+    assert len(data['candidates']) == 2
+    assert not data['task_id']
+
+
+def test_same_cell_references_deduplicated(client, phone_headers, monkeypatch):
+    mock_locality(monkeypatch, [locality_ref(), locality_ref(lat=34.43)])
+    data = submit(client, phone_headers, plus_code='CPF8+Q7 東広島市 広島県').json()
+    assert data['status'] == 'resolved'
+    assert len(data['candidates']) == 1
+
+
+def test_city_only_needs_confirmation(client, phone_headers, monkeypatch):
+    mock_locality(monkeypatch, [locality_ref()])
+    data = submit(client, phone_headers, plus_code='CPF8+Q7 東広島市').json()
+    assert data['status'] == 'needs_clarification'
+    assert len(data['candidates']) == 1
+    assert not data['task_id']
+
+
+def test_city_lookup_unavailable_no_task(client, phone_headers, monkeypatch):
+    mock_locality(monkeypatch, [])
+    data = submit(client, phone_headers, plus_code='CPF8+Q7 东广岛市 广岛县').json()
+    assert data['status'] == 'needs_clarification'
+    assert not data['task_id']

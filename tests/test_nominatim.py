@@ -314,3 +314,21 @@ def test_regression_direct_coordinates_and_protections(client, phone_headers):
     assert vp_resp.json()["task_id"] is None
     assert len(vp_resp.json()["candidates"]) == 0
     assert "视野中心" in vp_resp.json()["clarification_question"]
+
+
+@pytest.mark.asyncio
+async def test_locality_search_filters_poi_and_uses_separate_cache(monkeypatch):
+    provider = NominatimMapsProvider(rate_limiter=NominatimRateLimiter(0.001))
+    calls = []
+    async def mock_get(self, url, params=None, headers=None):
+        calls.append(params.copy())
+        return httpx.Response(200, json=[
+            {'lat':'34.42','lon':'132.74','name':'東広島市','display_name':'東広島市, 広島県, 日本', 'addresstype':'city'},
+            {'lat':'34.42','lon':'132.74','name':'商店','display_name':'商店, 東広島市, 広島県, 日本','addresstype':'shop'},
+        ], request=httpx.Request('GET',url))
+    monkeypatch.setattr(httpx.AsyncClient, 'get', mock_get)
+    assert len(await provider.search('东广岛市 广岛县')) == 2
+    assert len(await provider.search('东广岛市 广岛县', locality_only=True)) == 1
+    assert calls[-1]['featureType'] == 'city'
+    assert len(await provider.search('东广岛市 广岛县', locality_only=True)) == 1
+    assert len(calls) == 2

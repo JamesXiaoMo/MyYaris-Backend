@@ -184,13 +184,14 @@ class NominatimMapsProvider(BaseMapsProvider):
         query: str,
         lat: Optional[float] = None,
         lon: Optional[float] = None,
+        *, locality_only: bool = False,
     ) -> List[PlaceCandidateItem]:
         if not query or not query.strip():
             return []
 
         raw_query = query.strip()
         norm_query = normalize_japanese_address(raw_query)
-        cache_key = norm_query.lower()
+        cache_key = ("locality:" if locality_only else "") + norm_query.lower()
 
         # 1. Check in-memory cache
         if cache_key in self._cache:
@@ -223,7 +224,10 @@ class NominatimMapsProvider(BaseMapsProvider):
 
         # 3. Leader executes the request pipeline
         try:
-            results = await self._execute_search(norm_query, raw_query)
+            if locality_only:
+                results = await self._query_nominatim_api(norm_query, locality_only=True)
+            else:
+                results = await self._execute_search(norm_query, raw_query)
             self._cache[cache_key] = (time.time(), results)
             if future_to_await and not future_to_await.done():
                 future_to_await.set_result(results)
@@ -259,7 +263,7 @@ class NominatimMapsProvider(BaseMapsProvider):
 
         return []
 
-    async def _query_nominatim_api(self, term: str) -> List[PlaceCandidateItem]:
+    async def _query_nominatim_api(self, term: str, *, locality_only: bool = False) -> List[PlaceCandidateItem]:
         # Enforce strict 1 req/s rate limit before network dispatch
         await self.rate_limiter.acquire()
 
@@ -276,6 +280,10 @@ class NominatimMapsProvider(BaseMapsProvider):
             "accept-language": "ja,en",
         }
 
+        if locality_only:
+            params["featureType"] = "city"
+            params["limit"] = "10"
+
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.get(self.base_url, params=params, headers=headers)
@@ -288,7 +296,7 @@ class NominatimMapsProvider(BaseMapsProvider):
                     return []
 
                 candidates: list[PlaceCandidateItem] = []
-                for item in data[:3]:
+                for item in data[:10 if locality_only else 3]:
                     try:
                         lat = float(item["lat"])
                         lon = float(item["lon"])
@@ -300,6 +308,11 @@ class NominatimMapsProvider(BaseMapsProvider):
                     item_type = item.get("type", "place")
                     addresstype = item.get("addresstype", item_type)
                     category = item.get("category", "")
+
+                    if locality_only and addresstype not in {"city", "town", "village", "municipality"}:
+                        continue
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                        continue
 
                     is_area = (
                         addresstype in AREA_TYPES
