@@ -1,7 +1,10 @@
 import json
-from typing import Optional
+import math
+import re
+from typing import Optional, Tuple
 import uuid
 from fastapi import HTTPException, status
+from openlocationcode import openlocationcode as olc
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.providers.base import PlaceCandidateItem, ProviderNotConfiguredError, SSRFSecurityError
@@ -19,6 +22,37 @@ from app.schemas.destination import (
 from app.services.task_service import create_task_for_place
 
 
+def parse_strict_coordinates(text: str) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
+    """Strictly parse complete latitude, longitude from text.
+
+    Supports:
+    - Decimal, positive/negative signs
+    - Comma (,), Chinese full-width comma (，), whitespace, newline separators
+    - Strictly matches the full string (no partial matches inside messy text or URLs)
+    - Validates finite numbers and latitude [-90, 90], longitude [-180, 180]
+    - Does NOT guess or swap coordinate order
+    """
+    if not text or not isinstance(text, str):
+        return None, "输入内容为空。"
+    cleaned = text.strip()
+    pattern = r"^\s*([+-]?\d+(?:\.\d+)?)\s*(?:[,，\s]|\r?\n)\s*([+-]?\d+(?:\.\d+)?)\s*$"
+    m = re.match(pattern, cleaned)
+    if not m:
+        return None, "未能匹配完整经纬度格式。"
+    try:
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+    except (ValueError, TypeError):
+        return None, "经纬度数值解析失败。"
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return None, "经纬度必须为有限数值。"
+    if not (-90.0 <= lat <= 90.0):
+        return None, f"纬度 {lat} 超出有效范围 [-90, 90]（请确认输入顺序为：纬度在前、经度在后，系统不会自动调换顺序）。"
+    if not (-180.0 <= lon <= 180.0):
+        return None, f"经度 {lon} 超出有效范围 [-180, 180]。"
+    return (lat, lon), None
+
+
 def _to_candidate_out(c: Candidate) -> CandidateOut:
     return CandidateOut(
         candidate_id=c.candidate_id,
@@ -33,11 +67,29 @@ def _to_candidate_out(c: Candidate) -> CandidateOut:
 
 
 def _build_query_response(req: ParseRequest) -> DestinationQueryResponse:
+    # Build human-friendly message for client / iPhone Shortcuts
+    if req.status == "resolved" and req.task_id:
+        if req.candidates:
+            cand = req.candidates[0]
+            if cand.source == "coords" or "经纬度" in cand.title:
+                msg = f"已成功解析坐标 [纬度 {cand.latitude:.6f}, 经度 {cand.longitude:.6f}]，任务已发送到车机待处理。"
+            else:
+                msg = f"已成功解析「{cand.title}」，任务已发送到车机待处理。"
+        else:
+            msg = "目的地已解析成功，任务已发送到车机待处理。"
+    elif req.status == "needs_clarification":
+        msg = req.clarification_question or "输入需要进一步确认，请提供更明确的地点信息。"
+    elif req.status == "failed":
+        msg = req.error_message or "目的地解析失败，请检查输入格式。"
+    else:
+        msg = "正在解析处理中。"
+
     return DestinationQueryResponse(
         request_id=req.request_id,
         idempotency_key=req.idempotency_key,
         source=req.source,
         status=req.status,
+        message=msg,
         transcribed_text=req.transcribed_text,
         candidates=[_to_candidate_out(c) for c in req.candidates],
         clarification_question=req.clarification_question,
@@ -103,7 +155,115 @@ async def create_destination_request(
     if not target_device:
         target_device = settings.DEFAULT_CAR_DEVICE_ID
 
-    if req.input_type == DestinationInputType.COORDS:
+    if req.input_type == DestinationInputType.AUTO:
+        raw_text = (req.text or "").strip()
+        if not raw_text and req.coordinate:
+            coords = (req.coordinate.latitude, req.coordinate.longitude)
+            coords_err = None
+        else:
+            if not raw_text:
+                parse_request.status = "failed"
+                parse_request.error_message = "Missing text input for auto destination resolution."
+                db.commit()
+                raise HTTPException(status_code=400, detail="Missing text for auto input.")
+            coords, coords_err = parse_strict_coordinates(raw_text)
+
+        # 1. Check if strictly valid coordinates
+        if coords is not None:
+            lat, lon = coords
+            candidate_id = str(uuid.uuid4())
+            cand = Candidate(
+                candidate_id=candidate_id,
+                request_id=request_id,
+                title="指定经纬度目的地",
+                address=f"经度: {lon:.6f}, 纬度: {lat:.6f}",
+                latitude=lat,
+                longitude=lon,
+                coord_system="wgs84",
+                source="coords",
+            )
+            db.add(cand)
+
+            task = await create_task_for_place(
+                db=db,
+                device_id=target_device,
+                title=cand.title,
+                address=cand.address,
+                latitude=cand.latitude,
+                longitude=cand.longitude,
+                coord_system=cand.coord_system,
+                request_id=request_id,
+            )
+            parse_request.task_id = task.task_id
+            parse_request.status = "resolved"
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
+
+        # If coordinates format matched partially but failed range / finiteness check
+        if coords_err and ("超出有效范围" in coords_err or "有限数值" in coords_err):
+            parse_request.status = "needs_clarification"
+            parse_request.clarification_question = coords_err
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
+
+        # 2. Check if valid Plus Code format
+        norm_val = raw_text.replace("＋", "+").strip()
+        code_part = norm_val.split(maxsplit=1)[0].upper()
+        if olc.isValid(code_part):
+            results = await resolve_plus_code(raw_text, req.reference_coordinate)
+            result = results[0]
+            if result.error:
+                parse_request.status = "failed"
+                parse_request.error_message = result.error
+            elif result.latitude is None:
+                parse_request.status = "needs_clarification"
+                parse_request.clarification_question = result.question
+            else:
+                for item in results:
+                    cand = Candidate(
+                        candidate_id=str(uuid.uuid4()),
+                        request_id=request_id,
+                        title=f"Plus Code {item.full_code}",
+                        address=item.address or "Plus Code 编码区域中心（并非原始图钉的无限精度坐标）",
+                        latitude=item.latitude,
+                        longitude=item.longitude,
+                        coord_system="wgs84",
+                        source="plus_code",
+                    )
+                    db.add(cand)
+                if result.question or len(results) > 1:
+                    parse_request.status = "needs_clarification"
+                    parse_request.clarification_question = result.question
+                else:
+                    task = await create_task_for_place(
+                        db=db,
+                        device_id=target_device,
+                        title=cand.title,
+                        address=cand.address,
+                        latitude=cand.latitude,
+                        longitude=cand.longitude,
+                        coord_system="wgs84",
+                        request_id=request_id,
+                    )
+                    parse_request.task_id = task.task_id
+                    parse_request.status = "resolved"
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
+
+        # 3. Neither valid coordinates nor valid Plus Code
+        parse_request.status = "needs_clarification"
+        parse_request.clarification_question = (
+            "未能识别有效目的地。当前统一输入支持明确经纬度坐标（如：34.4245, 132.7083，纬度在前）"
+            "或 Plus Code 编码（完整码如 8Q6JCPF8+Q7，短码如 CPF8+Q7 东广岛市 广岛县）。请检查后重新输入。"
+        )
+        db.commit()
+        db.refresh(parse_request)
+        return _build_query_response(parse_request)
+
+    elif req.input_type == DestinationInputType.COORDS:
         if not req.coordinate:
             parse_request.status = "failed"
             parse_request.error_message = "Missing coordinate in request."

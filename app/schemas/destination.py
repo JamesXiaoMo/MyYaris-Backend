@@ -5,6 +5,7 @@ from app.schemas.common import Coordinate
 
 
 class DestinationInputType(str, Enum):
+    AUTO = "auto"
     COORDS = "coords"
     PLUS_CODE = "plus_code"
     TEXT = "text"
@@ -42,6 +43,7 @@ class DestinationQueryResponse(BaseModel):
     idempotency_key: Optional[str] = None
     source: str
     status: str  # resolving | needs_clarification | resolved | failed
+    message: Optional[str] = None  # Human-readable status message for iPhone Shortcuts
     transcribed_text: Optional[str] = None
     candidates: List[CandidateOut] = []
     clarification_question: Optional[str] = None
