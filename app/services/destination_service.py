@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.providers.base import PlaceCandidateItem, ProviderNotConfiguredError, SSRFSecurityError
 from app.providers.google_maps_parser import resolve_and_parse_map_url
+from app.providers.plus_code_parser import parse_plus_code
 from app.providers.provider_factory import get_maps_provider, get_nlp_provider
 from app.repositories.models import Candidate, ParseRequest, Task, utc_now
 from app.schemas.destination import (
@@ -69,6 +70,10 @@ async def create_destination_request(
             except (json.JSONDecodeError, TypeError):
                 existing_dict = {}
 
+            # New optional fields must not break retries of requests stored before this release.
+            for key in ("plus_code", "reference_coordinate"):
+                if key not in existing_dict and current_dict.get(key) is None:
+                    current_dict.pop(key, None)
             if existing_dict != current_dict:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -131,6 +136,38 @@ async def create_destination_request(
         )
         parse_request.task_id = task.task_id
         parse_request.status = "resolved"
+        db.commit()
+        db.refresh(parse_request)
+        return _build_query_response(parse_request)
+
+    elif req.input_type == DestinationInputType.PLUS_CODE:
+        result = parse_plus_code(req.plus_code or "", req.reference_coordinate)
+        if result.error:
+            parse_request.status = "failed"
+            parse_request.error_message = result.error
+        elif result.question and result.latitude is None:
+            parse_request.status = "needs_clarification"
+            parse_request.clarification_question = result.question
+        else:
+            cand = Candidate(
+                candidate_id=str(uuid.uuid4()), request_id=request_id,
+                title=f"Plus Code {result.full_code}",
+                address="Plus Code 编码区域中心（并非原始图钉的无限精度坐标）",
+                latitude=result.latitude, longitude=result.longitude,
+                coord_system="wgs84", source="plus_code",
+            )
+            db.add(cand)
+            if result.question:
+                parse_request.status = "needs_clarification"
+                parse_request.clarification_question = result.question
+            else:
+                task = await create_task_for_place(
+                    db=db, device_id=target_device, title=cand.title,
+                    address=cand.address, latitude=cand.latitude,
+                    longitude=cand.longitude, coord_system="wgs84", request_id=request_id,
+                )
+                parse_request.task_id = task.task_id
+                parse_request.status = "resolved"
         db.commit()
         db.refresh(parse_request)
         return _build_query_response(parse_request)

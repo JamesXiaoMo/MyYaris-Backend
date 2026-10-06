@@ -6,6 +6,7 @@ from app.schemas.common import Coordinate
 
 class DestinationInputType(str, Enum):
     COORDS = "coords"
+    PLUS_CODE = "plus_code"
     TEXT = "text"
     SHARE_LINK = "share_link"
     VOICE = "voice"
@@ -14,6 +15,8 @@ class DestinationInputType(str, Enum):
 class DestinationCreateRequest(BaseModel):
     input_type: DestinationInputType
     coordinate: Optional[Coordinate] = None
+    plus_code: Optional[str] = Field(default=None, max_length=256)
+    reference_coordinate: Optional[Coordinate] = None
     text: Optional[str] = None
     url: Optional[str] = None
     idempotency_key: Optional[str] = None

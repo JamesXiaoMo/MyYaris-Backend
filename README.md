@@ -204,3 +204,9 @@ cd /path/to/user/桌面/MyYaris/backend
 ```
 *(已通过真实 Token 验证 /health、未鉴权与越权拒绝、测试设备 car_test_probe 坐标入队与轮询，未发送虚假车机 ack)*
 
+
+### Google Plus Code
+
+`POST /destinations` 新增 `input_type: plus_code`，输入字段 `plus_code`，可选 `reference_coordinate: {latitude, longitude, coord_system: "wgs84"}`。原有 `coords` 不变。Open Location Code 离线解码为编码区域中心，不需要 Google Maps API Key。
+
+完整编码精度 >=10 位可直接创建任务；粗编码或按参照恢复的短编码必须通过现有 confirm 接口确认。短编码缺参照（包括仅带城市名）返回 needs_clarification 且无候选，不猜测目的地。iPhone 具体配置见 `docs/iPhone快捷指令配置.md`。现有 share_link/text 输入不自动识别 Plus Code，请明确使用 plus_code 输入类型。
