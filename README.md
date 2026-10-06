@@ -113,19 +113,69 @@ curl -X POST "https://myyaris.example.com/destinations" \
 
 ---
 
-## 服务访问地址 (无凭据)
+---
 
-- **本地回环调试**：`http://127.0.0.1:8000`
-- **Tailscale 私网访问**：`https://myyaris.example.com`（通过 `tailscale serve --bg 8000` 代理，提供统一 TLS 证书，对外不开放公网端口）
+## 生产运行状态与日志 (无凭据)
+
+- **运行方式**：Linux User Systemd 服务 (`systemctl --user status myyaris.service`)，已配置开机与无登录会话持久常驻 (`loginctl enable-linger myyaris-user`)，进程崩溃自动拉起 (`Restart=always, RestartSec=3s`)。
+- **监听绑定**：`http://127.0.0.1:8000`（安全绑定本机回环，预备由 Tailscale Serve 终结 HTTPS 并反向代理）。
+- **实时日志查看**：`journalctl --user -u myyaris.service -f`
+- **数据持久化目录**：`/path/to/user/.local/share/myyaris/myyaris.db`（SQLite WAL 模式，WAL + SHM 双缓冲）。
+- **运行配置与凭据**：高强度随机 Token 已由脚本初始化至 `/path/to/user/桌面/MyYaris/backend/.env`（权限 `0600`，绝不输出），`ALLOW_MOCK_FALLBACK=false`（严格禁用任何 mock 假坐标回退）。
+- **运行记录时间**：`2026-10-06 20:00:09 JST`（PID: 1067821，验证通过）。
 
 ---
 
-## 运行自动化测试
+## Tailscale 私网访问与 HTTPS 配置指南
 
-在远端或本地运行 pytest：
+当前 Tailnet 三端实时在线状态：
+- **Linux R9000P**：`192.0.2.10` (`myyaris.example.com`)
+- **iPhone**：`192.0.2.10` (`iphone182`)（R9000P `tailscale ping` 响应时间 13ms）
+- **车机 Ottocast P3 Pro**：`192.0.2.10` (`ottoaibox-p3-pro`)（R9000P `tailscale ping` 响应时间 45ms）
 
-```bash
-cd backend
-source .venv/bin/activate
-pytest -v
+### 真实 HTTPS 目标地址（供 Flutter 与 iPhone 快捷指令使用）
+```text
+https://myyaris.example.com
 ```
+
+### Tailscale Serve 当前状态与剩余用户操作
+Tailscale 守护进程对 `serve` 配置实施权限限制：
+执行 `tailscale serve --bg http://127.0.0.1:8000` 报错：
+```text
+sending serve config: Access denied: serve config denied
+Use 'sudo tailscale serve --bg http://127.0.0.1:8000'.
+To not require root, use 'sudo tailscale set --operator=$USER' once.
+```
+因 sudo 需要用户交互输入密码，系统遵循安全原则不猜测密码，**剩余操作需用户在 R9000P 终端执行一次授权**：
+
+**选项 A（直接启动 Serve 反代）**：
+```bash
+sudo tailscale serve --bg http://127.0.0.1:8000
+```
+
+**选项 B（一次性赋予 operator 权限，后续无需 sudo）**：
+```bash
+sudo tailscale set --operator=myyaris-user
+tailscale serve --bg http://127.0.0.1:8000
+```
+
+执行后，Tailscale 将在私网端口 443 终结 TLS 证书并自动代理至本机的 `http://127.0.0.1:8000`，使 iPhone 快捷指令与车机 P3 Pro 均能通过上述统一 HTTPS 域名安全访问。
+
+---
+
+## 运行自动化测试与现网巡检
+
+1. **运行 Pytest 单元与安全测试套件**：
+```bash
+cd /path/to/user/桌面/MyYaris/backend
+.venv/bin/pytest -v
+```
+*(33 项测试全量通过，覆盖整数坐标、路线起点保护、ll/q优先级、多坐标澄清、SSRF防护及跳转耗尽拦截)*
+
+2. **运行当前活跃服务黑盒验证**：
+```bash
+cd /path/to/user/桌面/MyYaris/backend
+.venv/bin/python tests/verify_running_service.py
+```
+*(已通过真实 Token 验证 /health、未鉴权与越权拒绝、测试设备 car_test_probe 坐标入队与轮询，未发送虚假车机 ack)*
+
