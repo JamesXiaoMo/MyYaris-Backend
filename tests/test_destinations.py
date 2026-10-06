@@ -65,3 +65,50 @@ def test_text_search_and_confirm(client, phone_headers):
     )
     assert reconfirm_resp.status_code == 200
     assert reconfirm_resp.json()["task_id"] == task_data["task_id"]
+
+
+def test_share_link_with_pinpoint(client, phone_headers):
+    # Pinpoint containing !3d35.6585805!4d139.7454329
+    url = "https://www.google.com/maps/place/Tokyo+Tower/@35.6000,139.7000,12z/data=!4m6!3m5!1s0x60188bbd9009ec09:0x481a93f0d2a409dd!8m2!3d35.6585805!4d139.7454329"
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "resolved"
+    assert data["task_id"] is not None
+    assert abs(data["candidates"][0]["latitude"] - 35.6585805) < 1e-4
+    assert abs(data["candidates"][0]["longitude"] - 139.7454329) < 1e-4
+
+
+def test_share_link_viewport_only_rejected_as_clarification(client, phone_headers):
+    # Viewport camera position only (no destination pin)
+    url = "https://www.google.com/maps/@35.658581,139.745433,17z"
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "share_link", "url": url, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    # Must NOT create a task or generate fake coordinates
+    assert data["status"] == "needs_clarification"
+    assert data["task_id"] is None
+    assert len(data["candidates"]) == 0
+    assert "视野中心" in data["clarification_question"]
+
+
+def test_unknown_text_does_not_fabricate_coordinates(client, phone_headers):
+    # Completely unknown location query
+    resp = client.post(
+        "/destinations",
+        json={"input_type": "text", "text": "完全虚构不存在的地点12345XYZ", "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "needs_clarification"
+    assert len(data["candidates"]) == 0
+    assert data["task_id"] is None

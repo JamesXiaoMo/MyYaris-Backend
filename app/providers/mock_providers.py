@@ -77,17 +77,5 @@ class MockMapsProvider(BaseMapsProvider):
             if key in query or key.lower() in query_lower:
                 results.append(item)
 
-        if not results:
-            # Fallback mock candidate using hash-like offset around Tokyo if unknown
-            results.append(
-                PlaceCandidateItem(
-                    title=query,
-                    address=f"东京都中央区（模拟地址：{query}）",
-                    latitude=35.681236,
-                    longitude=139.767125,
-                    coord_system="wgs84",
-                    source="mock_maps_fallback",
-                    place_id=f"mock_gen_{abs(hash(query)) % 10000}",
-                )
-            )
+        # Do NOT generate fake coordinates when query is unknown
         return results

@@ -23,6 +23,14 @@ def test_auth_rejection(client):
     )
     assert response.status_code == 401
 
+    # Empty token
+    response_empty = client.post(
+        "/destinations",
+        json={"input_type": "text", "text": "东京铁塔"},
+        headers={"Authorization": "Bearer "},
+    )
+    assert response_empty.status_code == 401
+
 
 def test_role_separation(client, phone_headers, car_headers):
     # Car token attempting to submit destination -> 403 Forbidden

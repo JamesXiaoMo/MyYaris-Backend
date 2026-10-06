@@ -4,12 +4,13 @@ import uuid
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from app.config import settings
-from app.providers.base import PlaceCandidateItem, SSRFSecurityError
+from app.providers.base import PlaceCandidateItem, ProviderNotConfiguredError, SSRFSecurityError
 from app.providers.google_maps_parser import resolve_and_parse_map_url
 from app.providers.provider_factory import get_maps_provider, get_nlp_provider
 from app.repositories.models import Candidate, ParseRequest, Task, utc_now
 from app.schemas.destination import (
     CandidateOut,
+    DestinationConfirmRequest,
     DestinationCreateRequest,
     DestinationInputType,
     DestinationQueryResponse,
@@ -50,7 +51,7 @@ async def create_destination_request(
     req: DestinationCreateRequest,
     caller_id: str,
 ) -> DestinationQueryResponse:
-    # 1. Idempotency Check
+    # 1. Semantic Idempotency Check
     if req.idempotency_key:
         existing = (
             db.query(ParseRequest)
@@ -61,9 +62,14 @@ async def create_destination_request(
             .first()
         )
         if existing:
-            # Check payload consistency
-            current_payload = req.model_dump_json(exclude={"idempotency_key"})
-            if existing.raw_input and existing.raw_input != current_payload:
+            # Check payload semantic consistency using parsed JSON
+            current_dict = json.loads(req.model_dump_json(exclude={"idempotency_key"}))
+            try:
+                existing_dict = json.loads(existing.raw_input) if existing.raw_input else {}
+            except (json.JSONDecodeError, TypeError):
+                existing_dict = {}
+
+            if existing_dict != current_dict:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Idempotency key collision with differing payload.",
@@ -88,7 +94,9 @@ async def create_destination_request(
     db.commit()
 
     # 2. Process by input type
-    target_device = req.target_device_id or settings.DEFAULT_CAR_DEVICE_ID
+    target_device = (req.target_device_id or settings.DEFAULT_CAR_DEVICE_ID).strip()
+    if not target_device:
+        target_device = settings.DEFAULT_CAR_DEVICE_ID
 
     if req.input_type == DestinationInputType.COORDS:
         if not req.coordinate:
@@ -102,7 +110,7 @@ async def create_destination_request(
             candidate_id=candidate_id,
             request_id=request_id,
             title="指定经纬度目的地",
-            address=f"经度: {req.coordinate.longitude}, 纬度: {req.coordinate.latitude}",
+            address=f"经度: {req.coordinate.longitude:.6f}, 纬度: {req.coordinate.latitude:.6f}",
             latitude=req.coordinate.latitude,
             longitude=req.coordinate.longitude,
             coord_system=req.coordinate.coord_system,
@@ -135,45 +143,91 @@ async def create_destination_request(
             raise HTTPException(status_code=400, detail="Missing URL.")
 
         try:
-            resolved_place = await resolve_and_parse_map_url(req.url)
+            resolution = await resolve_and_parse_map_url(req.url)
         except SSRFSecurityError as e:
             parse_request.status = "failed"
             parse_request.error_message = f"Security check failed: {e}"
             db.commit()
             raise HTTPException(status_code=400, detail=f"SSRF security violation: {e}")
 
-        if not resolved_place:
-            parse_request.status = "needs_clarification"
-            parse_request.clarification_question = "未能从该地图链接提取有效目的地坐标，请尝试直接输入地名或地址。"
+        # 1. Unambiguous destination coordinates extracted
+        if resolution.candidate:
+            cand = Candidate(
+                candidate_id=str(uuid.uuid4()),
+                request_id=request_id,
+                title=resolution.candidate.title,
+                address=resolution.candidate.address,
+                latitude=resolution.candidate.latitude,
+                longitude=resolution.candidate.longitude,
+                coord_system=resolution.candidate.coord_system,
+                source="share_link",
+            )
+            db.add(cand)
+
+            task = await create_task_for_place(
+                db=db,
+                device_id=target_device,
+                title=cand.title,
+                address=cand.address,
+                latitude=cand.latitude,
+                longitude=cand.longitude,
+                coord_system=cand.coord_system,
+                request_id=request_id,
+            )
+            parse_request.task_id = task.task_id
+            parse_request.status = "resolved"
             db.commit()
             db.refresh(parse_request)
             return _build_query_response(parse_request)
 
-        cand = Candidate(
-            candidate_id=str(uuid.uuid4()),
-            request_id=request_id,
-            title=resolved_place.title,
-            address=resolved_place.address,
-            latitude=resolved_place.latitude,
-            longitude=resolved_place.longitude,
-            coord_system=resolved_place.coord_system,
-            source="share_link",
-        )
-        db.add(cand)
+        # 2. Viewport-only center URL (camera position, not destination)
+        if resolution.is_viewport_only:
+            parse_request.status = "needs_clarification"
+            parse_request.clarification_question = (
+                "所分享链接仅为地图视野中心，并非具体的目的地或图钉。请在地图上长按放置图钉或点击具体地点后再分享。"
+            )
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
 
-        # Create task directly for unambiguous map share link
-        task = await create_task_for_place(
-            db=db,
-            device_id=target_device,
-            title=cand.title,
-            address=cand.address,
-            latitude=cand.latitude,
-            longitude=cand.longitude,
-            coord_system=cand.coord_system,
-            request_id=request_id,
+        # 3. Place name extracted from URL but no coordinates
+        if resolution.place_name:
+            try:
+                maps = get_maps_provider()
+                search_results = await maps.search(resolution.place_name, lat=req.client_lat, lon=req.client_lon)
+                if search_results:
+                    for item in search_results:
+                        cand = Candidate(
+                            candidate_id=str(uuid.uuid4()),
+                            request_id=request_id,
+                            title=item.title,
+                            address=item.address,
+                            latitude=item.latitude,
+                            longitude=item.longitude,
+                            coord_system=item.coord_system,
+                            source="share_link_search",
+                            place_id=item.place_id,
+                        )
+                        db.add(cand)
+                    parse_request.status = "needs_clarification"
+                    parse_request.clarification_question = f"从链接中识别到地点“{resolution.place_name}”，找到以下候选，请确认："
+                    db.commit()
+                    db.refresh(parse_request)
+                    return _build_query_response(parse_request)
+            except ProviderNotConfiguredError:
+                parse_request.status = "needs_clarification"
+                parse_request.clarification_question = (
+                    f"已从地图链接识别地点“{resolution.place_name}”，但该链接未包含精确图钉坐标且地图搜索服务未配置。请直接输入经纬度或提供包含图钉坐标的分享链接。"
+                )
+                db.commit()
+                db.refresh(parse_request)
+                return _build_query_response(parse_request)
+
+        # 4. Fallback when neither coordinates nor place name could be resolved
+        parse_request.status = "needs_clarification"
+        parse_request.clarification_question = (
+            "未能从该地图链接提取有效目的地坐标。请尝试直接在地图上放置图钉后分享，或输入明确经纬度。"
         )
-        parse_request.task_id = task.task_id
-        parse_request.status = "resolved"
         db.commit()
         db.refresh(parse_request)
         return _build_query_response(parse_request)
@@ -185,8 +239,15 @@ async def create_destination_request(
             db.commit()
             raise HTTPException(status_code=400, detail="Empty text input.")
 
-        nlp = get_nlp_provider()
-        maps = get_maps_provider()
+        try:
+            nlp = get_nlp_provider()
+            maps = get_maps_provider()
+        except ProviderNotConfiguredError as e:
+            parse_request.status = "failed"
+            parse_request.error_message = f"地图或NLP检索服务未配置: {e}"
+            db.commit()
+            db.refresh(parse_request)
+            return _build_query_response(parse_request)
 
         keywords = await nlp.extract_destinations(req.text)
         if not keywords:
@@ -226,7 +287,6 @@ async def create_destination_request(
             parse_request.status = "resolved"
             db.commit()
             db.refresh(parse_request)
-            # If exactly 1 clear result from text, can still require or auto confirm; per spec, return candidate for confirmation
             return _build_query_response(parse_request)
         else:
             parse_request.status = "needs_clarification"

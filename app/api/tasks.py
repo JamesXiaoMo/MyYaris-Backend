@@ -57,6 +57,17 @@ def acknowledge_task(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_car_or_admin),
 ):
+    task_obj = db.query(Task).filter(Task.task_id == id).first()
+    if not task_obj:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    # Prevent car client from acknowledging other devices' tasks
+    if user.role == "car" and user.device_id and task_obj.device_id != user.device_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Forbidden: Car token cannot acknowledge tasks for device {task_obj.device_id}",
+        )
+
     dt = None
     if ack.device_timestamp:
         try:
@@ -93,4 +104,12 @@ def get_task(
     task = db.query(Task).filter(Task.task_id == id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
+
+    # Car client can only view its own device's tasks
+    if user.role == "car" and user.device_id and task.device_id != user.device_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Car token cannot view tasks for other devices.",
+        )
+
     return _to_task_out(task)

@@ -166,9 +166,13 @@ def record_task_ack(
     # Monotonic transition rules
     # Status progression: queued -> received -> launch_requested
     # Terminal/Non-regressible states: expired, superseded, failed
-    if task.status in ["expired", "superseded"]:
+    if task.status in ["expired", "superseded", "failed"]:
         db.commit()
         return False, f"Task is already {task.status}; state not changed", task
+
+    if task.status == "received" and phase == "received":
+        db.commit()
+        return True, "Task already received; duplicate ack recorded", task
 
     if task.status == "launch_requested":
         if phase == "received":

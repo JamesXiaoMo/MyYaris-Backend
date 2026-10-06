@@ -13,14 +13,28 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Authenticat
         )
 
     token = authorization[len("Bearer ") :].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized access: Empty token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    if token == settings.ADMIN_TOKEN:
+    # Server must have tokens configured; reject if all tokens are unset
+    if not (settings.ADMIN_TOKEN or settings.PHONE_TOKEN or settings.CAR_TOKEN):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication tokens are not configured on this server.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if settings.ADMIN_TOKEN and token == settings.ADMIN_TOKEN:
         return AuthenticatedUser(identity="admin", role="admin")
 
-    if token == settings.PHONE_TOKEN:
+    if settings.PHONE_TOKEN and token == settings.PHONE_TOKEN:
         return AuthenticatedUser(identity="phone_client", role="phone")
 
-    if token == settings.CAR_TOKEN:
+    if settings.CAR_TOKEN and token == settings.CAR_TOKEN:
         return AuthenticatedUser(
             identity="car_client",
             role="car",

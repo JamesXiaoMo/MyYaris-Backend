@@ -74,31 +74,66 @@ async def run_integration_scenario():
         )
         assert ack_res3.status_code == 200
         assert ack_res3.json()["status"] == "launch_requested"
+        assert ack_res3.json()["accepted"] is False
         print(f"    -> OK: Status correctly preserved as '{ack_res3.json()['status']}'")
 
-        # 7. Submit text destination & confirm candidate
-        print("[7] Testing text destination & candidate confirmation ...")
-        text_res = await client.post(
+        # 7. Test Google Maps pinpoint link
+        print("[7] Testing Google Maps pinpoint share link ...")
+        pin_url = "https://www.google.com/maps/place/Tokyo+Tower/@35.6000,139.7000,12z/data=!4m6!3m5!1s0x60188bbd9009ec09:0x481a93f0d2a409dd!8m2!3d35.6585805!4d139.7454329"
+        pin_res = await client.post(
             "/destinations",
-            json={"input_type": "text", "text": "我想去东京铁塔", "target_device_id": "car_p3pro"},
+            json={"input_type": "share_link", "url": pin_url, "target_device_id": "car_p3pro"},
             headers=headers_phone,
         )
-        assert text_res.status_code == 200
-        req_id = text_res.json()["request_id"]
-        cand_id = text_res.json()["candidates"][0]["candidate_id"]
+        assert pin_res.status_code == 200
+        assert pin_res.json()["status"] == "resolved"
+        assert pin_res.json()["task_id"] is not None
+        print(f"    -> OK: Generated task {pin_res.json()['task_id']} from pinpoint link")
 
-        confirm_res = await client.post(
-            f"/destinations/{req_id}/confirm",
-            json={"candidate_id": cand_id, "target_device_id": "car_p3pro"},
+        # 8. Test viewport-only link rejection (no fake coordinates)
+        print("[8] Testing viewport-only map link rejection ...")
+        vp_url = "https://www.google.com/maps/@35.658581,139.745433,17z"
+        vp_res = await client.post(
+            "/destinations",
+            json={"input_type": "share_link", "url": vp_url, "target_device_id": "car_p3pro"},
             headers=headers_phone,
         )
-        assert confirm_res.status_code == 200
-        print(f"    -> OK: Confirmed task {confirm_res.json()['task_id']} for candidate {cand_id}")
+        assert vp_res.status_code == 200
+        assert vp_res.json()["status"] == "needs_clarification"
+        assert vp_res.json()["task_id"] is None
+        print("    -> OK: Viewport-only link correctly required clarification without inventing coordinates")
+
+        # 9. Test car device permission isolation
+        print("[9] Testing car device permission isolation ...")
+        other_task_res = await client.post(
+            "/destinations",
+            json={"input_type": "coords", "coordinate": {"latitude": 35.0, "longitude": 139.0}, "target_device_id": "car_other"},
+            headers=headers_phone,
+        )
+        other_task_id = other_task_res.json()["task_id"]
+        unauth_ack = await client.post(
+            f"/tasks/{other_task_id}/ack",
+            json={"phase": "received"},
+            headers=headers_car,
+        )
+        assert unauth_ack.status_code == 403
+        print("    -> OK: Car token unauthorized to ack other device's task (403 Forbidden)")
 
     print("\n>>> All live API scenarios passed successfully! <<<\n")
 
 
 async def main():
+    if not settings.PHONE_TOKEN:
+        settings.PHONE_TOKEN = "verify-live-phone-token"
+    if not settings.CAR_TOKEN:
+        settings.CAR_TOKEN = "verify-live-car-token"
+    if not settings.ADMIN_TOKEN:
+        settings.ADMIN_TOKEN = "verify-live-admin-token"
+    settings.ALLOW_MOCK_FALLBACK = True
+    settings.MAPS_PROVIDER = "mock"
+    settings.ASR_PROVIDER = "mock"
+    settings.NLP_PROVIDER = "mock"
+
     config = uvicorn.Config(app=app, host="127.0.0.1", port=8000, log_level="warning")
     server = uvicorn.Server(config)
 

@@ -36,21 +36,21 @@ class Settings(BaseSettings):
     MAX_ACTIVE_LONG_POLL_PER_DEVICE: int = 2
     DEFAULT_CAR_DEVICE_ID: str = "car_p3pro"
 
-    # Pre-shared tokens for authentication
-    CAR_TOKEN: str = "myyaris-car-secret-token"
-    PHONE_TOKEN: str = "myyaris-phone-secret-token"
-    ADMIN_TOKEN: str = "myyaris-admin-secret-token"
+    # Pre-shared tokens for authentication (Must be configured in .env or environment)
+    CAR_TOKEN: str = ""
+    PHONE_TOKEN: str = ""
+    ADMIN_TOKEN: str = ""
 
     # External providers
-    ASR_PROVIDER: str = "mock"  # mock | none | whisper_local | openai
+    ASR_PROVIDER: str = "none"  # none | whisper_local | openai | mock (test only)
     ASR_API_KEY: str = ""
-    NLP_PROVIDER: str = "mock"  # mock | none | openai | gemini
+    NLP_PROVIDER: str = "none"  # none | openai | gemini | mock (test only)
     NLP_API_KEY: str = ""
-    MAPS_PROVIDER: str = "mock"  # mock | google
+    MAPS_PROVIDER: str = "google"  # google | none | mock (test only)
     GOOGLE_MAPS_API_KEY: str = ""
 
-    # Allow mock providers when real keys are missing
-    ALLOW_MOCK_FALLBACK: bool = True
+    # Mock fallback is strictly disabled in production to prevent fake navigation coordinates
+    ALLOW_MOCK_FALLBACK: bool = False
 
     def init_directories(self) -> None:
         data_path = Path(self.DATA_DIR)

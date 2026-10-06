@@ -10,6 +10,13 @@ from sqlalchemy.pool import StaticPool
 test_db_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 os.environ["MYYARIS_DATA_DIR"] = tempfile.mkdtemp()
 os.environ["DATABASE_URL"] = f"sqlite:///{test_db_file.name}"
+os.environ["CAR_TOKEN"] = "test-car-secret-token"
+os.environ["PHONE_TOKEN"] = "test-phone-secret-token"
+os.environ["ADMIN_TOKEN"] = "test-admin-secret-token"
+os.environ["ALLOW_MOCK_FALLBACK"] = "true"
+os.environ["ASR_PROVIDER"] = "mock"
+os.environ["NLP_PROVIDER"] = "mock"
+os.environ["MAPS_PROVIDER"] = "mock"
 
 from app.config import settings
 from app.main import app

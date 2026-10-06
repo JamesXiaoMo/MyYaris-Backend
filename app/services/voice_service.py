@@ -20,6 +20,23 @@ async def process_voice_upload(
     client_time: str | None = None,
     target_device_id: str | None = None,
 ) -> VoiceUploadResponse:
+    # Check idempotency
+    if idempotency_key:
+        existing = (
+            db.query(ParseRequest)
+            .filter(
+                ParseRequest.idempotency_key == idempotency_key,
+                ParseRequest.caller_id == caller_id,
+            )
+            .first()
+        )
+        if existing:
+            return VoiceUploadResponse(
+                request_id=existing.request_id,
+                status=existing.status,
+                message="Idempotent voice request returned existing result",
+            )
+
     request_id = str(uuid.uuid4())
     temp_dir = Path(settings.AUDIO_TEMP_DIR)
     temp_dir.mkdir(parents=True, exist_ok=True)
