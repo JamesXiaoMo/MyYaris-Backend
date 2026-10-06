@@ -233,12 +233,22 @@ async def create_destination_request(
                             latitude=item.latitude,
                             longitude=item.longitude,
                             coord_system=item.coord_system,
-                            source="share_link_search",
+                            source=item.source or "share_link_search",
                             place_id=item.place_id,
                         )
                         db.add(cand)
                     parse_request.status = "needs_clarification"
-                    parse_request.clarification_question = f"从链接中识别到地点“{resolution.place_name}”，找到以下候选，请确认："
+                    parse_request.clarification_question = (
+                        f"从链接中识别到地点“{resolution.place_name}”，检索到以下候选地点（均为地区概略范围/非建筑物精确图钉）。请确认具体目的地后下发导航，或直接输入精确经纬度："
+                    )
+                    db.commit()
+                    db.refresh(parse_request)
+                    return _build_query_response(parse_request)
+                else:
+                    parse_request.status = "needs_clarification"
+                    parse_request.clarification_question = (
+                        f"已从地图链接识别地点“{resolution.place_name}”，但地图服务未检索到匹配结果（可能缺少详细街道番地）。请尝试补充更详细的门牌地址，或在地图上长按图钉分享明确坐标。"
+                    )
                     db.commit()
                     db.refresh(parse_request)
                     return _build_query_response(parse_request)
@@ -267,37 +277,40 @@ async def create_destination_request(
             db.commit()
             raise HTTPException(status_code=400, detail="Empty text input.")
 
+        # Maps provider is required for place searches
         try:
-            nlp = get_nlp_provider()
             maps = get_maps_provider()
         except ProviderNotConfiguredError as e:
             parse_request.status = "failed"
-            parse_request.error_message = f"地图或NLP检索服务未配置: {e}"
+            parse_request.error_message = f"地图检索服务未配置: {e}"
             db.commit()
             db.refresh(parse_request)
             return _build_query_response(parse_request)
 
-        keywords = await nlp.extract_destinations(req.text)
+        # NLP is optional: use extracted keywords if configured, otherwise search raw text directly
+        keywords: list[str] = []
+        try:
+            nlp = get_nlp_provider()
+            keywords = await nlp.extract_destinations(req.text)
+        except ProviderNotConfiguredError:
+            keywords = [req.text.strip()]
+
         if not keywords:
-            parse_request.status = "needs_clarification"
-            parse_request.clarification_question = "未能识别出目的地关键词，请尝试说出具体的建筑物或地名。"
-            db.commit()
-            db.refresh(parse_request)
-            return _build_query_response(parse_request)
+            keywords = [req.text.strip()]
 
         all_candidates: list[PlaceCandidateItem] = []
-        for kw in keywords:
+        for kw in keywords[:3]:
             results = await maps.search(kw, lat=req.client_lat, lon=req.client_lon)
             all_candidates.extend(results)
 
         if not all_candidates:
             parse_request.status = "needs_clarification"
-            parse_request.clarification_question = f"未能找到与“{req.text}”相关的目的地，请补充更明确的地标或区域名称。"
+            parse_request.clarification_question = f"未能找到与“{req.text}”相关的目的地，请补充更明确的地标或街道门牌地址。"
             db.commit()
             db.refresh(parse_request)
             return _build_query_response(parse_request)
 
-        for item in all_candidates:
+        for item in all_candidates[:3]:
             cand = Candidate(
                 candidate_id=str(uuid.uuid4()),
                 request_id=request_id,
@@ -306,22 +319,17 @@ async def create_destination_request(
                 latitude=item.latitude,
                 longitude=item.longitude,
                 coord_system=item.coord_system,
-                source="search",
+                source=item.source or "search",
                 place_id=item.place_id,
             )
             db.add(cand)
 
-        if len(all_candidates) == 1:
-            parse_request.status = "resolved"
-            db.commit()
-            db.refresh(parse_request)
-            return _build_query_response(parse_request)
-        else:
-            parse_request.status = "needs_clarification"
-            parse_request.clarification_question = f"找到 {len(all_candidates)} 个相关地点，请确认具体目的地："
-            db.commit()
-            db.refresh(parse_request)
-            return _build_query_response(parse_request)
+        # All place/address search results MUST require user confirmation (never auto-dispatch regional centroids)
+        parse_request.status = "needs_clarification"
+        parse_request.clarification_question = f"找到 {len(all_candidates[:3])} 个相关候选（均为概略范围/非建筑物精确图钉），请确认具体目的地："
+        db.commit()
+        db.refresh(parse_request)
+        return _build_query_response(parse_request)
 
     parse_request.status = "failed"
     parse_request.error_message = f"Unsupported input type: {req.input_type}"

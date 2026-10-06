@@ -46,8 +46,15 @@ class Settings(BaseSettings):
     ASR_API_KEY: str = ""
     NLP_PROVIDER: str = "none"  # none | openai | gemini | mock (test only)
     NLP_API_KEY: str = ""
-    MAPS_PROVIDER: str = "google"  # google | none | mock (test only)
+    MAPS_PROVIDER: str = "nominatim"  # nominatim | google | none | mock (test only)
     GOOGLE_MAPS_API_KEY: str = ""
+
+    # Nominatim (OpenStreetMap) Provider Settings
+    NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org/search"
+    NOMINATIM_USER_AGENT: str = "MyYaris/1.0 (https://github.com/myyaris-user/MyYaris; contact: myyaris-user@local)"
+    NOMINATIM_COUNTRY_CODES: str = "jp"
+    NOMINATIM_RATE_LIMIT_SECONDS: float = 1.05
+    NOMINATIM_CACHE_TTL_SECONDS: float = 86400.0
 
     # Mock fallback is strictly disabled in production to prevent fake navigation coordinates
     ALLOW_MOCK_FALLBACK: bool = False

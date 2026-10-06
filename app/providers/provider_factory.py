@@ -25,6 +25,10 @@ def get_nlp_provider() -> BaseNLPProvider:
 
 
 def get_maps_provider() -> BaseMapsProvider:
+    if settings.MAPS_PROVIDER == "nominatim":
+        from app.providers.nominatim_provider import get_nominatim_provider
+        return get_nominatim_provider()
     if settings.ALLOW_MOCK_FALLBACK and settings.MAPS_PROVIDER == "mock":
         return MockMapsProvider()
-    raise ProviderNotConfiguredError("Maps provider is not configured.")
+    raise ProviderNotConfiguredError(f"Maps provider '{settings.MAPS_PROVIDER}' is not configured.")
+

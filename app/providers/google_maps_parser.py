@@ -84,17 +84,18 @@ def extract_coordinates_from_url(url: str) -> tuple[float, float, str] | None:
                     pin_title = title if title != "Google Maps Location" else f"Google Maps Destination ({lat:.4f}, {lon:.4f})"
                     return lat, lon, pin_title
 
-    # Priority 2: Explicit search query (q=lat,lon)
-    # (If q has coordinates, it is an explicit destination pin, even if ll is also present)
-    if "q" in qs:
-        val = qs["q"][0]
-        match_coords = re.match(COORD_REGEX, val)
-        if match_coords:
-            lat = float(match_coords.group(1))
-            lon = float(match_coords.group(2))
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                pin_title = title if title != "Google Maps Location" else f"Google Maps Pin ({lat:.4f}, {lon:.4f})"
-                return lat, lon, pin_title
+    # Priority 2: Explicit search query (q=lat,lon or query=lat,lon)
+    # (If q/query has coordinates, it is an explicit destination pin, even if ll is also present)
+    for q_param in ["q", "query"]:
+        if q_param in qs:
+            val = qs[q_param][0]
+            match_coords = re.match(COORD_REGEX, val)
+            if match_coords:
+                lat = float(match_coords.group(1))
+                lon = float(match_coords.group(2))
+                if -90 <= lat <= 90 and -180 <= lon <= 180:
+                    pin_title = title if title != "Google Maps Location" else f"Google Maps Pin ({lat:.4f}, {lon:.4f})"
+                    return lat, lon, pin_title
 
     # If it is a route (/dir/) without explicit destination parameter,
     # DO NOT extract !3d!4d because the first coordinate pair is the route start/origin!
@@ -129,7 +130,13 @@ def is_viewport_only_url(url: str) -> bool:
     qs = parse_qs(parsed.query)
 
     has_viewport_path = bool(re.search(r"/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", url))
-    has_ll_param = "ll" in qs and "destination" not in qs and "daddr" not in qs and "q" not in qs
+    has_ll_param = (
+        "ll" in qs
+        and "destination" not in qs
+        and "daddr" not in qs
+        and "q" not in qs
+        and "query" not in qs
+    )
     has_coords = extract_coordinates_from_url(url) is not None
     has_place = extract_place_name_from_url(url) is not None
 
@@ -154,16 +161,17 @@ def has_multiple_coordinates(url: str) -> bool:
 
 
 def extract_place_name_from_url(url: str) -> str | None:
-    """Extracts place name from /place/<name> or non-coordinate query q if present."""
+    """Extracts place name from /place/<name> or non-coordinate query q/query if present."""
     match_place = re.search(r"/place/([^/@?]+)", url)
     if match_place:
         return unquote(match_place.group(1)).replace("+", " ")
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
-    if "q" in qs:
-        val = qs["q"][0].strip()
-        if not re.match(COORD_REGEX, val):
-            return unquote(val).replace("+", " ")
+    for q_param in ["q", "query"]:
+        if q_param in qs:
+            val = qs[q_param][0].strip()
+            if not re.match(COORD_REGEX, val):
+                return unquote(val).replace("+", " ")
     return None
 
 

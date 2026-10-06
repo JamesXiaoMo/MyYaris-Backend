@@ -71,23 +71,48 @@ curl -X POST "https://myyaris.example.com/destinations" \
   }'
 ```
 
+#### 快捷指令处理流程（含确认流程）：
+1. 若响应 `status == "resolved"`：链接含有明确图钉或坐标，`task_id` 已生成，车机将自动拉取并导航。
+2. 若响应 `status == "needs_clarification"` 且包含 `candidates`：
+   - 链接属于地址/区域描述（无明确图钉坐标），系统通过 Nominatim 返回了概略候选列表；
+   - 快捷指令提示用户选取候选（或默认选用首个候选），随后调用确认接口：
+   ```bash
+   curl -X POST "https://myyaris.example.com/destinations/<REQUEST_ID>/confirm" \
+     -H "Authorization: Bearer <PHONE_TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "candidate_id": "<CANDIDATE_ID>",
+       "target_device_id": "car_p3pro"
+     }'
+   ```
+   确认后即刻生成任务并下发车机，成功唤起 CAR NAVITIME。
+
 ---
 
-## 链接真实支持范围与解析策略
+## 链接真实支持范围与 Nominatim 地点查询兜底
 
 后端严格执行真实导航坐标保障准则，**坚决不猜测、不伪造假坐标**：
 
 1. **直接解析成功并生成任务**（支持合法整数与浮点 WGS84 坐标）：
    - 包含明确单一地点图钉（`!3d<lat>!4d<lon>`）的长/短链接；
    - 包含明确终点查询参数的链接（`destination=<lat>,<lon>`、`daddr=<lat>,<lon>`）；
-   - 包含明确经纬度图钉搜索参数（`q=<lat>,<lon>`，即使附带 `ll` 视野中心亦优先采用 `q` 目标）；
+   - 包含明确经纬度图钉搜索参数（`q=<lat>,<lon>` 或 `query=<lat>,<lon>`，即使附带 `ll` 视野中心亦优先采用图钉坐标）；
    - 兼容合法整数坐标（例如 `35, 139` 或 `0, 0`）与标准浮点坐标。
-2. **返回 `needs_clarification`（澄清）而非猜测假坐标**：
+2. **Nominatim (OpenStreetMap) 地名/地址查询兜底**：
+   - 针对无直接经纬度、仅包含地址文字或 Place 描述的链接（如 `https://maps.app.goo.gl/EXAMPLE` 展开为 `q=Saijocho Jike, 东广岛市广岛县 739-0041`）：
+   - **日文地址规范化**：自动完成常见汉字转换（如“东广岛市”->“東広島市”、“广岛县”->“広島県”）、罗马字转换（如“Saijocho Jike”->“西条町寺家”）与日本 47 都道府县层级识别，规避无意义猜词；
+   - **严格遵守 OSMF 使用政策**：
+     - 配置独立标识性 `User-Agent`，携带项目与联系信息；
+     - 进程级硬性限流 **1 request/s**（`NominatimRateLimiter`）；
+     - 内存查询缓存（TTL 24小时）与并发防击穿（In-flight Deduplication）；
+     - 明确来源标注：*Data © OpenStreetMap contributors*；
+   - **安全确认机制**：**任何检索候选必须返回 `needs_clarification`，在确认前 `task_id` 严格为空**，地区/行政区中心明确标注 `(地区中心·非精确图钉)`，杜绝将非图钉概略点静默自动下发至车机；
+   - **无结果明确提示**：若检索无匹配，明确返回无候选并提示用户补充详细番地门牌或分享精确图钉，不伪造坐标。
+3. **返回 `needs_clarification`（澄清）而非猜测假坐标**：
    - **`ll` 单独出现或仅视野中心**（`/@lat,lon,zoom` 或 `?ll=lat,lon`）：此类链接仅代表地图浏览视野中心，并非具体目的地。系统返回清晰说明：“所分享链接仅为地图视野中心，并非具体的目的地或图钉。请在地图上长按放置图钉或点击具体地点后再分享。”
    - **路线导航链接缺终点参数**（`/dir/` 链接）：路线链接中首个出现的坐标通常为出发地/起点，为杜绝将出发地误当终点下发车机，系统不自动选取首个坐标，要求用户直接提供终点图钉或明确坐标。
    - **包含多个地点坐标**：存在多个不同 `!3d!4d` 候选点且无法证明终点时，系统不盲目取第一个，返回澄清提示。
-   - **仅包含地点名称或 Place ID**：在未配置 Google Places API 等外部服务时，系统明确说明地图检索服务未配置，引导用户提供经纬度或图钉链接。
-3. **SSRF 安全防护与重定向处理**：
+4. **SSRF 安全防护与重定向处理**：
    - 相对重定向统一使用 `urljoin` 正确还原完整 URL；
    - 重定向每跳及最终落地 URL 严格校验白名单域名（`maps.google.com`, `maps.app.goo.gl` 等）与真实解析 IP（禁止内网、回环及多播 IP）；
    - 重定向跳数耗尽时安全拦截报错，杜绝解析未经验证的目的地。
@@ -170,7 +195,7 @@ tailscale serve --bg http://127.0.0.1:8000
 cd /path/to/user/桌面/MyYaris/backend
 .venv/bin/pytest -v
 ```
-*(33 项测试全量通过，覆盖整数坐标、路线起点保护、ll/q优先级、多坐标澄清、SSRF防护及跳转耗尽拦截)*
+*(42 项测试全量通过，覆盖 Nominatim 地名检索、OSM 限流与缓存、并发去重、整数坐标、路线起点保护、ll/q优先级、多坐标澄清、SSRF防护及跳转耗尽拦截)*
 
 2. **运行当前活跃服务黑盒验证**：
 ```bash
