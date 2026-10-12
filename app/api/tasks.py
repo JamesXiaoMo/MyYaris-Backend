@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 from app.api.auth import get_current_user, require_car_or_admin
+from app.config import settings
 from app.repositories.database import get_db
 from app.repositories.models import Task
 from app.schemas.auth import AuthenticatedUser
@@ -48,6 +49,17 @@ async def get_next_task(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return _to_task_out(task)
+
+
+@router.get("/api/v1/tasks/poll", response_model=Optional[TaskOut])
+async def poll_tasks(
+    device_id: Optional[str] = Query(default=None),
+    timeout: Optional[int] = Query(default=None, ge=1, le=60),
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_car_or_admin),
+):
+    dev_id = device_id or user.device_id or settings.DEFAULT_CAR_DEVICE_ID
+    return await get_next_task(id=dev_id, timeout=timeout, db=db, user=user)
 
 
 @router.post("/tasks/{id}/ack", response_model=TaskAckResponse)

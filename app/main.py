@@ -1,8 +1,10 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.api.control import router as control_router
 from app.api.destinations import router as destinations_router
 from app.api.health import router as health_router
+from app.api.music import router as music_router
 from app.api.tasks import router as tasks_router
 from app.api.voice import router as voice_router
 from app.config import settings
@@ -40,6 +42,8 @@ app.include_router(health_router)
 app.include_router(destinations_router)
 app.include_router(tasks_router)
 app.include_router(voice_router)
+app.include_router(music_router)
+app.include_router(control_router)
 
 
 if __name__ == "__main__":

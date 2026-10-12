@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     AUDIO_RETENTION_HOURS: int = 24
     MAX_AUDIO_FILE_SIZE_BYTES: int = 15 * 1024 * 1024  # 15 MB
 
+    # Media library & Cache (V2.0)
+    LOCAL_TRACKS_DIR: str = ""
+    MEDIA_CACHE_DIR: str = ""
+    MEDIA_CACHE_MAX_BYTES: int = 50 * 1024 * 1024 * 1024  # 50 GB
+
     # Task & Polling policies
     TASK_DEFAULT_EXPIRY_MINUTES: int = 60
     ACK_TIMEOUT_SECONDS: int = 30
@@ -65,6 +70,20 @@ class Settings(BaseSettings):
         if not self.AUDIO_TEMP_DIR:
             self.AUDIO_TEMP_DIR = str(data_path / "audio_temp")
         Path(self.AUDIO_TEMP_DIR).mkdir(parents=True, exist_ok=True)
+
+        if not self.LOCAL_TRACKS_DIR:
+            self.LOCAL_TRACKS_DIR = os.getenv(
+                "MYYARIS_LOCAL_TRACKS_DIR",
+                str(data_path / "media" / "local_tracks"),
+            )
+        Path(self.LOCAL_TRACKS_DIR).mkdir(parents=True, exist_ok=True)
+
+        if not self.MEDIA_CACHE_DIR:
+            self.MEDIA_CACHE_DIR = os.getenv(
+                "MYYARIS_MEDIA_CACHE_DIR",
+                str(data_path / "media" / "cache"),
+            )
+        Path(self.MEDIA_CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
         if not self.DATABASE_URL:
             db_file = data_path / "myyaris.db"

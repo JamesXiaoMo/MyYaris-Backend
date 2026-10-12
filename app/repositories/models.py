@@ -104,3 +104,36 @@ class TaskEvent(Base):
     error_detail = Column(Text, nullable=True)
 
     task = relationship("Task", back_populates="events")
+
+
+class MediaTrack(Base):
+    __tablename__ = "media_tracks"
+
+    track_id = Column(String(64), primary_key=True, index=True)
+    source = Column(String(32), default="local_repo", nullable=False)  # local_repo | netease_cache
+    title = Column(String(256), nullable=False, index=True)
+    artist = Column(String(256), default="Unknown Artist", nullable=False, index=True)
+    album = Column(String(256), nullable=True)
+    duration_ms = Column(Integer, default=0, nullable=False)
+    file_path = Column(Text, nullable=False)
+    file_size_bytes = Column(Integer, nullable=False)
+    bitrate_kbps = Column(Integer, nullable=True)
+    cover_url = Column(Text, nullable=True)
+    hit_count = Column(Integer, default=0)
+    last_accessed_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class CarDeviceStatus(Base):
+    __tablename__ = "car_device_status"
+
+    device_id = Column(String(64), primary_key=True, index=True)
+    playback_state = Column(String(32), default="stopped", nullable=False)  # playing | paused | stopped
+    current_track_id = Column(String(64), nullable=True)
+    position_ms = Column(Integer, default=0, nullable=False)
+    duration_ms = Column(Integer, default=0, nullable=False)
+    software_volume = Column(Float, default=1.0, nullable=False)
+    loop_mode = Column(String(16), default="all", nullable=False)  # all | one | off
+    shuffle_enabled = Column(Boolean, default=False, nullable=False)
+    last_heartbeat_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
