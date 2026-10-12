@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.control import router as control_router
 from app.api.destinations import router as destinations_router, api_v1_router as nav_v1_router
+from app.api.favorites import router as favorites_router
 from app.api.health import router as health_router
 from app.api.music import router as music_router
 from app.api.netease import router as netease_router
@@ -51,6 +52,7 @@ app.include_router(voice_router)
 app.include_router(music_router)
 app.include_router(netease_router)
 app.include_router(control_router)
+app.include_router(favorites_router)
 
 
 if __name__ == "__main__":

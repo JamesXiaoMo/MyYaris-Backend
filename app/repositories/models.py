@@ -156,3 +156,18 @@ class MusicCommand(Base):
     acknowledged_at = Column(DateTime(timezone=True), nullable=True)
     error_code = Column(String(64), nullable=True)
     error_detail = Column(Text, nullable=True)
+
+
+class Favorite(Base):
+    __tablename__ = "favorites"
+
+    id = Column(String(64), primary_key=True, index=True)
+    name = Column(String(128), nullable=True, index=True)
+    address = Column(String(512), nullable=False)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    coord_system = Column(String(32), default="wgs84", nullable=False)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
