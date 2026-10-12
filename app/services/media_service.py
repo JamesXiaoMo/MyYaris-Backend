@@ -150,7 +150,7 @@ def scan_local_tracks(
                     added_count += 1
 
     db.commit()
-    total_tracks = db.query(MediaTrack).count()
+    total_tracks = db.query(MediaTrack).filter(MediaTrack.source == "local_repo").count()
 
     return {
         "status": "ok",

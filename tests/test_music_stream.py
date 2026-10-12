@@ -93,7 +93,7 @@ def test_media_scan_and_listing_api(client: TestClient, db_session, tmp_path):
     assert res2.json()["updated_count"] == 2
 
     # 3. List tracks
-    list_res = client.get("/api/v1/music/tracks")
+    list_res = client.get("/api/v1/music/tracks?source=local_repo")
     assert list_res.status_code == 200
     list_data = list_res.json()
     assert list_data["total"] == 2
@@ -104,7 +104,7 @@ def test_media_scan_and_listing_api(client: TestClient, db_session, tmp_path):
     assert all("/api/v1/music/stream/" in t["stream_url"] for t in tracks)
 
     # 4. Search keyword
-    search_res = client.get("/api/v1/music/tracks?keyword=alpha")
+    search_res = client.get("/api/v1/music/tracks?keyword=alpha&source=local_repo")
     assert search_res.status_code == 200
     assert search_res.json()["total"] == 1
     assert search_res.json()["tracks"][0]["title"] == "track_alpha"

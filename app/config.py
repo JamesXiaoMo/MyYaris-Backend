@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     LOCAL_TRACKS_DIR: str = ""
     MEDIA_CACHE_DIR: str = ""
     MEDIA_CACHE_MAX_BYTES: int = 50 * 1024 * 1024 * 1024  # 50 GB
+    NETEASE_API_BASE_URL: str = "http://127.0.0.1:3001"
 
     # Task & Polling policies
     TASK_DEFAULT_EXPIRY_MINUTES: int = 60

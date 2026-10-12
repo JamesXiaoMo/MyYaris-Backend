@@ -37,6 +37,7 @@ def list_tracks(
     keyword: Optional[str] = Query(None, description="Keyword search in title, artist, album"),
     artist: Optional[str] = Query(None, description="Filter by artist"),
     album: Optional[str] = Query(None, description="Filter by album"),
+    source: Optional[str] = Query(None, description="Filter by source: local_repo | netease_cache"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -44,6 +45,8 @@ def list_tracks(
     """List indexed music tracks with filtering and pagination."""
     query = db.query(MediaTrack)
 
+    if source and source.strip():
+        query = query.filter(MediaTrack.source == source.strip())
     if keyword and keyword.strip():
         kw = f"%{keyword.strip()}%"
         query = query.filter(
