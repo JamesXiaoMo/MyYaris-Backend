@@ -1,4 +1,5 @@
 import asyncio
+import collections
 from datetime import datetime, timezone
 import logging
 from typing import Any, Dict, List, Optional
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.repositories.models import CarDeviceStatus, utc_now
 from app.schemas.control import CarStatusReportRequest, CarStatusResponse
+from app.services.device_service import is_same_device, resolve_car_device_id
 
 logger = logging.getLogger(__name__)
 
@@ -21,34 +23,47 @@ class WebSocketConnectionManager:
 
     async def connect(self, websocket: WebSocket, client_type: str, device_id: str):
         await websocket.accept()
+        norm_device = resolve_car_device_id(device_id)
         async with self._lock:
             self.active_connections[websocket] = {
                 "client_type": client_type,
-                "device_id": device_id,
+                "device_id": norm_device,
+                "raw_device_id": device_id,
                 "connected_at": utc_now().isoformat(),
             }
-        logger.info(f"WebSocket client connected: type={client_type}, device={device_id}. Total: {len(self.active_connections)}")
+        logger.info(f"WebSocket client connected: type={client_type}, device={device_id} (norm={norm_device}). Total: {len(self.active_connections)}")
 
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
             meta = self.active_connections.pop(websocket, None)
         if meta:
-            logger.info(f"WebSocket client disconnected: type={meta.get('client_type')}, device={meta.get('device_id')}. Total: {len(self.active_connections)}")
+            logger.info(f"WebSocket client disconnected: type={meta.get('client_type')}, device={meta.get('raw_device_id')}. Total: {len(self.active_connections)}")
 
     async def broadcast_status(self, status_dict: dict, device_id: Optional[str] = None):
-        """Broadcasts playback state updates to all connected iPhone/client WebSockets."""
-        payload = {
-            "type": "status_update",
-            "timestamp": utc_now().isoformat(),
-            "data": status_dict,
-        }
+        """Broadcasts playback state updates to all connected iPhone/client WebSockets using dual envelope."""
+        norm_device = resolve_car_device_id(device_id) if device_id else None
         stale_sockets = []
 
         async with self._lock:
             targets = list(self.active_connections.items())
 
         for ws, meta in targets:
-            # Broadcast to phones, or all listening devices
+            ws_dev = meta.get("device_id")
+            if norm_device and ws_dev and not is_same_device(norm_device, ws_dev):
+                continue
+
+            client_dev = meta.get("raw_device_id") or status_dict.get("device_id")
+            conn_data = {**status_dict}
+            if client_dev:
+                conn_data["device_id"] = client_dev
+
+            # Dual envelope: top-level fields for flat parsers, plus nested "data" for envelope parsers
+            payload = {
+                "type": "status_update",
+                "timestamp": utc_now().isoformat(),
+                **conn_data,
+                "data": conn_data,
+            }
             try:
                 await ws.send_json(payload)
             except Exception as e:
@@ -61,10 +76,16 @@ class WebSocketConnectionManager:
                     self.active_connections.pop(ws, None)
 
     async def dispatch_command(self, command_dict: dict, target_device_id: str) -> int:
-        """Dispatches an immediate music command to car WebSocket clients matching target_device_id."""
+        """Dispatches an immediate music command to car WebSocket clients matching target_device_id using dual envelope."""
+        norm_target = resolve_car_device_id(target_device_id)
         payload = {
             "type": "music_command",
             "timestamp": utc_now().isoformat(),
+            "command_id": command_dict.get("command_id"),
+            "device_id": command_dict.get("device_id"),
+            "action": command_dict.get("action"),
+            "command": command_dict.get("action"),
+            "params": command_dict.get("params", {}),
             "data": command_dict,
         }
         delivered_count = 0
@@ -74,7 +95,7 @@ class WebSocketConnectionManager:
             targets = list(self.active_connections.items())
 
         for ws, meta in targets:
-            if meta.get("device_id") == target_device_id and meta.get("client_type") == "car":
+            if is_same_device(meta.get("device_id"), norm_target) and meta.get("client_type") == "car":
                 try:
                     await ws.send_json(payload)
                     delivered_count += 1
@@ -87,23 +108,54 @@ class WebSocketConnectionManager:
                 for ws in stale_sockets:
                     self.active_connections.pop(ws, None)
 
+        if delivered_count > 0 and command_dict.get("command_id"):
+            command_queue_manager.mark_ws_delivered(command_dict["command_id"])
+
         return delivered_count
 
 
 class MusicCommandQueueManager:
-    """In-memory async command queues per device for HTTP long-polling and fallback."""
+    """In-memory async command queues per device for HTTP long-polling and fallback with deduplication."""
 
     def __init__(self):
         self._queues: Dict[str, asyncio.Queue] = {}
+        self._ws_delivered_command_ids: collections.OrderedDict = collections.OrderedDict()
+        self._dispatched_command_ids: collections.OrderedDict = collections.OrderedDict()
         self._lock = asyncio.Lock()
 
+    def mark_ws_delivered(self, command_id: str):
+        if not command_id:
+            return
+        self._ws_delivered_command_ids[command_id] = True
+        while len(self._ws_delivered_command_ids) > 1000:
+            self._ws_delivered_command_ids.popitem(last=False)
+
+    def is_ws_delivered(self, command_id: str) -> bool:
+        return bool(command_id and command_id in self._ws_delivered_command_ids)
+
+    def mark_dispatched(self, command_id: str):
+        if not command_id:
+            return
+        self._dispatched_command_ids[command_id] = True
+        while len(self._dispatched_command_ids) > 1000:
+            self._dispatched_command_ids.popitem(last=False)
+
+    def is_duplicate(self, command_id: str) -> bool:
+        return bool(command_id and (command_id in self._dispatched_command_ids or command_id in self._ws_delivered_command_ids))
+
     async def _get_or_create_queue(self, device_id: str) -> asyncio.Queue:
+        norm_dev = resolve_car_device_id(device_id)
         async with self._lock:
-            if device_id not in self._queues:
-                self._queues[device_id] = asyncio.Queue(maxsize=100)
-            return self._queues[device_id]
+            if norm_dev not in self._queues:
+                self._queues[norm_dev] = asyncio.Queue(maxsize=100)
+            return self._queues[norm_dev]
 
     async def enqueue_command(self, device_id: str, command: dict):
+        cmd_id = command.get("command_id")
+        if cmd_id and self.is_ws_delivered(cmd_id):
+            return
+        if cmd_id:
+            self.mark_dispatched(cmd_id)
         queue = await self._get_or_create_queue(device_id)
         if queue.full():
             try:
@@ -114,28 +166,41 @@ class MusicCommandQueueManager:
 
     async def get_next_command(self, device_id: str, timeout_seconds: Optional[int] = None) -> Optional[dict]:
         queue = await self._get_or_create_queue(device_id)
-        if timeout_seconds is None or timeout_seconds <= 0:
-            try:
-                return queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return None
+        start_time = asyncio.get_event_loop().time()
+        remaining = float(timeout_seconds) if timeout_seconds and timeout_seconds > 0 else 0.0
 
-        try:
-            return await asyncio.wait_for(queue.get(), timeout=float(timeout_seconds))
-        except asyncio.TimeoutError:
-            return None
+        while True:
+            if timeout_seconds is None or timeout_seconds <= 0:
+                try:
+                    cmd = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return None
+            else:
+                try:
+                    cmd = await asyncio.wait_for(queue.get(), timeout=max(0.01, remaining))
+                except asyncio.TimeoutError:
+                    return None
+
+            cmd_id = cmd.get("command_id")
+            if cmd_id and self.is_ws_delivered(cmd_id):
+                logger.info(f"Skipping command {cmd_id} for HTTP polling as it was already delivered via WebSocket")
+                if timeout_seconds and timeout_seconds > 0:
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    remaining = float(timeout_seconds) - elapsed
+                    if remaining <= 0:
+                        return None
+                    continue
+                else:
+                    continue
+
+            if cmd_id:
+                self.mark_dispatched(cmd_id)
+            return cmd
 
 
 # Global singletons
 ws_manager = WebSocketConnectionManager()
 command_queue_manager = MusicCommandQueueManager()
-
-
-def resolve_car_device_id(input_id: Optional[str], default_id: Optional[str] = None) -> str:
-    chosen = input_id or default_id or settings.DEFAULT_CAR_DEVICE_ID
-    if chosen in ("car_p3pro", "ottocast_p3_pro"):
-        return settings.DEFAULT_CAR_DEVICE_ID
-    return chosen
 
 
 def save_or_update_car_status(

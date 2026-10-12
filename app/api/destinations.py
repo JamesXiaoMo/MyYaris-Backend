@@ -11,6 +11,7 @@ from app.schemas.destination import (
     DestinationQueryResponse,
 )
 from app.schemas.task import TaskOut
+from app.services.device_service import resolve_car_device_id
 from app.services.destination_service import (
     _build_query_response,
     confirm_destination_candidate,
@@ -52,7 +53,7 @@ async def confirm_destination(
         db=db,
         request_id=id,
         candidate_id=body.candidate_id,
-        target_device_id=body.target_device_id or "car_p3pro",
+        target_device_id=resolve_car_device_id(body.target_device_id),
     )
     return TaskOut(
         task_id=task.task_id,
@@ -108,11 +109,13 @@ async def resolve_destination_v1(
         create_req = DestinationCreateRequest(
             input_type=DestinationInputType.SHARE_LINK,
             url=body.raw_input,
+            auto_create_task=False,
         )
     else:
         create_req = DestinationCreateRequest(
             input_type=DestinationInputType.AUTO,
             text=body.raw_input,
+            auto_create_task=False,
         )
     query_resp = await create_destination_request(db, create_req, caller_id=user.identity)
 
@@ -148,7 +151,7 @@ async def create_task_from_destination_v1(
         raise HTTPException(status_code=404, detail="Destination or candidates not found.")
 
     cand_id = req.candidates[0].candidate_id
-    dev_id = body.target_device_id or "car_p3pro"
+    dev_id = resolve_car_device_id(body.target_device_id)
 
     task = await confirm_destination_candidate(
         db=db,

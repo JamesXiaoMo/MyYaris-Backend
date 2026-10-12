@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import uuid
 from typing import Any, Dict, Optional
 
@@ -37,6 +38,9 @@ from app.services.control_service import (
     save_or_update_car_status,
     ws_manager,
 )
+from app.services.device_service import is_same_device, resolve_car_device_id
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["Music Control & State Sync"])
 
@@ -44,6 +48,7 @@ VALID_ACTIONS = {
     "play_track",
     "pause",
     "resume",
+    "stop",
     "next",
     "prev",
     "seek",
@@ -53,13 +58,6 @@ VALID_ACTIONS = {
 }
 
 
-def resolve_car_device_id(input_id: Optional[str], user_device_id: Optional[str] = None) -> str:
-    chosen = input_id or user_device_id or settings.DEFAULT_CAR_DEVICE_ID
-    if chosen in ("car_p3pro", "ottocast_p3_pro"):
-        return settings.DEFAULT_CAR_DEVICE_ID
-    return chosen
-
-
 @router.post("/music/control/command", response_model=MusicCommandResponse)
 async def send_music_command(
     cmd: MusicCommandRequest,
@@ -67,7 +65,8 @@ async def send_music_command(
 ):
     """
     iPhone client dispatches an immediate playback control command to the vehicle.
-    Dispatched instantly via WebSocket to online car clients, and enqueued for HTTP long-poll fallback.
+    Dispatched instantly via WebSocket to online car clients, or enqueued for HTTP long-poll fallback.
+    Prevents duplicate execution via command_id tracking.
     """
     if cmd.action not in VALID_ACTIONS:
         raise HTTPException(
@@ -87,11 +86,24 @@ async def send_music_command(
         "sender_role": user.role,
     }
 
-    # 1. Enqueue for HTTP long-polling car clients
-    await command_queue_manager.enqueue_command(target_device, command_payload)
+    # Deduplicate: if caller is retrying the same command_id that was already processed
+    if cmd.command_id and command_queue_manager.is_duplicate(cmd.command_id):
+        return MusicCommandResponse(
+            status="ok",
+            command_id=cmd_id,
+            device_id=target_device,
+            action=cmd.action,
+            params=command_payload["params"],
+            queued_at=command_payload["timestamp"],
+            dispatched_to_ws=command_queue_manager.is_ws_delivered(cmd_id),
+        )
 
-    # 2. Real-time instant push to WebSocket-connected car clients
+    # 1. Real-time instant push to WebSocket-connected car clients
     delivered_count = await ws_manager.dispatch_command(command_payload, target_device)
+
+    # 2. Only enqueue for HTTP long-polling if not delivered via WebSocket
+    if delivered_count == 0:
+        await command_queue_manager.enqueue_command(target_device, command_payload)
 
     return MusicCommandResponse(
         status="ok",
@@ -117,8 +129,7 @@ async def get_next_music_command(
     target_device = resolve_car_device_id(device_id, user.device_id)
 
     if user.role == "car" and user.device_id:
-        user_dev = resolve_car_device_id(user.device_id)
-        if user_dev != target_device:
+        if not is_same_device(user.device_id, target_device):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Forbidden: Car token cannot poll commands for device {target_device}",
@@ -143,8 +154,7 @@ async def report_car_playback_status(
     """
     target_device = resolve_car_device_id(report.device_id, user.device_id)
     if user.role == "car" and user.device_id:
-        user_dev = resolve_car_device_id(user.device_id)
-        if user_dev != target_device:
+        if not is_same_device(user.device_id, target_device):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Forbidden: Car token cannot report status for device {target_device}",
@@ -208,13 +218,12 @@ async def music_websocket_endpoint(
 ):
     """
     Full-duplex WebSocket channel for real-time music control and playback state broadcasting.
-    - iPhone clients receive instant playback status updates from vehicle.
-    - Car clients receive immediate playback commands dispatched by iPhone.
+    - iPhone clients receive instant playback status updates from vehicle via dual envelope.
+    - Car clients receive immediate playback commands dispatched by iPhone with top-level actions.
     """
     # 1. Authenticate token from query param or headers
     auth_token = token
     if not auth_token:
-        # Check Authorization header from websocket headers
         auth_header = websocket.headers.get("authorization")
         if auth_header:
             auth_token = auth_header
@@ -229,20 +238,21 @@ async def music_websocket_endpoint(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # Determine client identity
+    # Determine client identity and normalized target device
     c_type = client_type if client_type in ["car", "phone"] else ("car" if user.role == "car" else "phone")
-    target_dev = device_id or user.device_id or settings.DEFAULT_CAR_DEVICE_ID
+    raw_dev = device_id or user.device_id or settings.DEFAULT_CAR_DEVICE_ID
+    norm_target = resolve_car_device_id(raw_dev)
 
-    await ws_manager.connect(websocket, client_type=c_type, device_id=target_dev)
+    await ws_manager.connect(websocket, client_type=c_type, device_id=raw_dev)
 
-    # Send initial status snapshot upon connection
-    status_row = get_car_status_by_id(db, target_dev)
+    # Send initial status snapshot upon connection in dual envelope
+    status_row = get_car_status_by_id(db, norm_target)
     if status_row:
         initial_data = car_status_to_response(status_row).model_dump()
     else:
         now_str = utc_now().isoformat()
         initial_data = {
-            "device_id": target_dev,
+            "device_id": raw_dev,
             "playback_state": "stopped",
             "current_track_id": None,
             "position_ms": 0,
@@ -254,8 +264,19 @@ async def music_websocket_endpoint(
             "updated_at": now_str,
         }
 
+    # Ensure device_id in snapshot reflects what client requested
+    if raw_dev:
+        initial_data["device_id"] = raw_dev
+
+    snapshot_payload = {
+        "type": "status_snapshot",
+        "timestamp": utc_now().isoformat(),
+        **initial_data,
+        "data": initial_data,
+    }
+
     try:
-        await websocket.send_json({"type": "status_snapshot", "data": initial_data})
+        await websocket.send_json(snapshot_payload)
     except Exception:
         await ws_manager.disconnect(websocket)
         return
@@ -271,28 +292,58 @@ async def music_websocket_endpoint(
 
             elif msg_type == "status_update" and c_type == "car":
                 # Car updates playback status via WebSocket
-                report_data = msg.get("data", {})
+                report_data = msg.get("data")
+                if not isinstance(report_data, dict) or not report_data:
+                    # Fallback to root payload for flat car implementations
+                    report_data = {k: v for k, v in msg.items() if k not in ("type", "timestamp")}
+
+                # Safety check: if payload has no valid status fields, DO NOT wipe existing status!
+                valid_status_keys = {
+                    "playback_state",
+                    "current_track_id",
+                    "position_ms",
+                    "duration_ms",
+                    "software_volume",
+                    "loop_mode",
+                    "shuffle",
+                }
+                if not any(k in report_data for k in valid_status_keys):
+                    logger.warning("Ignoring invalid status_update message without status fields: %s", msg)
+                    continue
+
+                # If playback_state or position_ms are missing from partial update, preserve existing values
+                existing_row = get_car_status_by_id(db, norm_target)
+                if "playback_state" not in report_data and existing_row:
+                    report_data["playback_state"] = existing_row.playback_state
+                if "position_ms" not in report_data and existing_row:
+                    report_data["position_ms"] = existing_row.position_ms
+
                 req = CarStatusReportRequest(**report_data)
-                saved_row = save_or_update_car_status(db, req, default_device_id=target_dev)
+                saved_row = save_or_update_car_status(db, req, default_device_id=norm_target)
                 resp = car_status_to_response(saved_row)
-                await ws_manager.broadcast_status(resp.model_dump(), device_id=target_dev)
+                await ws_manager.broadcast_status(resp.model_dump(), device_id=norm_target)
 
             elif msg_type == "command" and c_type in ["phone", "admin"]:
                 # Phone dispatches command via WebSocket
-                cmd_data = msg.get("data", {})
+                cmd_data = msg.get("data")
+                if not isinstance(cmd_data, dict) or not cmd_data:
+                    cmd_data = {k: v for k, v in msg.items() if k not in ("type", "timestamp")}
                 cmd_req = MusicCommandRequest(**cmd_data)
                 if cmd_req.action in VALID_ACTIONS:
                     cmd_id = cmd_req.command_id or f"cmd_music_{uuid.uuid4().hex[:12]}"
+                    cmd_target = resolve_car_device_id(cmd_req.device_id or norm_target)
                     command_payload = {
                         "command_id": cmd_id,
-                        "device_id": target_dev,
+                        "device_id": cmd_target,
                         "action": cmd_req.action,
                         "params": cmd_req.params.model_dump(exclude_unset=True) if cmd_req.params else {},
                         "timestamp": utc_now().isoformat(),
                         "sender_role": user.role,
                     }
-                    await command_queue_manager.enqueue_command(target_dev, command_payload)
-                    await ws_manager.dispatch_command(command_payload, target_dev)
+                    delivered = await ws_manager.dispatch_command(command_payload, cmd_target)
+                    if delivered == 0:
+                        await command_queue_manager.enqueue_command(cmd_target, command_payload)
+
                     await websocket.send_json({
                         "type": "command_ack",
                         "command_id": cmd_id,
@@ -301,5 +352,6 @@ async def music_websocket_endpoint(
 
     except WebSocketDisconnect:
         await ws_manager.disconnect(websocket)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"WebSocket session error: {e}")
         await ws_manager.disconnect(websocket)

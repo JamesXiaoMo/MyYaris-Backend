@@ -19,6 +19,7 @@ from app.schemas.destination import (
     DestinationInputType,
     DestinationQueryResponse,
 )
+from app.services.device_service import is_same_device, resolve_car_device_id
 from app.services.task_service import create_task_for_place
 
 
@@ -151,9 +152,7 @@ async def create_destination_request(
     db.commit()
 
     # 2. Process by input type
-    target_device = (req.target_device_id or settings.DEFAULT_CAR_DEVICE_ID).strip()
-    if not target_device:
-        target_device = settings.DEFAULT_CAR_DEVICE_ID
+    target_device = resolve_car_device_id(req.target_device_id)
 
     if req.input_type == DestinationInputType.AUTO:
         raw_text = (req.text or "").strip()
@@ -184,17 +183,18 @@ async def create_destination_request(
             )
             db.add(cand)
 
-            task = await create_task_for_place(
-                db=db,
-                device_id=target_device,
-                title=cand.title,
-                address=cand.address,
-                latitude=cand.latitude,
-                longitude=cand.longitude,
-                coord_system=cand.coord_system,
-                request_id=request_id,
-            )
-            parse_request.task_id = task.task_id
+            if req.auto_create_task:
+                task = await create_task_for_place(
+                    db=db,
+                    device_id=target_device,
+                    title=cand.title,
+                    address=cand.address,
+                    latitude=cand.latitude,
+                    longitude=cand.longitude,
+                    coord_system=cand.coord_system,
+                    request_id=request_id,
+                )
+                parse_request.task_id = task.task_id
             parse_request.status = "resolved"
             db.commit()
             db.refresh(parse_request)
@@ -371,17 +371,18 @@ async def create_destination_request(
             )
             db.add(cand)
 
-            task = await create_task_for_place(
-                db=db,
-                device_id=target_device,
-                title=cand.title,
-                address=cand.address,
-                latitude=cand.latitude,
-                longitude=cand.longitude,
-                coord_system=cand.coord_system,
-                request_id=request_id,
-            )
-            parse_request.task_id = task.task_id
+            if req.auto_create_task:
+                task = await create_task_for_place(
+                    db=db,
+                    device_id=target_device,
+                    title=cand.title,
+                    address=cand.address,
+                    latitude=cand.latitude,
+                    longitude=cand.longitude,
+                    coord_system=cand.coord_system,
+                    request_id=request_id,
+                )
+                parse_request.task_id = task.task_id
             parse_request.status = "resolved"
             db.commit()
             db.refresh(parse_request)
@@ -547,10 +548,16 @@ async def confirm_destination_candidate(
     if not req:
         raise HTTPException(status_code=404, detail="Destination request not found.")
 
+    target_dev = resolve_car_device_id(target_device_id)
+
     # Idempotent re-confirmation: if already resolved and has task_id
     if req.task_id:
         existing_task = db.query(Task).filter(Task.task_id == req.task_id).first()
         if existing_task:
+            if not is_same_device(existing_task.device_id, target_dev) and existing_task.status in ("queued", "received"):
+                existing_task.device_id = target_dev
+                db.commit()
+                db.refresh(existing_task)
             return existing_task
 
     cand = (
@@ -566,7 +573,7 @@ async def confirm_destination_candidate(
 
     task = await create_task_for_place(
         db=db,
-        device_id=target_device_id,
+        device_id=target_dev,
         title=cand.title,
         address=cand.address,
         latitude=cand.latitude,

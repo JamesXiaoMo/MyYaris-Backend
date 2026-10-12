@@ -8,6 +8,7 @@ from app.repositories.database import get_db
 from app.repositories.models import Task
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.task import TaskAckRequest, TaskAckResponse, TaskOut
+from app.services.device_service import is_same_device, resolve_car_device_id
 from app.services.task_service import get_next_task_long_poll, record_task_ack
 
 router = APIRouter(tags=["Tasks"])
@@ -37,14 +38,16 @@ async def get_next_task(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_car_or_admin),
 ):
-    # Car client can only poll its assigned device
-    if user.role == "car" and user.device_id and user.device_id != id:
+    norm_id = resolve_car_device_id(id)
+
+    # Car client can only poll its assigned device (supports alias equality)
+    if user.role == "car" and user.device_id and not is_same_device(user.device_id, norm_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Forbidden: Car token cannot poll for device {id}",
         )
 
-    task = await get_next_task_long_poll(db, device_id=id, timeout_seconds=timeout)
+    task = await get_next_task_long_poll(db, device_id=norm_id, timeout_seconds=timeout)
     if not task:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -58,7 +61,7 @@ async def poll_tasks(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_car_or_admin),
 ):
-    dev_id = device_id or user.device_id or settings.DEFAULT_CAR_DEVICE_ID
+    dev_id = resolve_car_device_id(device_id, user.device_id)
     return await get_next_task(id=dev_id, timeout=timeout, db=db, user=user)
 
 
@@ -75,7 +78,7 @@ def acknowledge_task(
         raise HTTPException(status_code=404, detail="Task not found.")
 
     # Prevent car client from acknowledging other devices' tasks
-    if user.role == "car" and user.device_id and task_obj.device_id != user.device_id:
+    if user.role == "car" and user.device_id and not is_same_device(user.device_id, task_obj.device_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Forbidden: Car token cannot acknowledge tasks for device {task_obj.device_id}",
@@ -119,7 +122,7 @@ def get_task(
         raise HTTPException(status_code=404, detail="Task not found.")
 
     # Car client can only view its own device's tasks
-    if user.role == "car" and user.device_id and task.device_id != user.device_id:
+    if user.role == "car" and user.device_id and not is_same_device(user.device_id, task.device_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: Car token cannot view tasks for other devices.",

@@ -5,6 +5,7 @@ from app.api.auth import get_current_user
 from app.repositories.database import get_db
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.voice import VoiceUploadResponse
+from app.services.device_service import resolve_car_device_id
 from app.services.voice_service import process_voice_upload
 
 router = APIRouter(tags=["Voice"])
@@ -21,6 +22,7 @@ async def upload_voice(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    norm_target = resolve_car_device_id(target_device_id)
     return await process_voice_upload(
         db=db,
         file=file,
@@ -29,5 +31,5 @@ async def upload_voice(
         client_lat=client_lat,
         client_lon=client_lon,
         client_time=client_time,
-        target_device_id=target_device_id,
+        target_device_id=norm_target,
     )
