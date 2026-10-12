@@ -49,8 +49,8 @@ class FavoriteBase(BaseModel):
         if not v or not v.strip():
             return "wgs84"
         norm = v.strip().lower()
-        if norm not in ("wgs84", "gcj02", "bd09"):
-            raise ValueError("Unsupported coordinate system. Supported: wgs84, gcj02, bd09.")
+        if norm != "wgs84":
+            raise ValueError("Only 'wgs84' coordinate system is supported in this version. GCJ02/BD09 without explicit transformation is rejected.")
         return norm
 
 
@@ -110,8 +110,8 @@ class FavoriteUpdateRequest(BaseModel):
         if v is None:
             return None
         norm = v.strip().lower()
-        if norm not in ("wgs84", "gcj02", "bd09"):
-            raise ValueError("Unsupported coordinate system. Supported: wgs84, gcj02, bd09.")
+        if norm != "wgs84":
+            raise ValueError("Only 'wgs84' coordinate system is supported in this version. GCJ02/BD09 without explicit transformation is rejected.")
         return norm
 
 

@@ -168,7 +168,7 @@ def test_coordinate_and_address_validation_strict(client: TestClient, phone_head
     )
     assert r_boundary.status_code == 201
 
-    # 6. Invalid coordinate system
+    # 6. Non-wgs84 coordinate systems (gcj02, bd09, mars) must be strictly rejected (422)
     r_bad_coord = client.post(
         "/api/v1/favorites",
         json={"address": "地址", "latitude": 39.9, "longitude": 116.4, "coord_system": "mars_coordinates"},
@@ -176,7 +176,21 @@ def test_coordinate_and_address_validation_strict(client: TestClient, phone_head
     )
     assert r_bad_coord.status_code == 422
 
-    # 7. Update with invalid latitude
+    r_gcj = client.post(
+        "/api/v1/favorites",
+        json={"address": "地址", "latitude": 39.9, "longitude": 116.4, "coord_system": "gcj02"},
+        headers=phone_headers,
+    )
+    assert r_gcj.status_code == 422
+
+    r_bd = client.post(
+        "/api/v1/favorites",
+        json={"address": "地址", "latitude": 39.9, "longitude": 116.4, "coord_system": "bd09"},
+        headers=phone_headers,
+    )
+    assert r_bd.status_code == 422
+
+    # 7. Update with invalid latitude or non-wgs84 coord_system
     fav_id = r_boundary.json()["id"]
     r_bad_patch = client.patch(
         f"/api/v1/favorites/{fav_id}",
@@ -184,6 +198,13 @@ def test_coordinate_and_address_validation_strict(client: TestClient, phone_head
         headers=phone_headers,
     )
     assert r_bad_patch.status_code == 422
+
+    r_bad_coord_patch = client.patch(
+        f"/api/v1/favorites/{fav_id}",
+        json={"coord_system": "gcj02"},
+        headers=phone_headers,
+    )
+    assert r_bad_coord_patch.status_code == 422
 
 
 def test_auth_boundaries_and_forbidden_roles(client: TestClient, car_headers: dict, admin_headers: dict):
@@ -215,6 +236,7 @@ def test_auth_boundaries_and_forbidden_roles(client: TestClient, car_headers: di
 
 
 def test_restart_persistence_sqlite(client: TestClient, phone_headers: dict, db_session: Session):
+    # Tests that favorite records are reliably committed to disk in SQLite and verifiable via an independent fresh DB session
     # 1. Create favorite via HTTP
     post_resp = client.post(
         "/api/v1/favorites",
@@ -224,7 +246,7 @@ def test_restart_persistence_sqlite(client: TestClient, phone_headers: dict, db_
     assert post_resp.status_code == 201
     fav_id = post_resp.json()["id"]
 
-    # 2. Query directly from fresh database session (simulating server reboot / independent connection)
+    # 2. Query directly from fresh database session (verifying SQLite disk persistence across connection boundaries)
     from app.repositories.database import SessionLocal
     with SessionLocal() as fresh_db:
         row = fresh_db.query(Favorite).filter(Favorite.id == fav_id).first()
