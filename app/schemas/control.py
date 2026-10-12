@@ -17,18 +17,52 @@ class MusicCommandParams(BaseModel):
 class MusicCommandRequest(BaseModel):
     command_id: Optional[str] = Field(None, description="Optional caller command ID or UUID")
     device_id: Optional[str] = Field(None, description="Target vehicle device ID")
-    action: str = Field(..., description="Action: play_track, pause, resume, next, prev, seek, set_loop, set_shuffle, set_volume")
+    action: str = Field(..., description="Action: play_track, pause, resume, stop, next, prev, seek, set_loop, set_shuffle, set_volume")
     params: Optional[MusicCommandParams] = Field(default_factory=MusicCommandParams)
+    expires_in_seconds: Optional[int] = Field(None, ge=5, le=300, description="Optional command TTL in seconds")
 
 
 class MusicCommandResponse(BaseModel):
-    status: str = "ok"
+    status: str = "ok"  # "ok" for client backward compatibility
+    lifecycle_status: str = "queued"  # queued | sent | received | applied | failed | expired
     command_id: str
     device_id: str
     action: str
     params: Optional[Dict[str, Any]] = None
     queued_at: str
     dispatched_to_ws: bool = False
+    expires_at: Optional[str] = None
+
+
+class MusicCommandAckRequest(BaseModel):
+    status: str = Field(..., description="received | applied | executed | failed")
+    error_code: Optional[str] = None
+    error_detail: Optional[str] = None
+    device_timestamp: Optional[str] = None
+
+
+class MusicCommandAckResponse(BaseModel):
+    command_id: str
+    status: str  # received | applied | failed
+    accepted: bool = True
+    message: Optional[str] = None
+
+
+class MusicCommandDetailResponse(BaseModel):
+    command_id: str
+    device_id: str
+    action: str
+    params: Optional[Dict[str, Any]] = None
+    status: str  # queued | sent | received | applied | failed | expired
+    sender_role: str = "phone"
+    dispatched_channel: Optional[str] = None
+    delivery_attempts: int = 0
+    created_at: str
+    expires_at: str
+    sent_at: Optional[str] = None
+    acknowledged_at: Optional[str] = None
+    error_code: Optional[str] = None
+    error_detail: Optional[str] = None
 
 
 class CarStatusReportRequest(BaseModel):

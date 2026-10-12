@@ -1,9 +1,20 @@
+import asyncio
+import datetime
+import json
 import pytest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.repositories.models import ParseRequest, Task
+from app.repositories.models import MusicCommand, ParseRequest, Task, utc_now
+from app.services.control_service import command_queue_manager
+
+
+@pytest.fixture(autouse=True)
+def clean_queue_state():
+    command_queue_manager.clear_all()
+    yield
+    command_queue_manager.clear_all()
 
 
 def test_resolve_and_dispatch_separation(client: TestClient, phone_headers: dict):
@@ -178,7 +189,6 @@ def test_websocket_dual_envelope_status_validation_and_broadcast(client: TestCli
             # Safety test: Car sends empty/invalid status update
             car_ws.send_json({"type": "status_update", "data": {}})
             # Existing database record must NOT be wiped to stopped/0!
-            # Query status via HTTP:
             http_status = client.get(
                 "/api/v1/music/control/status?device_id=car_p3pro",
                 headers={"Authorization": f"Bearer {settings.PHONE_TOKEN}"},
@@ -189,40 +199,267 @@ def test_websocket_dual_envelope_status_validation_and_broadcast(client: TestCli
             assert http_status.json()["position_ms"] == 45000
 
 
-def test_command_deduplication_between_ws_and_http_channels(
+def test_command_lifecycle_and_car_ack_http(client: TestClient, phone_headers: dict, car_headers: dict):
+    # 1. Phone dispatches command via HTTP
+    cmd_id = "cmd_lifecycle_001"
+    post_resp = client.post(
+        "/api/v1/music/control/command",
+        json={
+            "command_id": cmd_id,
+            "device_id": "car_p3pro",
+            "action": "pause",
+        },
+        headers=phone_headers,
+    )
+    assert post_resp.status_code == 200
+    res_data = post_resp.json()
+    assert res_data["command_id"] == cmd_id
+    assert res_data["lifecycle_status"] == "queued"
+
+    # 2. Query command detail
+    detail_resp = client.get(
+        f"/api/v1/music/control/command/{cmd_id}",
+        headers=phone_headers,
+    )
+    assert detail_resp.status_code == 200
+    detail_data = detail_resp.json()
+    assert detail_data["command_id"] == cmd_id
+    assert detail_data["action"] == "pause"
+    assert detail_data["status"] == "queued"
+    assert detail_data["acknowledged_at"] is None
+
+    # 3. Car acknowledges execution via HTTP POST /ack
+    ack_resp = client.post(
+        f"/api/v1/music/control/command/{cmd_id}/ack",
+        json={"status": "applied"},
+        headers=car_headers,
+    )
+    assert ack_resp.status_code == 200
+    assert ack_resp.json()["status"] == "applied"
+
+    # 4. Query detail after acknowledgement
+    detail_after = client.get(
+        f"/api/v1/music/control/command/{cmd_id}",
+        headers=phone_headers,
+    )
+    assert detail_after.status_code == 200
+    assert detail_after.json()["status"] == "applied"
+    assert detail_after.json()["acknowledged_at"] is not None
+
+
+def test_command_lifecycle_car_failure_report(client: TestClient, phone_headers: dict, car_headers: dict):
+    cmd_id = "cmd_fail_001"
+    client.post(
+        "/api/v1/music/control/command",
+        json={
+            "command_id": cmd_id,
+            "device_id": "car_p3pro",
+            "action": "play_track",
+            "params": {"track_id": "invalid_track_id"},
+        },
+        headers=phone_headers,
+    )
+
+    # Car acknowledges execution failure with error details
+    ack_resp = client.post(
+        f"/api/v1/music/control/command/{cmd_id}/ack",
+        json={
+            "status": "failed",
+            "error_code": "TRACK_DECODE_ERROR",
+            "error_detail": "Unsupported codec format",
+        },
+        headers=car_headers,
+    )
+    assert ack_resp.status_code == 200
+    assert ack_resp.json()["status"] == "failed"
+
+    # Query command status
+    detail_resp = client.get(
+        f"/api/v1/music/control/command/{cmd_id}",
+        headers=phone_headers,
+    )
+    assert detail_resp.status_code == 200
+    data = detail_resp.json()
+    assert data["status"] == "failed"
+    assert data["error_code"] == "TRACK_DECODE_ERROR"
+    assert data["error_detail"] == "Unsupported codec format"
+
+
+def test_command_idempotency_and_collision_conflict(client: TestClient, phone_headers: dict):
+    cmd_id = "cmd_idem_test_99"
+
+    # 1. First submission
+    resp1 = client.post(
+        "/api/v1/music/control/command",
+        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "resume"},
+        headers=phone_headers,
+    )
+    assert resp1.status_code == 200
+
+    # 2. Idempotent re-submission with identical action and params -> succeeds (200 OK)
+    resp2 = client.post(
+        "/api/v1/music/control/command",
+        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "resume"},
+        headers=phone_headers,
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["command_id"] == cmd_id
+
+    # 3. Conflict: same command_id with DIFFERENT action -> 409 Conflict
+    resp3 = client.post(
+        "/api/v1/music/control/command",
+        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "next"},
+        headers=phone_headers,
+    )
+    assert resp3.status_code == 409
+
+    # 4. Conflict: same command_id for DIFFERENT device -> 409 Conflict
+    resp4 = client.post(
+        "/api/v1/music/control/command",
+        json={"command_id": cmd_id, "device_id": "car_other_device", "action": "resume"},
+        headers=phone_headers,
+    )
+    assert resp4.status_code == 409
+
+
+def test_command_cross_device_ack_forbidden(client: TestClient, phone_headers: dict, monkeypatch):
+    cmd_id = "cmd_cross_device_01"
+    client.post(
+        "/api/v1/music/control/command",
+        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "pause"},
+        headers=phone_headers,
+    )
+
+    # Attempt to acknowledge using a car token from a different device
+    # Emulate an attacker/other car client with device_id="other_car_999"
+    from app.schemas.auth import AuthenticatedUser
+    from app.api import auth
+
+    def mock_require_car_other():
+        return AuthenticatedUser(identity="car_other", role="car", device_id="other_car_999")
+
+    from app.main import app
+    app.dependency_overrides[auth.require_car_or_admin] = mock_require_car_other
+
+    try:
+        ack_resp = client.post(
+            f"/api/v1/music/control/command/{cmd_id}/ack",
+            json={"status": "applied"},
+        )
+        assert ack_resp.status_code == 403
+        assert "cannot acknowledge commands for device" in ack_resp.json()["detail"]
+    finally:
+        app.dependency_overrides.pop(auth.require_car_or_admin, None)
+
+
+def test_command_ws_send_drop_recovered_by_http(
     client: TestClient, phone_headers: dict, car_headers: dict
 ):
-    # When car is connected over WebSocket, commands delivered via WS are not duplicated to HTTP poll
+    # Tests the failure mode: WS send succeeded at transport level, but car disconnected before acknowledging.
+    # The command MUST NOT be lost and MUST be recoverable via HTTP long polling!
     with client.websocket_connect(
         f"/api/v1/ws/music?token={settings.CAR_TOKEN}&client_type=car&device_id=car_p3pro"
     ) as car_ws:
         car_ws.receive_json()  # snapshot
 
-        # Phone sends command via HTTP POST with explicit command_id
-        cmd_id = "cmd_unique_dedup_001"
-        cmd_resp = client.post(
+        cmd_id = "cmd_ws_drop_recovery_01"
+        # Phone sends command while car is connected to WS
+        post_resp = client.post(
             "/api/v1/music/control/command",
-            json={
-                "command_id": cmd_id,
-                "device_id": "car_p3pro",
-                "action": "pause",
-            },
+            json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "next"},
             headers=phone_headers,
         )
-        assert cmd_resp.status_code == 200
-        assert cmd_resp.json()["dispatched_to_ws"] is True
+        assert post_resp.status_code == 200
+        assert post_resp.json()["dispatched_to_ws"] is True
 
-        # Car receives command over WebSocket
-        car_msg = car_ws.receive_json()
-        assert car_msg["type"] == "music_command"
-        assert car_msg["action"] == "pause"
-        assert car_msg["command_id"] == cmd_id
-        assert "data" in car_msg  # dual envelope
+        # Car receives over WS
+        ws_msg = car_ws.receive_json()
+        assert ws_msg["command_id"] == cmd_id
 
-        # Now car attempts to poll HTTP /api/v1/music/control/command/next
-        # It must NOT receive the already WS-delivered command
-        http_poll = client.get(
-            "/api/v1/music/control/command/next?timeout=1",
-            headers=car_headers,
-        )
-        assert http_poll.status_code == 204
+    # Now the WebSocket has DROPPED and car did NOT send an ACK!
+    # Car falls back to HTTP polling:
+    http_poll = client.get(
+        "/api/v1/music/control/command/next?timeout=2",
+        headers=car_headers,
+    )
+    assert http_poll.status_code == 200
+    polled_cmd = http_poll.json()
+    assert polled_cmd["command_id"] == cmd_id
+    assert polled_cmd["action"] == "next"
+
+    # Car acknowledges via HTTP
+    ack_resp = client.post(
+        f"/api/v1/music/control/command/{cmd_id}/ack",
+        json={"status": "applied"},
+        headers=car_headers,
+    )
+    assert ack_resp.status_code == 200
+
+
+def test_command_ttl_expiration_no_stale_replay(client: TestClient, phone_headers: dict, car_headers: dict):
+    # Transient seek command with short TTL
+    cmd_id = "cmd_stale_seek_001"
+    post_resp = client.post(
+        "/api/v1/music/control/command",
+        json={
+            "command_id": cmd_id,
+            "device_id": "car_p3pro",
+            "action": "seek",
+            "params": {"seek_ms": 99000},
+            "expires_in_seconds": 5,
+        },
+        headers=phone_headers,
+    )
+    assert post_resp.status_code == 200
+
+    # Simulate time elapsed past expires_at
+    from app.services.control_service import command_queue_manager
+    # Pull from queue and expire the timestamp
+    queue = asyncio.run(command_queue_manager._get_or_create_queue("car_p3pro"))
+    cmd = queue.get_nowait()
+    cmd["expires_at"] = (utc_now() - datetime.timedelta(seconds=10)).isoformat()
+    queue.put_nowait(cmd)
+
+    # Car polls HTTP: expired seek command must be skipped and NOT returned
+    poll_resp = client.get(
+        "/api/v1/music/control/command/next?timeout=1",
+        headers=car_headers,
+    )
+    assert poll_resp.status_code == 204
+
+
+def test_websocket_car_ack_broadcasts_to_phone(client: TestClient, phone_headers: dict):
+    with client.websocket_connect(
+        f"/api/v1/ws/music?token={settings.PHONE_TOKEN}&client_type=phone&device_id=car_p3pro"
+    ) as phone_ws:
+        phone_ws.receive_json()  # snapshot
+
+        with client.websocket_connect(
+            f"/api/v1/ws/music?token={settings.CAR_TOKEN}&client_type=car&device_id=car_p3pro"
+        ) as car_ws:
+            car_ws.receive_json()  # snapshot
+
+            cmd_id = "cmd_ws_ack_broadcast_01"
+            # Phone sends command via HTTP
+            client.post(
+                "/api/v1/music/control/command",
+                json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "resume"},
+                headers=phone_headers,
+            )
+            # Car gets command
+            car_msg = car_ws.receive_json()
+            assert car_msg["command_id"] == cmd_id
+
+            # Car sends command_ack over WebSocket
+            car_ws.send_json({
+                "type": "command_ack",
+                "command_id": cmd_id,
+                "status": "applied",
+            })
+
+            # Phone receives broadcast of command execution!
+            phone_status_msg = phone_ws.receive_json()
+            assert phone_status_msg["type"] == "command_status"
+            assert phone_status_msg["command_id"] == cmd_id
+            assert phone_status_msg["status"] == "applied"
+            assert "data" in phone_status_msg

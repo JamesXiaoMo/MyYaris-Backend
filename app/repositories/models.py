@@ -137,3 +137,22 @@ class CarDeviceStatus(Base):
     shuffle_enabled = Column(Boolean, default=False, nullable=False)
     last_heartbeat_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class MusicCommand(Base):
+    __tablename__ = "music_commands"
+
+    command_id = Column(String(64), primary_key=True, index=True)
+    device_id = Column(String(64), nullable=False, index=True)
+    action = Column(String(32), nullable=False)
+    params_json = Column(Text, nullable=True)
+    status = Column(String(32), default="queued", index=True)  # queued | sent | received | applied | failed | expired
+    sender_role = Column(String(32), default="phone")
+    dispatched_channel = Column(String(32), nullable=True)  # ws | http
+    delivery_attempts = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), default=utc_now, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+    error_code = Column(String(64), nullable=True)
+    error_detail = Column(Text, nullable=True)
