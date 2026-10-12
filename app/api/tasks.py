@@ -63,6 +63,7 @@ async def poll_tasks(
 
 
 @router.post("/tasks/{id}/ack", response_model=TaskAckResponse)
+@router.post("/api/v1/tasks/{id}/ack", response_model=TaskAckResponse)
 def acknowledge_task(
     id: str,
     ack: TaskAckRequest,

@@ -26,7 +26,11 @@ from app.schemas.netease import (
     CacheStatsResponse,
     NeteaseIntelligenceRequest,
     NeteaseIntelligenceResponse,
+    NeteaseLoginStatusResponse,
     NeteaseLyricResponse,
+    NeteaseQRCheckResponse,
+    NeteaseQRCreateResponse,
+    NeteaseQRKeyResponse,
     NeteaseSearchResponse,
     NeteaseSongItem,
     NeteaseSongUrlResponse,
@@ -304,3 +308,75 @@ def trigger_cache_cleanup(
         "evicted_bytes": evicted_bytes,
         "remaining_stats": cache_manager.get_cache_stats(db),
     }
+
+
+@router.get("/netease/login/qr/key", response_model=NeteaseQRKeyResponse)
+async def get_login_qr_key(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Generate unikey for Netease QR login session."""
+    key = await netease_service.get_qr_key()
+    return NeteaseQRKeyResponse(code=200, unikey=key)
+
+
+@router.get("/netease/login/qr/create", response_model=NeteaseQRCreateResponse)
+async def create_login_qr(
+    key: str = Query(..., description="Unikey from /login/qr/key"),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Create QR code image (Base64 PNG) and URL for scanning."""
+    data = await netease_service.create_qr(key=key)
+    return NeteaseQRCreateResponse(
+        code=200,
+        qrurl=data.get("qrurl", ""),
+        qrimg=data.get("qrimg", ""),
+    )
+
+
+@router.get("/netease/login/qr/check", response_model=NeteaseQRCheckResponse)
+async def check_login_qr(
+    key: str = Query(..., description="Unikey from /login/qr/key"),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Poll QR code scan and authorization status."""
+    res = await netease_service.check_qr(key=key)
+    return NeteaseQRCheckResponse(**res)
+
+
+@router.get("/netease/login/status", response_model=NeteaseLoginStatusResponse)
+async def get_login_status(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Check current user login status and profile from stored cookie."""
+    info = netease_service.cookie_store.get_info()
+    if not info.get("logged_in"):
+        return NeteaseLoginStatusResponse(code=200, logged_in=False)
+
+    profile = info.get("profile") or {}
+    return NeteaseLoginStatusResponse(
+        code=200,
+        logged_in=True,
+        user_id=profile.get("user_id"),
+        nickname=profile.get("nickname"),
+        avatar_url=profile.get("avatar_url"),
+        vip_type=profile.get("vip_type"),
+        cookie_updated_at=info.get("updated_at"),
+    )
+
+
+@router.post("/netease/login/refresh")
+async def refresh_login_cookie(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Refresh and renew stored Netease login cookie."""
+    ok = await netease_service.refresh_cookie()
+    return {"status": "ok" if ok else "failed", "refreshed": ok}
+
+
+@router.post("/netease/login/logout")
+async def logout_netease(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Clear Netease login session and remove stored cookie."""
+    ok = await netease_service.logout()
+    return {"status": "ok", "logged_out": ok}

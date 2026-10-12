@@ -55,3 +55,32 @@ class CacheStatsResponse(BaseModel):
     max_bytes: int
     usage_percentage: float
     tracks_in_db: int
+
+
+class NeteaseQRKeyResponse(BaseModel):
+    code: int = 200
+    unikey: str
+
+
+class NeteaseQRCreateResponse(BaseModel):
+    code: int = 200
+    qrurl: str
+    qrimg: str
+
+
+class NeteaseQRCheckResponse(BaseModel):
+    code: int
+    status: str
+    message: str
+    cookie_saved: bool = False
+    nickname: Optional[str] = None
+
+
+class NeteaseLoginStatusResponse(BaseModel):
+    code: int = 200
+    logged_in: bool
+    user_id: Optional[int] = None
+    nickname: Optional[str] = None
+    avatar_url: Optional[str] = None
+    vip_type: Optional[int] = None
+    cookie_updated_at: Optional[str] = None

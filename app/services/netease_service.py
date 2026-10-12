@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -15,16 +16,174 @@ from app.services.media_service import record_track_access
 logger = logging.getLogger(__name__)
 
 
+class NeteaseCookieStore:
+    """Manages persistent encrypted/local storage of Netease user authorization Cookie."""
+
+    def __init__(self, storage_path: Optional[Path] = None):
+        self.path = storage_path or (Path(settings.DATA_DIR) / "netease_cookie.json")
+
+    def save(self, cookie: str, profile: Optional[dict] = None):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "cookie": cookie,
+            "updated_at": utc_now().isoformat(),
+            "profile": profile or {},
+        }
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"Netease cookie successfully saved to {self.path}")
+
+    def load(self) -> Optional[str]:
+        if not self.path.exists():
+            return None
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("cookie")
+        except Exception as e:
+            logger.warning(f"Failed to read Netease cookie file: {e}")
+            return None
+
+    def get_info(self) -> dict:
+        if not self.path.exists():
+            return {"logged_in": False, "cookie": None, "profile": None, "updated_at": None}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {
+                    "logged_in": bool(data.get("cookie")),
+                    "cookie": data.get("cookie"),
+                    "profile": data.get("profile"),
+                    "updated_at": data.get("updated_at"),
+                }
+        except Exception:
+            return {"logged_in": False, "cookie": None, "profile": None, "updated_at": None}
+
+    def clear(self):
+        if self.path.exists():
+            try:
+                self.path.unlink()
+                logger.info("Netease cookie cleared from disk")
+            except OSError:
+                pass
+
+    @property
+    def has_cookie(self) -> bool:
+        return self.load() is not None
+
+
 class NeteaseService:
     """Interfaces with the upstream NeteaseCloudMusicApi container."""
 
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or settings.NETEASE_API_BASE_URL).rstrip("/")
+        self.cookie_store = NeteaseCookieStore()
+
+    def _with_cookie_param(self, params: Optional[dict] = None) -> dict:
+        p = dict(params or {})
+        cookie = self.cookie_store.load()
+        if cookie:
+            p["cookie"] = cookie
+        return p
+
+    async def get_qr_key(self) -> str:
+        url = f"{self.base_url}/login/qr/key"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params={"timestamp": int(utc_now().timestamp() * 1000)})
+            data = resp.json()
+            return data.get("data", {}).get("unikey", "")
+
+    async def create_qr(self, key: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/login/qr/create"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params={"key": key, "qrimg": "true", "timestamp": int(utc_now().timestamp() * 1000)})
+            data = resp.json()
+            return data.get("data", {})
+
+    async def check_qr(self, key: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/login/qr/check"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params={"key": key, "timestamp": int(utc_now().timestamp() * 1000)})
+            data = resp.json()
+            code = data.get("code")
+
+            if code == 803:
+                cookie = data.get("cookie", "")
+                profile = await self.get_profile_by_cookie(cookie)
+                self.cookie_store.save(cookie, profile)
+                nickname = profile.get("nickname") if profile else None
+                return {
+                    "code": 803,
+                    "status": "authorized",
+                    "message": "登录成功",
+                    "cookie_saved": True,
+                    "nickname": nickname,
+                }
+            elif code == 800:
+                return {"code": 800, "status": "expired", "message": "二维码已过期", "cookie_saved": False}
+            elif code == 801:
+                return {"code": 801, "status": "waiting_scan", "message": "等待扫码", "cookie_saved": False}
+            elif code == 802:
+                return {"code": 802, "status": "waiting_confirm", "message": "待确认授权", "cookie_saved": False}
+            else:
+                return {"code": code or 500, "status": "unknown", "message": data.get("message", "未知状态"), "cookie_saved": False}
+
+    async def get_profile_by_cookie(self, cookie: Optional[str] = None) -> Optional[dict]:
+        c = cookie or self.cookie_store.load()
+        if not c:
+            return None
+        url = f"{self.base_url}/login/status"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params={"cookie": c, "timestamp": int(utc_now().timestamp() * 1000)})
+                data = resp.json().get("data", {})
+                profile = data.get("profile") or {}
+                account = data.get("account") or {}
+                if profile or account:
+                    return {
+                        "user_id": account.get("id") or profile.get("userId"),
+                        "nickname": profile.get("nickname") or account.get("userName"),
+                        "avatar_url": profile.get("avatarUrl"),
+                        "vip_type": profile.get("vipType") or account.get("vipType"),
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to fetch profile: {e}")
+        return None
+
+    async def refresh_cookie(self) -> bool:
+        cookie = self.cookie_store.load()
+        if not cookie:
+            return False
+        url = f"{self.base_url}/login/refresh"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params={"cookie": cookie, "timestamp": int(utc_now().timestamp() * 1000)})
+                data = resp.json()
+                if data.get("code") == 200:
+                    new_cookie = data.get("cookie")
+                    if new_cookie:
+                        self.cookie_store.save(new_cookie)
+                    return True
+        except Exception as e:
+            logger.warning(f"Failed to refresh cookie: {e}")
+        return False
+
+    async def logout(self) -> bool:
+        cookie = self.cookie_store.load()
+        if cookie:
+            url = f"{self.base_url}/logout"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.get(url, params={"cookie": cookie})
+            except Exception:
+                pass
+        self.cookie_store.clear()
+        return True
 
     async def search(self, keyword: str, page: int = 1, limit: int = 20) -> Dict[str, Any]:
         offset = max(0, (page - 1) * limit)
         url = f"{self.base_url}/cloudsearch"
-        params = {"keywords": keyword, "offset": offset, "limit": limit, "type": 1}
+        params = self._with_cookie_param({"keywords": keyword, "offset": offset, "limit": limit, "type": 1})
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -67,7 +226,8 @@ class NeteaseService:
         url_v1 = f"{self.base_url}/song/url/v1"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url_v1, params={"id": song_id, "level": level})
+                params = self._with_cookie_param({"id": song_id, "level": level})
+                resp = await client.get(url_v1, params=params)
                 if resp.status_code == 200:
                     data = resp.json().get("data", [])
                     if data and data[0].get("url"):
@@ -86,7 +246,8 @@ class NeteaseService:
         url_std = f"{self.base_url}/song/url"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url_std, params={"id": song_id, "br": 320000})
+                params = self._with_cookie_param({"id": song_id, "br": 320000})
+                resp = await client.get(url_std, params=params)
                 if resp.status_code == 200:
                     data = resp.json().get("data", [])
                     if data and data[0].get("url"):
@@ -109,7 +270,7 @@ class NeteaseService:
         Falls back to simi/song if login credentials are not present (code 301).
         """
         url_intel = f"{self.base_url}/playmode/intelligence/list"
-        params = {"id": seed_song_id, "pid": playlist_id or ""}
+        params = self._with_cookie_param({"id": seed_song_id, "pid": playlist_id or ""})
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
