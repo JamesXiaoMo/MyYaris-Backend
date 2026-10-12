@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 from fastapi import HTTPException, WebSocket, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -179,17 +180,21 @@ class MusicCommandQueueManager:
     """
     In-memory async command queues per device for HTTP long-polling and WS-fallback.
     Tracks command acknowledgements and prevents duplicate execution without premature eviction.
+    Supports recovering unacknowledged commands from SQLite on server restart or on demand.
     """
 
     def __init__(self):
         self._queues: Dict[str, asyncio.Queue] = {}
         self._acknowledged_command_ids: collections.OrderedDict = collections.OrderedDict()
+        self._enqueued_command_ids: set = set()
+        self._recovered_devices: set = set()
         self._lock = asyncio.Lock()
 
     def mark_acknowledged(self, command_id: str):
         if not command_id:
             return
         self._acknowledged_command_ids[command_id] = True
+        self._enqueued_command_ids.discard(command_id)
         while len(self._acknowledged_command_ids) > 1000:
             self._acknowledged_command_ids.popitem(last=False)
 
@@ -207,31 +212,109 @@ class MusicCommandQueueManager:
         """Clears all in-memory queues and tracking state (used in testing)."""
         self._queues.clear()
         self._acknowledged_command_ids.clear()
+        self._enqueued_command_ids.clear()
+        self._recovered_devices.clear()
+
+    async def recover_from_db(self, db: Session, device_id: Optional[str] = None):
+        """
+        Recovers unacknowledged, unexpired commands from SQLite into memory queues.
+        Populates _acknowledged_command_ids from terminal database records to prevent replay.
+        """
+        async with self._lock:
+            # 1. Populate terminal commands into _acknowledged_command_ids
+            term_rows = (
+                db.query(MusicCommand.command_id)
+                .filter(MusicCommand.status.in_(["applied", "failed", "expired"]))
+                .order_by(MusicCommand.created_at.desc())
+                .limit(1000)
+                .all()
+            )
+            for (cid,) in term_rows:
+                if cid:
+                    self._acknowledged_command_ids[cid] = True
+
+            # 2. Query unacknowledged, unexpired commands (FIFO order)
+            query = (
+                db.query(MusicCommand)
+                .filter(MusicCommand.status.in_(["queued", "sent", "received"]))
+                .order_by(MusicCommand.created_at.asc())
+            )
+            if device_id:
+                norm_dev = resolve_car_device_id(device_id)
+                query = query.filter(MusicCommand.device_id == norm_dev)
+                self._recovered_devices.add(norm_dev)
+            else:
+                self._recovered_devices.add("__all__")
+
+            pending_rows = query.all()
+            for row in pending_rows:
+                if _is_expired(row.expires_at):
+                    row.status = "expired"
+                    continue
+                if row.command_id in self._acknowledged_command_ids:
+                    continue
+                if row.command_id in self._enqueued_command_ids:
+                    continue
+
+                params_dict = json.loads(row.params_json) if row.params_json else {}
+                cmd_dict = {
+                    "command_id": row.command_id,
+                    "device_id": row.device_id,
+                    "action": row.action,
+                    "params": params_dict,
+                    "timestamp": row.created_at.isoformat(),
+                    "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+                    "sender_role": row.sender_role,
+                    "ws_dispatched_at": None,
+                }
+
+                target_dev = resolve_car_device_id(row.device_id)
+                if target_dev not in self._queues:
+                    self._queues[target_dev] = asyncio.Queue(maxsize=50)
+                q = self._queues[target_dev]
+                if not q.full():
+                    await q.put(cmd_dict)
+                    self._enqueued_command_ids.add(row.command_id)
+
+            db.commit()
 
     async def enqueue_command(self, device_id: str, command: dict):
         """Enqueues command for car long-poll delivery."""
         cmd_id = command.get("command_id")
-        if cmd_id and self.is_acknowledged(cmd_id):
-            return
+        if cmd_id:
+            if self.is_acknowledged(cmd_id):
+                return
+            if cmd_id in self._enqueued_command_ids:
+                return
 
         queue = await self._get_or_create_queue(device_id)
         if queue.full():
             try:
-                queue.get_nowait()  # Evict oldest unconsumed command to maintain bound
+                evicted = queue.get_nowait()  # Evict oldest unconsumed command to maintain bound
+                if isinstance(evicted, dict) and evicted.get("command_id"):
+                    self._enqueued_command_ids.discard(evicted.get("command_id"))
             except asyncio.QueueEmpty:
                 pass
         await queue.put(command)
+        if cmd_id:
+            self._enqueued_command_ids.add(cmd_id)
 
     async def get_next_command(
         self,
         device_id: str,
         timeout_seconds: Optional[int] = None,
+        db: Optional[Session] = None,
     ) -> Optional[dict]:
         """
         Polls the next pending, unacknowledged, unexpired command.
         Skips commands that have already been acknowledged or expired.
+        Automatically recovers from SQLite if this device has not been recovered yet.
         """
-        queue = await self._get_or_create_queue(device_id)
+        norm_dev = resolve_car_device_id(device_id)
+        if db is not None and norm_dev not in self._recovered_devices and "__all__" not in self._recovered_devices:
+            await self.recover_from_db(db, device_id=norm_dev)
+
+        queue = await self._get_or_create_queue(norm_dev)
         start_time = asyncio.get_event_loop().time()
         remaining = float(timeout_seconds) if timeout_seconds and timeout_seconds > 0 else 0.0
 
@@ -248,6 +331,9 @@ class MusicCommandQueueManager:
                     return None
 
             cmd_id = cmd.get("command_id")
+            if cmd_id:
+                self._enqueued_command_ids.discard(cmd_id)
+
             # 1. Skip if already acknowledged/applied
             if cmd_id and self.is_acknowledged(cmd_id):
                 logger.debug(f"Skipping command {cmd_id}: already acknowledged")
@@ -288,6 +374,8 @@ class MusicCommandQueueManager:
                     logger.debug(f"Command {cmd_id} waiting for WS ACK (age={age:.1f}s)")
                     # Re-enqueue at back of queue
                     await queue.put(cmd)
+                    if cmd_id:
+                        self._enqueued_command_ids.add(cmd_id)
                     if timeout_seconds and timeout_seconds > 0:
                         await asyncio.sleep(0.5)
                         elapsed = asyncio.get_event_loop().time() - start_time
@@ -361,10 +449,29 @@ def create_or_get_music_command(
         expires_at=expires_at,
         delivery_attempts=0,
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row, True
+    try:
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row, True
+    except IntegrityError:
+        db.rollback()
+        # Handle concurrent insertion of the same command_id
+        existing = db.query(MusicCommand).filter(MusicCommand.command_id == cmd_id).first()
+        if existing:
+            if not is_same_device(existing.device_id, norm_dev):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Command ID '{cmd_id}' already exists for another device '{existing.device_id}'.",
+                )
+            existing_params = json.loads(existing.params_json) if existing.params_json else {}
+            if existing.action != cmd_req.action or existing_params != incoming_params:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Command ID '{cmd_id}' already exists with different action or parameters.",
+                )
+            return existing, False
+        raise
 
 
 def record_command_sent(
@@ -399,6 +506,7 @@ def record_command_ack(
     Records vehicle acknowledgement of command execution.
     Supports status: received, applied (executed), failed.
     Prevents cross-device ack.
+    Terminal states (applied, failed, expired) are immutable and idempotent.
     """
     cmd = db.query(MusicCommand).filter(MusicCommand.command_id == command_id).first()
     if not cmd:
@@ -411,6 +519,11 @@ def record_command_ack(
             detail=f"Forbidden: Car token for '{car_device_id}' cannot acknowledge commands for device '{cmd.device_id}'.",
         )
 
+    # Terminal state protection: applied, failed, expired cannot be rolled back or mutated
+    if cmd.status in ("applied", "failed", "expired"):
+        command_queue_manager.mark_acknowledged(command_id)
+        return cmd
+
     norm_status = ack_status.lower().strip()
     if norm_status in ("applied", "executed", "ok", "success"):
         cmd.status = "applied"
@@ -421,8 +534,8 @@ def record_command_ack(
         cmd.error_detail = error_detail
         command_queue_manager.mark_acknowledged(command_id)
     elif norm_status == "received":
-        if cmd.status not in ("applied", "failed"):
-            cmd.status = "received"
+        cmd.status = "received"
+        # DO NOT call mark_acknowledged: received is not execution completion
     else:
         cmd.status = norm_status
 

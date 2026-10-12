@@ -19,6 +19,10 @@ async def lifespan(app: FastAPI):
     settings.init_directories()
     Base.metadata.create_all(bind=engine)
     clean_stale_audio_files()
+    from app.repositories.database import SessionLocal
+    from app.services.control_service import command_queue_manager
+    with SessionLocal() as db:
+        await command_queue_manager.recover_from_db(db)
     yield
     # Shutdown actions
     clean_stale_audio_files()

@@ -145,7 +145,7 @@ async def get_next_music_command(
                 detail=f"Forbidden: Car token cannot poll commands for device {target_device}",
             )
 
-    cmd = await command_queue_manager.get_next_command(target_device, timeout_seconds=timeout)
+    cmd = await command_queue_manager.get_next_command(target_device, timeout_seconds=timeout, db=db)
     if not cmd:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -417,8 +417,19 @@ async def music_websocket_endpoint(
                         await websocket.send_json({
                             "type": "command_ack",
                             "command_id": cmd_req.command_id or "",
-                            "status": "error",
+                            "status": "conflict" if he.status_code == status.HTTP_409_CONFLICT else "error",
                             "error": he.detail,
+                        })
+                        continue
+
+                    # If duplicate command ID: DO NOT re-dispatch or re-enqueue!
+                    if not is_new:
+                        await websocket.send_json({
+                            "type": "command_ack",
+                            "command_id": cmd_row.command_id,
+                            "status": "duplicate" if cmd_row.status in ("queued", "sent") else cmd_row.status,
+                            "lifecycle_status": cmd_row.status,
+                            "duplicate": True,
                         })
                         continue
 
