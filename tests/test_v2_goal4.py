@@ -81,6 +81,26 @@ def test_netease_qr_login_flow(client, phone_headers, tmp_path):
         assert logout_resp.json()["logged_out"] is True
         assert not test_cookie_file.exists()
 
+    # 7. Direct Cookie Import Login
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "code": 200,
+            "data": {"profile": {"userId": 99999, "nickname": "DirectVipUser", "vipType": 11}},
+        }
+        mock_get.return_value = mock_resp
+
+        cookie_resp = client.post(
+            "/api/v1/music/netease/login/cookie",
+            json={"cookie": "MUSIC_U=direct_vip_token;"},
+            headers=phone_headers,
+        )
+        assert cookie_resp.status_code == 200
+        assert cookie_resp.json()["logged_in"] is True
+        assert cookie_resp.json()["nickname"] == "DirectVipUser"
+        assert test_cookie_file.exists()
+
+
 
 from app.providers.base import PlaceCandidateItem
 from app.providers.google_maps_parser import MapUrlResolutionResult

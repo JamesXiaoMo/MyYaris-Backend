@@ -84,3 +84,8 @@ class NeteaseLoginStatusResponse(BaseModel):
     avatar_url: Optional[str] = None
     vip_type: Optional[int] = None
     cookie_updated_at: Optional[str] = None
+
+
+class NeteaseCookieLoginRequest(BaseModel):
+    cookie: str
+

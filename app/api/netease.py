@@ -21,9 +21,11 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user
 from app.config import settings
 from app.repositories.database import SessionLocal, get_db
+from app.repositories.models import utc_now
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.netease import (
     CacheStatsResponse,
+    NeteaseCookieLoginRequest,
     NeteaseIntelligenceRequest,
     NeteaseIntelligenceResponse,
     NeteaseLoginStatusResponse,
@@ -380,3 +382,29 @@ async def logout_netease(
     """Clear Netease login session and remove stored cookie."""
     ok = await netease_service.logout()
     return {"status": "ok", "logged_out": ok}
+
+
+@router.post("/netease/login/cookie", response_model=NeteaseLoginStatusResponse)
+async def login_with_cookie(
+    body: NeteaseCookieLoginRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Directly save and authenticate with a provided Netease Cookie string (e.g. MUSIC_U=...)."""
+    raw_cookie = body.cookie.strip()
+    if not raw_cookie.startswith("MUSIC_U=") and "=" not in raw_cookie:
+        cookie_str = f"MUSIC_U={raw_cookie};"
+    else:
+        cookie_str = raw_cookie
+
+    profile = await netease_service.get_profile_by_cookie(cookie_str)
+    netease_service.cookie_store.save(cookie_str, profile)
+    return NeteaseLoginStatusResponse(
+        code=200,
+        logged_in=True,
+        user_id=profile.get("user_id") if profile else None,
+        nickname=profile.get("nickname") if profile else None,
+        avatar_url=profile.get("avatar_url") if profile else None,
+        vip_type=profile.get("vip_type") if profile else None,
+        cookie_updated_at=utc_now().isoformat(),
+    )
+
