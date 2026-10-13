@@ -293,8 +293,15 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   - **上游异常处理**：若网易云服务不可用、上游返回 5xx/4xx 错误或连接超时，直接向客户端返回 **HTTP 502 Bad Gateway** 或 **HTTP 504 Gateway Timeout**，杜绝将上游挂死/网络故障伪装为 0 结果空列表；
 - `GET /api/v1/music/netease/playlist/favorite?offset=0&limit=30`：分页获取当前网易云账号专属「我喜欢的音乐」
   - **权限约束**：仅限 `admin` 管理员角色（及过渡期 legacy phone 凭据）访问；普通注册用户 (`user`) 或车机硬件 (`car`) 访问返回 **HTTP 403 Forbidden**；匿名未鉴权请求返回 **HTTP 401 Unauthorized**；
-  - **会话状态**：若后端全局网易云账号尚未登录，返回 **HTTP 409 Conflict**，避免误触发客户端注销 MyYaris 自身会话；
-  - **歌单定位**：依据第三方 API（`Binaryify/NeteaseCloudMusicApi`）规范，通过 `specialType == 5` 及所有者 UID 精确匹配，不硬编码 ID，不依赖歌单中文名匹配；
+  - **会话状态与错误语义**：
+    - 若后端全局网易云账号尚未登录，返回 **HTTP 409 Conflict**，避免误触发客户端注销 MyYaris 自身会话；
+    - 若账号切换导致异步定位中会话凭证失效，安全中断并返回 **HTTP 409 Conflict**，杜绝跨账号脏数据污染缓存；
+    - 若歌单存在多个匹配候选，返回 **HTTP 409 Conflict**（明确指示多重歧义，杜绝误读）；
+    - 若无证据证明归属于当前 Owner 或 Owner 匹配不一致，返回 **HTTP 404 Not Found**；
+  - **严格所有者闭环识别**：依据第三方 API（`Binaryify/NeteaseCloudMusicApi`）规范：
+    - `specialType == 5` 仅作为候选类型提示，必须满足 `creator.userId == current_owner_uid`；
+    - 若上游 `/user/playlist` 列表条目缺失 `creator` 属性，后端**严禁静默接纳**，自动穿透调用 `/playlist/detail` 获取全量歌单元数据补全所有者验证；若补全后仍缺失或所有者不一致则断然剔除；
+    - 绝不依赖硬编码 Playlist ID，绝不依赖歌单中文名模糊匹配，严禁返回其他账号私人歌单；
   - **分页与排序**：支持 `offset`（ge=0）与 `limit`（ge=1, le=100，默认 30），保持上游原生返回顺序；offset 越界或空歌单返回合法空页 (`songs: []`, `has_more: false`)；
   - **音轨与权限元数据**：返回标准化 `NeteaseSongItem`（包含 `id`, `song_id`, `title`, `artist`, `album`, `duration_ms`, `cover_url`, `cached`, `stream_url`, `fee`, `playable`, `source: "netease"`），兼容现有 Stage 1 播放模型（同时提供 `songs` 与 `tracks` 字段便于客户端直接调用 `playTrack`）；
   - **上游错误透传**：上游 5xx 返回 **HTTP 502 Bad Gateway**，超时返回 **HTTP 504 Gateway Timeout**，严禁吞咽异常掩盖为空列表；

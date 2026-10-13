@@ -657,3 +657,223 @@ def test_favorite_playlist_cache_invalidation_on_cookie_change():
     assert netease_service._cached_cookie_signature is None
 
 
+def test_favorite_playlist_missing_creator_supplemented_by_detail_success(client, admin_headers):
+    fake_uid = 11223344
+    netease_service.invalidate_favorite_cache()
+
+    mock_profile = {"user_id": fake_uid, "nickname": "TestUser"}
+    # Candidate lacks creator field in user/playlist
+    mock_playlists_data = {
+        "code": 200,
+        "playlist": [
+            {
+                "id": 998877,
+                "name": "我喜欢的音乐",
+                "specialType": 5,
+                # creator is completely missing
+                "trackCount": 15,
+            },
+        ],
+    }
+    # But /playlist/detail provides creator with matching userId
+    mock_detail_data = {
+        "code": 200,
+        "playlist": {
+            "id": 998877,
+            "name": "我喜欢的音乐",
+            "creator": {"userId": fake_uid},
+            "trackCount": 15,
+            "coverImgUrl": "https://example.com/cover.jpg",
+        },
+    }
+    mock_tracks_data = {
+        "code": 200,
+        "songs": [{"id": 101, "name": "Song 1", "ar": [], "al": {}, "dt": 120000}],
+        "privileges": [{"id": 101, "st": 0, "fee": 0}],
+    }
+
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=valid_cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                def fake_get(url, **kwargs):
+                    m = MagicMock()
+                    m.status_code = 200
+                    if "/user/playlist" in url:
+                        m.json.return_value = mock_playlists_data
+                    elif "/playlist/detail" in url:
+                        m.json.return_value = mock_detail_data
+                    elif "/playlist/track/all" in url:
+                        m.json.return_value = mock_tracks_data
+                    else:
+                        m.json.return_value = {"code": 200}
+                    return m
+
+                mock_get.side_effect = fake_get
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite", headers=admin_headers)
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["playlist_id"] == 998877
+                assert data["total"] == 15
+                assert len(data["songs"]) == 1
+
+
+def test_favorite_playlist_missing_creator_detail_fails_rejected(client, admin_headers):
+    fake_uid = 11223344
+    netease_service.invalidate_favorite_cache()
+
+    mock_profile = {"user_id": fake_uid, "nickname": "TestUser"}
+    mock_playlists_data = {
+        "code": 200,
+        "playlist": [
+            {
+                "id": 998877,
+                "name": "我喜欢的音乐",
+                "specialType": 5,
+                # creator missing
+            },
+        ],
+    }
+    # /playlist/detail also fails or has wrong creator
+    mock_detail_data = {
+        "code": 200,
+        "playlist": {
+            "id": 998877,
+            "creator": {"userId": 99999999},  # Wrong owner
+        },
+    }
+
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=valid_cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                def fake_get(url, **kwargs):
+                    m = MagicMock()
+                    m.status_code = 200
+                    if "/user/playlist" in url:
+                        m.json.return_value = mock_playlists_data
+                    elif "/playlist/detail" in url:
+                        m.json.return_value = mock_detail_data
+                    return m
+
+                mock_get.side_effect = fake_get
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite", headers=admin_headers)
+                assert resp.status_code == 404
+                assert "ownership mismatch" in resp.json()["detail"].lower() or "not found" in resp.json()["detail"].lower()
+
+
+def test_favorite_playlist_wrong_owner_strictly_rejected(client, admin_headers):
+    fake_uid = 11223344
+    netease_service.invalidate_favorite_cache()
+
+    mock_profile = {"user_id": fake_uid, "nickname": "TestUser"}
+    # Candidate has specialType 5 but belongs to someone else (subscribed favorite playlist)
+    mock_playlists_data = {
+        "code": 200,
+        "playlist": [
+            {
+                "id": 554433,
+                "name": "朋友喜欢的音乐",
+                "specialType": 5,
+                "creator": {"userId": 88888888},  # NOT fake_uid
+                "trackCount": 50,
+            },
+        ],
+    }
+
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=valid_cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                m = MagicMock()
+                m.status_code = 200
+                m.json.return_value = mock_playlists_data
+                mock_get.return_value = m
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite", headers=admin_headers)
+                assert resp.status_code == 404
+
+
+def test_favorite_playlist_multiple_matching_candidates_returns_409(client, admin_headers):
+    fake_uid = 11223344
+    netease_service.invalidate_favorite_cache()
+
+    mock_profile = {"user_id": fake_uid, "nickname": "TestUser"}
+    # Two candidates both matching specialType == 5 and creator.userId == fake_uid
+    mock_playlists_data = {
+        "code": 200,
+        "playlist": [
+            {
+                "id": 10001,
+                "name": "喜欢的音乐1",
+                "specialType": 5,
+                "creator": {"userId": fake_uid},
+                "trackCount": 20,
+            },
+            {
+                "id": 10002,
+                "name": "喜欢的音乐2",
+                "specialType": 5,
+                "creator": {"userId": fake_uid},
+                "trackCount": 30,
+            },
+        ],
+    }
+
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=valid_cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                m = MagicMock()
+                m.status_code = 200
+                m.json.return_value = mock_playlists_data
+                mock_get.return_value = m
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite", headers=admin_headers)
+                assert resp.status_code == 409
+                assert "ambiguous" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_session_change_during_async_prevents_cache_pollution():
+    netease_service.invalidate_favorite_cache()
+
+    # Initial session
+    initial_cookie = "MUSIC_U=user_a_cookie"
+    new_cookie = "MUSIC_U=user_b_cookie"
+    current_cookie_state = initial_cookie
+
+    def mock_load():
+        return current_cookie_state
+
+    with patch.object(netease_service.cookie_store, "load", side_effect=mock_load):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = {"user_id": 11111, "nickname": "UserA"}
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                def fake_get(url, **kwargs):
+                    nonlocal current_cookie_state
+                    # Simulate session cookie changing while waiting for network response
+                    current_cookie_state = new_cookie
+                    m = MagicMock()
+                    m.status_code = 200
+                    m.json.return_value = {
+                        "code": 200,
+                        "playlist": [
+                            {"id": 8888, "specialType": 5, "creator": {"userId": 11111}, "trackCount": 10}
+                        ],
+                    }
+                    return m
+
+                mock_get.side_effect = fake_get
+
+                # When calling get_favorite_playlist_info, cookie changes to new_cookie before cache write
+                with pytest.raises(PermissionError) as exc_info:
+                    await netease_service.get_favorite_playlist_info()
+
+                assert "session changed" in str(exc_info.value).lower()
+                # Verify that cache was NOT populated with UserA's playlist!
+                assert netease_service._cached_favorite_playlist is None
+
+

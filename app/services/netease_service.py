@@ -397,12 +397,50 @@ class NeteaseService:
 
         return {"song_id": song_id, "lrc": None, "tlyric": None}
 
+    async def get_playlist_detail(self, playlist_id: int) -> Dict[str, Any]:
+        """Fetch detailed playlist metadata from upstream /playlist/detail."""
+        url = f"{self.base_url}/playlist/detail"
+        params = self._with_cookie_param({"id": playlist_id})
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    raise NeteaseUpstreamError(
+                        f"Upstream playlist detail returned HTTP {resp.status_code}",
+                        status_code=502,
+                    )
+                data = resp.json()
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout calling Netease playlist/detail for {playlist_id}: {e}")
+            raise NeteaseUpstreamError("Upstream Netease playlist detail query timed out", status_code=504)
+        except httpx.RequestError as e:
+            logger.error(f"Network error calling Netease playlist/detail for {playlist_id}: {e}")
+            raise NeteaseUpstreamError(f"Upstream Netease playlist detail connection failed: {e}", status_code=502)
+        except NeteaseUpstreamError:
+            raise
+        except Exception as e:
+            logger.error(f"Error calling Netease playlist/detail for {playlist_id}: {e}")
+            raise NeteaseUpstreamError(f"Failed to query upstream Netease playlist detail: {e}", status_code=502)
+
+        code = data.get("code")
+        if code is not None and code != 200:
+            raise NeteaseUpstreamError(
+                f"Upstream playlist detail returned code {code}: {data.get('message')}",
+                status_code=502,
+            )
+        return data.get("playlist") or {}
+
     async def get_favorite_playlist_info(self, force_refresh: bool = False) -> Dict[str, Any]:
         """
         Resolves non-sensitive metadata for the current account's system favorite playlist (我喜欢的音乐).
         Uses third-party upstream API (Binaryify/NeteaseCloudMusicApi) specification:
-        Matches specialType == 5 and creator.userId == current_user_uid.
-        Never relies on localized Chinese title matching or static hardcoded IDs.
+        - specialType == 5 is treated strictly as a candidate type hint.
+        - creator.userId MUST strictly match current valid owner UID.
+        - If creator is missing in user/playlist item, attempts upstream playlist/detail to supplement and verify.
+        - Never silently accepts missing creator fields.
+        - Rejects candidate if creator does not match or cannot be proven.
+        - Rejects with clear error if multiple candidates match or none match.
+        - Invalidates cache immediately if session changes during async resolution.
         """
         cookie = self.cookie_store.load()
         if not cookie:
@@ -458,21 +496,57 @@ class NeteaseService:
             )
 
         playlists = data.get("playlist", [])
-        matched = None
-        for pl in playlists:
-            creator_id = (pl.get("creator") or {}).get("userId")
-            # Standard third-party API convention: specialType == 5 designates the default favorite playlist
-            if pl.get("specialType") == 5:
-                if creator_id is None or creator_id == uid:
-                    matched = pl
-                    break
-
-        if not matched:
+        special_candidates = [pl for pl in playlists if pl.get("specialType") == 5]
+        if not special_candidates:
             raise NeteaseUpstreamError(
                 "Owner favorite playlist (specialType==5) not found in user playlists",
                 status_code=404,
             )
 
+        verified_owner_candidates = []
+        for pl in special_candidates:
+            pid = pl.get("id")
+            creator_id = (pl.get("creator") or {}).get("userId") or pl.get("userId")
+
+            # If creator_id is missing, do NOT silently accept; supplement via upstream playlist/detail
+            if creator_id is None and pid:
+                try:
+                    detail = await self.get_playlist_detail(pid)
+                    creator_id = (detail.get("creator") or {}).get("userId") or detail.get("userId")
+                    # Supplement metadata from detail if available
+                    if detail:
+                        pl = {
+                            **pl,
+                            "name": detail.get("name") or pl.get("name"),
+                            "coverImgUrl": detail.get("coverImgUrl") or pl.get("coverImgUrl"),
+                            "trackCount": detail.get("trackCount", pl.get("trackCount", 0)),
+                            "playCount": detail.get("playCount", pl.get("playCount", 0)),
+                        }
+                except Exception as e:
+                    logger.warning(f"Failed to fetch detail for candidate playlist {pid}: {e}")
+                    creator_id = None
+
+            # Strictly verify that creator_id matches current owner uid
+            if creator_id is not None and creator_id == uid:
+                verified_owner_candidates.append(pl)
+            else:
+                logger.info(
+                    f"Candidate playlist {pid} rejected: creator_id={creator_id} does not match owner uid={uid}"
+                )
+
+        if len(verified_owner_candidates) == 0:
+            raise NeteaseUpstreamError(
+                "No favorite playlist (specialType==5) verified for current account owner (ownership mismatch or missing creator verification)",
+                status_code=404,
+            )
+
+        if len(verified_owner_candidates) > 1:
+            raise NeteaseUpstreamError(
+                f"Ambiguous favorite playlist: found {len(verified_owner_candidates)} candidates matching specialType==5 for owner",
+                status_code=409,
+            )
+
+        matched = verified_owner_candidates[0]
         fav_info = {
             "playlist_id": matched["id"],
             "name": matched.get("name") or "我喜欢的音乐",
@@ -482,10 +556,17 @@ class NeteaseService:
             "user_id": uid,
         }
 
-        self._cached_favorite_playlist = fav_info
-        self._cached_cookie_signature = cookie_sig
-        self._cached_fav_timestamp = now
-        return dict(fav_info)
+        # Check if the session cookie changed during async execution to prevent cache pollution
+        current_cookie = self.cookie_store.load()
+        current_cookie_sig = hashlib.sha256(current_cookie.encode("utf-8")).hexdigest() if current_cookie else None
+        if current_cookie_sig == cookie_sig:
+            self._cached_favorite_playlist = fav_info
+            self._cached_cookie_signature = cookie_sig
+            self._cached_fav_timestamp = time.time()
+            return dict(fav_info)
+        else:
+            logger.warning("Netease session cookie changed during async favorite playlist resolution; discarding stale cache.")
+            raise PermissionError("Netease session changed during resolution; please retry.")
 
     async def get_favorite_playlist_tracks(self, offset: int = 0, limit: int = 30) -> Dict[str, Any]:
         """
