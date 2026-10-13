@@ -11,6 +11,8 @@ class NeteaseSongItem(BaseModel):
     cover_url: Optional[str] = Field(None, description="Album cover image URL")
     cached: bool = Field(False, description="Whether currently cached on local R9000P disk")
     stream_url: str = Field(..., description="Direct or proxy stream URL")
+    fee: Optional[int] = Field(0, description="0=free, 1=vip, 4=album, 8=pay")
+    playable: Optional[bool] = Field(True, description="Whether playable without regional/copyright restriction")
 
 
 class NeteaseSearchResponse(BaseModel):

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.repositories.database import SessionLocal
 from app.repositories.models import MediaTrack, utc_now
-from app.services.media_service import record_track_access
+from app.services.media_service import is_valid_audio_magic, record_track_access
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +208,9 @@ class NeteaseService:
             ar_names = [ar.get("name", "") for ar in s.get("ar", []) if ar.get("name")]
             artist_str = " / ".join(ar_names) or "Unknown Artist"
             al_dict = s.get("al") or {}
+            privilege = s.get("privilege") or {}
+            st = privilege.get("st", 0)
+            fee = s.get("fee", 0)
 
             songs.append({
                 "id": song_id,
@@ -216,6 +219,8 @@ class NeteaseService:
                 "album": al_dict.get("name"),
                 "duration_ms": s.get("dt") or 0,
                 "cover_url": al_dict.get("picUrl"),
+                "fee": fee,
+                "playable": bool(st >= 0),
             })
 
         return {"total": total, "songs": songs}
@@ -395,12 +400,19 @@ class CacheManager:
                 async with client.stream("GET", remote_url) as resp:
                     resp.raise_for_status()
                     total_bytes = 0
+                    first_chunk = True
                     with open(tmp_path, "wb") as f:
                         async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            if chunk:
-                                f.write(chunk)
-                                total_bytes += len(chunk)
-                                yield chunk
+                            if not chunk:
+                                continue
+                            if first_chunk:
+                                if not is_valid_audio_magic(chunk):
+                                    logger.error(f"Upstream stream for song {song_id} failed audio magic check: {chunk[:32]!r}")
+                                    raise ValueError(f"Upstream returned non-audio stream for song {song_id} (error/HTML masquerade)")
+                                first_chunk = False
+                            f.write(chunk)
+                            total_bytes += len(chunk)
+                            yield chunk
 
             # Download finished successfully - move to final destination
             if total_bytes > 0:
@@ -422,6 +434,65 @@ class CacheManager:
                 except OSError:
                     pass
             raise
+
+    async def cache_track_background(
+        self,
+        song_id: int,
+        remote_url: str,
+        metadata: Dict[str, Any],
+        db_factory,
+    ):
+        """Downloads full song in background and registers to disk and database cache."""
+        lock = await self._get_song_lock(song_id)
+        if lock.locked():
+            return  # Already being cached by another task
+        async with lock:
+            db = db_factory()
+            try:
+                if self.get_cached_track(db, song_id):
+                    return  # Already cached
+            finally:
+                db.close()
+
+            tmp_path = self.get_temp_path(song_id)
+            final_path = self.get_target_path(song_id, metadata.get("type", "mp3"))
+
+            try:
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    async with client.stream("GET", remote_url) as resp:
+                        if resp.status_code >= 400:
+                            logger.warning(f"Background cache failed for {song_id}: HTTP {resp.status_code}")
+                            return
+                        total_bytes = 0
+                        first_chunk = True
+                        with open(tmp_path, "wb") as f:
+                            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                if not chunk:
+                                    continue
+                                if first_chunk:
+                                    if not is_valid_audio_magic(chunk):
+                                        logger.warning(f"Background cache failed magic check for song {song_id}: {chunk[:32]!r}")
+                                        return
+                                    first_chunk = False
+                                f.write(chunk)
+                                total_bytes += len(chunk)
+
+                if total_bytes > 0:
+                    os.replace(tmp_path, final_path)
+                    logger.info(f"Background cache completed for song {song_id} ({total_bytes} bytes) -> {final_path}")
+                    db = db_factory()
+                    try:
+                        self._register_cached_track(db, song_id, str(final_path), total_bytes, metadata)
+                        self.enforce_lru_quota(db)
+                    finally:
+                        db.close()
+            except Exception as e:
+                logger.warning(f"Background cache failed for song {song_id}: {e}")
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
 
     def _register_cached_track(
         self,

@@ -1,14 +1,20 @@
 from datetime import datetime
-from typing import Any, Dict, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, Optional, Union
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MusicCommandParams(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     track_id: Optional[str] = None
     stream_url: Optional[str] = None
     title: Optional[str] = None
     artist: Optional[str] = None
+    source: Optional[str] = None
+    song_id: Optional[Union[int, str]] = None
     seek_ms: Optional[int] = None
+    seek_position_ms: Optional[int] = None
+    position_ms: Optional[int] = None
     loop_mode: Optional[str] = None  # all | one | off
     shuffle: Optional[bool] = None
     volume: Optional[float] = None

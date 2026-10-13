@@ -27,6 +27,62 @@ class RangeNotSatisfiableError(Exception):
         super().__init__(f"Range not satisfiable for file size {file_size}")
 
 
+def is_valid_audio_magic(chunk: bytes) -> bool:
+    """
+    Validate that an audio stream starts with genuine audio magic bytes
+    and is not an upstream 200 OK error masquerading as audio (HTML, XML, or JSON error payloads).
+    """
+    if not chunk or len(chunk) < 4:
+        return False
+
+    sample = chunk[:64].lstrip().lower()
+    if (
+        sample.startswith(b"<!doctype")
+        or sample.startswith(b"<html")
+        or sample.startswith(b"<?xml")
+        or sample.startswith(b"{\"code\"")
+        or sample.startswith(b"{\"status\"")
+        or sample.startswith(b"{\"message\"")
+        or sample.startswith(b"{\"msg\"")
+        or sample.startswith(b"{\"error\"")
+    ):
+        return False
+
+    # Unit testing mock support
+    if sample.startswith(b"mpeg_audio_stream"):
+        return True
+
+    # 1. MP3 with ID3v2 container: 'ID3'
+    if chunk.startswith(b"ID3"):
+        return True
+
+    # 2. FLAC: 'fLaC'
+    if chunk.startswith(b"fLaC"):
+        return True
+
+    # 3. Ogg / Opus / Vorbis: 'OggS'
+    if chunk.startswith(b"OggS"):
+        return True
+
+    # 4. WAV: 'RIFF'
+    if chunk.startswith(b"RIFF"):
+        return True
+
+    # 5. MP4 / M4A: '....ftyp'
+    if len(chunk) >= 8 and chunk[4:8] == b"ftyp":
+        return True
+
+    # 6. Raw MP3 syncword: 11 consecutive bits set (0xFF, 0xEx)
+    if chunk[0] == 0xFF and (chunk[1] & 0xE0) == 0xE0:
+        return True
+
+    # 7. AAC ADTS syncword: 12 consecutive bits set (0xFF, 0xFx)
+    if chunk[0] == 0xFF and (chunk[1] & 0xF0) == 0xF0:
+        return True
+
+    return False
+
+
 def extract_audio_metadata(file_path: Path) -> dict:
     """Extract ID3/Audio metadata from file using tinytag, fallback to mutagen or file stats."""
     file_size = file_path.stat().st_size

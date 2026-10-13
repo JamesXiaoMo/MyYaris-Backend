@@ -120,14 +120,16 @@ def get_track_detail(
     )
 
 
-@router.get("/stream/{track_id}")
+@router.api_route("/stream/{track_id}", methods=["GET", "HEAD"])
 async def stream_audio_track(
     track_id: str,
+    request: Request,
     range: Optional[str] = Header(None, alias="Range"),
+    token: Optional[str] = Query(None, description="Optional authentication token"),
     db: Session = Depends(get_db),
 ):
     """
-    Stream audio track supporting HTTP 206 Partial Content Range requests.
+    Stream audio track supporting HTTP 206 Partial Content Range requests and HEAD probing.
     Supports seek, resume, and arbitrary byte ranges for ExoPlayer / iOS AVPlayer.
     """
     track = db.query(MediaTrack).filter(MediaTrack.track_id == track_id).first()
@@ -169,6 +171,8 @@ async def stream_audio_track(
             "Content-Type": mime_type,
             "Cache-Control": "no-cache",
         }
+        if request.method == "HEAD":
+            return Response(status_code=status.HTTP_206_PARTIAL_CONTENT, headers=headers)
         return StreamingResponse(
             file_chunk_generator(str(file_path), start, end),
             status_code=status.HTTP_206_PARTIAL_CONTENT,
@@ -183,6 +187,8 @@ async def stream_audio_track(
             "Content-Type": mime_type,
             "Cache-Control": "no-cache",
         }
+        if request.method == "HEAD":
+            return Response(status_code=status.HTTP_200_OK, headers=headers)
         return StreamingResponse(
             file_chunk_generator(str(file_path), 0, file_size - 1),
             status_code=status.HTTP_200_OK,

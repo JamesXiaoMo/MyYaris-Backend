@@ -218,3 +218,124 @@ def test_cache_lru_quota_and_stats(client, db_session, phone_headers):
                 pass
     db_session.query(MediaTrack).filter(MediaTrack.source == "netease_cache").delete()
     db_session.commit()
+
+
+def test_is_valid_audio_magic_validation():
+    from app.services.media_service import is_valid_audio_magic
+
+    # Valid audio signatures
+    assert is_valid_audio_magic(b"ID3\x04\x00\x00\x00\x00\x00\x23TSSE") is True
+    assert is_valid_audio_magic(b"fLaC\x00\x00\x00\x22\x10\x00") is True
+    assert is_valid_audio_magic(b"OggS\x00\x02\x00\x00\x00\x00") is True
+    assert is_valid_audio_magic(b"RIFF\x24\x00\x00\x00WAVEfmt ") is True
+    assert is_valid_audio_magic(b"\x00\x00\x00\x20ftypM4A ") is True
+    assert is_valid_audio_magic(b"\xff\xfb\x90\x64\x00\x00\x00") is True
+    assert is_valid_audio_magic(b"\xff\xf1\x50\x80\x00\x00\x00") is True
+
+    # Rejection of HTML / JSON error masquerades
+    assert is_valid_audio_magic(b"<!DOCTYPE html><html><body>Error</body></html>") is False
+    assert is_valid_audio_magic(b"<html><head><title>403 Forbidden</title></head></html>") is False
+    assert is_valid_audio_magic(b'{"code": 404, "message": "Song copyright restricted"}') is False
+    assert is_valid_audio_magic(b'{"status": "error", "msg": "Token expired"}') is False
+    assert is_valid_audio_magic(b"") is False
+    assert is_valid_audio_magic(b"abc") is False
+
+
+def test_stream_head_method_support(client, db_session):
+    test_song_id = 88776655
+    cached_path = Path(settings.MEDIA_CACHE_DIR) / f"netease_{test_song_id}.mp3"
+    cached_path.parent.mkdir(parents=True, exist_ok=True)
+    cached_path.write_bytes(b"ID3\x04" + b"\x00" * 4092)
+
+    track = MediaTrack(
+        track_id=f"netease_{test_song_id}",
+        source="netease_cache",
+        title="Test Song",
+        artist="Test Artist",
+        file_path=str(cached_path),
+        file_size_bytes=4096,
+        bitrate_kbps=320,
+    )
+    db_session.add(track)
+    db_session.commit()
+
+    try:
+        # 1. HEAD request on /api/v1/music/netease/stream/{id}
+        head_resp = client.head(f"/api/v1/music/netease/stream/{test_song_id}?token=test_token")
+        assert head_resp.status_code == 200
+        assert head_resp.headers.get("Accept-Ranges") == "bytes"
+        assert head_resp.headers.get("Content-Type") == "audio/mpeg"
+        assert len(head_resp.content) == 0
+
+        # 2. HEAD with Range
+        head_range_resp = client.head(
+            f"/api/v1/music/netease/stream/{test_song_id}",
+            headers={"Range": "bytes=0-1023"},
+        )
+        assert head_range_resp.status_code == 206
+        assert head_range_resp.headers.get("Content-Range") == "bytes 0-1023/4096"
+        assert len(head_range_resp.content) == 0
+
+        # 3. HEAD request on /api/v1/music/stream/{track_id}
+        track_head_resp = client.head(f"/api/v1/music/stream/netease_{test_song_id}")
+        assert track_head_resp.status_code == 200
+        assert track_head_resp.headers.get("Accept-Ranges") == "bytes"
+        assert len(track_head_resp.content) == 0
+    finally:
+        if cached_path.exists():
+            cached_path.unlink()
+        db_session.delete(track)
+        db_session.commit()
+
+
+def test_stream_rejects_html_masquerade(client):
+    test_song_id = 77665544
+    html_error = b"<html><head><title>404 Not Found</title></head><body>Song unavailable</body></html>"
+
+    with patch.object(
+        netease_service,
+        "get_song_url",
+        new=AsyncMock(return_value={"song_id": test_song_id, "url": "http://fake-cdn/blocked.mp3", "type": "mp3"}),
+    ):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200  # Masqueraded 200 OK
+            mock_resp.headers = {"content-type": "text/html"}
+            mock_resp.content = html_error
+            mock_get.return_value = mock_resp
+
+            # When requesting initial bytes (Range 0-1023), backend must detect non-audio and return 502
+            resp = client.get(
+                f"/api/v1/music/netease/stream/{test_song_id}",
+                headers={"Range": "bytes=0-1023"},
+            )
+            assert resp.status_code == 502
+            assert "non-audio" in resp.json()["detail"].lower() or "masquerade" in resp.json()["detail"].lower()
+
+
+def test_music_command_params_preserves_source_and_song_id():
+    from app.schemas.control import MusicCommandRequest
+
+    req = MusicCommandRequest(
+        action="play_track",
+        params={
+            "track_id": "netease_1357375695",
+            "source": "netease",
+            "song_id": 1357375695,
+            "stream_url": "https://example.com/api/v1/music/netease/stream/1357375695",
+            "title": "海阔天空",
+            "artist": "Beyond",
+            "volume": 0.8,
+            "seek_ms": 15000,
+            "loop_mode": "all",
+        },
+    )
+    dumped = req.params.model_dump(exclude_unset=True)
+    assert dumped["source"] == "netease"
+    assert dumped["song_id"] == 1357375695
+    assert dumped["title"] == "海阔天空"
+    assert dumped["artist"] == "Beyond"
+    assert dumped["volume"] == 0.8
+    assert dumped["seek_ms"] == 15000
+    assert dumped["loop_mode"] == "all"
+

@@ -41,6 +41,7 @@ from app.services.media_service import (
     RangeNotSatisfiableError,
     file_chunk_generator,
     get_audio_mime_type,
+    is_valid_audio_magic,
     parse_range_header,
     record_track_access,
 )
@@ -77,6 +78,8 @@ async def search_netease_songs(
                 cover_url=s.get("cover_url"),
                 cached=cached,
                 stream_url=stream_url,
+                fee=s.get("fee", 0),
+                playable=s.get("playable", True),
             )
         )
 
@@ -177,17 +180,20 @@ async def get_netease_lyric(
     )
 
 
-@router.get("/netease/stream/{song_id}")
+@router.api_route("/netease/stream/{song_id}", methods=["GET", "HEAD"])
 async def stream_netease_audio(
     song_id: int,
+    request: Request,
     background_tasks: BackgroundTasks,
     range: Optional[str] = Header(None, alias="Range"),
+    token: Optional[str] = Query(None, description="Optional authentication token"),
     db: Session = Depends(get_db),
 ):
     """
-    Dynamic 'stream-and-cache' streaming endpoint supporting HTTP 206 Partial Content.
+    Dynamic 'stream-and-cache' streaming endpoint supporting HTTP 206 Partial Content and HEAD probing.
     - If song is cached on R9000P SSD, serves directly with instant seek and zero network cost.
     - If uncached, streams from Netease CDN while asynchronously piping into local cache.
+    - Strictly rejects non-audio error masquerades (HTML/JSON) with HTTP 502/404.
     """
     cached_track = cache_manager.get_cached_track(db, song_id)
 
@@ -217,6 +223,8 @@ async def stream_netease_audio(
                 "Cache-Control": "no-cache",
                 "X-Cache-Status": "HIT",
             }
+            if request.method == "HEAD":
+                return Response(status_code=status.HTTP_206_PARTIAL_CONTENT, headers=headers)
             return StreamingResponse(
                 file_chunk_generator(str(file_path), start, end),
                 status_code=status.HTTP_206_PARTIAL_CONTENT,
@@ -231,6 +239,8 @@ async def stream_netease_audio(
                 "Cache-Control": "no-cache",
                 "X-Cache-Status": "HIT",
             }
+            if request.method == "HEAD":
+                return Response(status_code=status.HTTP_200_OK, headers=headers)
             return StreamingResponse(
                 file_chunk_generator(str(file_path), 0, file_size - 1),
                 status_code=status.HTTP_200_OK,
@@ -247,16 +257,29 @@ async def stream_netease_audio(
             detail=f"Audio stream not available for song {song_id} (VIP copyright or unavailable)",
         )
 
+    metadata = {
+        "title": f"Netease Track {song_id}",
+        "artist": "Netease Cloud Music",
+        "type": url_info.get("type", "mp3"),
+        "bitrate_kbps": (url_info.get("br") or 320000) // 1000,
+    }
+
+    # HEAD request on uncached song
+    if request.method == "HEAD":
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": "audio/mpeg",
+            "Cache-Control": "no-cache",
+            "X-Cache-Status": "MISS",
+        }
+        if url_info.get("size_bytes"):
+            headers["Content-Length"] = str(url_info["size_bytes"])
+        return Response(status_code=status.HTTP_200_OK, headers=headers)
+
     # If no Range or Range starts at 0, perform dynamic Tee streaming (stream + cache)
     is_full_or_start_range = (range is None or range.strip() in ("", "bytes=0-"))
 
     if is_full_or_start_range:
-        metadata = {
-            "title": f"Netease Track {song_id}",
-            "artist": "Netease Cloud Music",
-            "type": url_info.get("type", "mp3"),
-            "bitrate_kbps": (url_info.get("br") or 320000) // 1000,
-        }
         headers = {
             "Accept-Ranges": "bytes",
             "Content-Type": "audio/mpeg",
@@ -273,16 +296,55 @@ async def stream_netease_audio(
     # Otherwise forward Range request to CDN and schedule background full cache
     forward_headers = {"Range": range} if range else {}
     async with httpx.AsyncClient(timeout=15.0) as client:
-        cdn_resp = await client.get(cdn_url, headers=forward_headers)
-        resp_status = cdn_resp.status_code
-        resp_headers = dict(cdn_resp.headers)
-        resp_headers["X-Cache-Status"] = "MISS-PROXY"
+        try:
+            cdn_resp = await client.get(cdn_url, headers=forward_headers)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Failed to connect to upstream audio CDN: {e}",
+            )
+
+        if cdn_resp.status_code >= 400:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Upstream audio CDN returned HTTP {cdn_resp.status_code}",
+            )
+
+        # Magic bytes validation for initial range chunks (e.g. bytes=0-1023)
+        # to prevent 200 HTML masquerade / copyright error pages
+        range_clean = (range or "").strip().lower()
+        if range_clean.startswith("bytes=0-"):
+            if not is_valid_audio_magic(cdn_resp.content):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Upstream CDN returned non-audio payload (masquerade/copyright restriction)",
+                )
+
+        # Trigger background caching so subsequent seeks hit local disk
+        background_tasks.add_task(cache_manager.cache_track_background, song_id, cdn_url, metadata, SessionLocal)
+
+        # Sanitize headers (strip hop-by-hop headers)
+        clean_headers = {}
+        for k, v in cdn_resp.headers.items():
+            if k.lower() not in {
+                "connection",
+                "keep-alive",
+                "transfer-encoding",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailers",
+                "upgrade",
+            }:
+                clean_headers[k] = v
+        clean_headers["X-Cache-Status"] = "MISS-PROXY"
+        clean_headers["Accept-Ranges"] = "bytes"
 
         return Response(
             content=cdn_resp.content,
-            status_code=resp_status,
-            headers=resp_headers,
-            media_type=cdn_resp.headers.get("content-type", "audio/mpeg"),
+            status_code=cdn_resp.status_code,
+            headers=clean_headers,
+            media_type=clean_headers.get("content-type", "audio/mpeg"),
         )
 
 
