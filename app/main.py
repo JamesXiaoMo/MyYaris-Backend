@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.api.auth import router as auth_router
 from app.api.control import router as control_router
 from app.api.destinations import router as destinations_router, api_v1_router as nav_v1_router
 from app.api.favorites import router as favorites_router
@@ -11,6 +12,7 @@ from app.api.tasks import router as tasks_router
 from app.api.voice import router as voice_router
 from app.config import settings
 from app.repositories.database import Base, engine
+from app.repositories.migrations import run_db_migrations
 from app.services.voice_service import clean_stale_audio_files
 
 
@@ -18,7 +20,7 @@ from app.services.voice_service import clean_stale_audio_files
 async def lifespan(app: FastAPI):
     # Startup actions
     settings.init_directories()
-    Base.metadata.create_all(bind=engine)
+    run_db_migrations(engine)
     clean_stale_audio_files()
     from app.repositories.database import SessionLocal
     from app.services.control_service import command_queue_manager
@@ -45,6 +47,7 @@ app.add_middleware(
 )
 
 app.include_router(health_router)
+app.include_router(auth_router)
 app.include_router(destinations_router)
 app.include_router(nav_v1_router)
 app.include_router(tasks_router)

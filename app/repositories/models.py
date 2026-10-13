@@ -162,6 +162,8 @@ class Favorite(Base):
     __tablename__ = "favorites"
 
     id = Column(String(64), primary_key=True, index=True)
+    user_id = Column(String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    is_legacy = Column(Boolean, default=False, nullable=False)
     name = Column(String(128), nullable=True, index=True)
     address = Column(String(512), nullable=False)
     latitude = Column(Float, nullable=False)
@@ -170,4 +172,52 @@ class Favorite(Base):
     created_by = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String(64), primary_key=True, index=True)
+    username = Column(String(64), unique=True, index=True, nullable=False)
+    password_hash = Column(String(256), nullable=False)
+    nickname = Column(String(64), nullable=True)
+    avatar_url = Column(String(512), nullable=True)
+    role = Column(String(32), default="user", nullable=False)  # user | admin
+    is_active = Column(Boolean, default=True, nullable=False)
+    failed_login_attempts = Column(Integer, default=0, nullable=False)
+    locked_until = Column(DateTime(timezone=True), nullable=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+    sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+    device_bindings = relationship("UserDeviceBinding", back_populates="user", cascade="all, delete-orphan")
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+
+    session_id = Column(String(64), primary_key=True, index=True)
+    user_id = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    last_active_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    is_revoked = Column(Boolean, default=False, nullable=False)
+    user_agent = Column(String(256), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+
+    user = relationship("User", back_populates="sessions")
+
+
+class UserDeviceBinding(Base):
+    __tablename__ = "user_device_bindings"
+
+    id = Column(String(64), primary_key=True, index=True)
+    user_id = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    device_id = Column(String(64), nullable=False, index=True)
+    can_control = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    created_by = Column(String(64), nullable=True)
+
+    user = relationship("User", back_populates="device_bindings")
 

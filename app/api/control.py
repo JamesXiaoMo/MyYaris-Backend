@@ -296,20 +296,30 @@ async def music_websocket_endpoint(
     - Car clients receive immediate playback commands dispatched by iPhone with top-level actions.
     - Car clients acknowledge execution via WS command_ack, which broadcasts command_status to phone.
     """
-    # 1. Authenticate token from query param or headers
+    # 1. Authenticate token from query param, cookies, or headers
     auth_token = token
     if not auth_token:
-        auth_header = websocket.headers.get("authorization")
-        if auth_header:
-            auth_token = auth_header
+        cookie_session = websocket.cookies.get(settings.SESSION_COOKIE_NAME)
+        if cookie_session:
+            auth_token = cookie_session
         else:
-            dev_header = websocket.headers.get("x-device-token")
-            if dev_header:
-                auth_token = dev_header
+            auth_header = websocket.headers.get("authorization")
+            if auth_header:
+                auth_token = auth_header
+            else:
+                dev_header = websocket.headers.get("x-device-token")
+                if dev_header:
+                    auth_token = dev_header
 
     try:
-        user = verify_token_string(auth_token)
+        user = verify_token_string(auth_token, db=db)
     except Exception:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # User role without vehicle device control cannot connect to vehicle control WS
+    if user.role == "user" and not user.has_device_control:
+        logger.warning(f"User '{user.identity}' denied WS access: no vehicle control permission")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 

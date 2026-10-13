@@ -10,3 +10,4 @@ pytest-asyncio>=0.23.0
 openlocationcode==1.0.1
 mutagen>=1.47.0
 tinytag>=2.0.0
+argon2-cffi>=23.1.0

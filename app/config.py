@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     PHONE_TOKEN: str = ""
     ADMIN_TOKEN: str = ""
 
+    # User Account & Session Authentication (Cookie & DB Sessions)
+    SESSION_COOKIE_NAME: str = "myyaris_session"
+    SESSION_EXPIRE_DAYS: int = 30
+    COOKIE_SECURE: bool = True
+    COOKIE_SAMESITE: str = "lax"
+    MAX_FAILED_LOGIN_ATTEMPTS: int = 5
+    LOCKOUT_MINUTES: int = 15
+    AVATARS_DIR: str = ""
+    ENABLE_LEGACY_TOKEN_AUTH: bool = True
+
     # External providers
     ASR_PROVIDER: str = "none"  # none | whisper_local | openai | mock (test only)
     ASR_API_KEY: str = ""
@@ -85,6 +95,10 @@ class Settings(BaseSettings):
                 str(data_path / "media" / "cache"),
             )
         Path(self.MEDIA_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+        if not self.AVATARS_DIR:
+            self.AVATARS_DIR = str(data_path / "avatars")
+        Path(self.AVATARS_DIR).mkdir(parents=True, exist_ok=True)
 
         if not self.DATABASE_URL:
             db_file = data_path / "myyaris.db"

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_phone_or_admin
+from app.api.auth import require_user_or_phone_or_admin
 from app.repositories.database import get_db
 from app.repositories.models import Favorite, utc_now
 from app.schemas.auth import AuthenticatedUser
@@ -39,13 +39,22 @@ def list_favorites(
     order: str = Query(default="desc", pattern="^(asc|desc)$", description="Sort direction"),
     search: Optional[str] = Query(default=None, max_length=100, description="Search keyword in name or address"),
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(require_phone_or_admin),
+    user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
     """
-    List user favorite locations with pagination, sorting, and optional search.
-    Requires phone or admin authentication.
+    List user favorite locations with user isolation.
+    - Logged-in users see their own favorites (user_id == current_user.user_id).
+    - Legacy token callers see the legacy shared favorites pool (user_id IS NULL).
+    - Administrators can inspect all favorites.
     """
     query = db.query(Favorite)
+
+    # 1. User isolation filtering
+    if user.role != "admin":
+        if user.user_id:
+            query = query.filter(Favorite.user_id == user.user_id)
+        else:
+            query = query.filter(or_(Favorite.user_id.is_(None), Favorite.is_legacy.is_(True)))
 
     if search and search.strip():
         term = f"%{search.strip()}%"
@@ -74,18 +83,20 @@ def list_favorites(
 def create_favorite(
     fav_in: FavoriteCreateRequest,
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(require_phone_or_admin),
+    user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
     """
     Create a new favorite location.
-    Requires phone or admin authentication.
-    Strict coordinate range and non-empty address validation enforced.
+    - Associates favorite with current user_id for logged-in accounts.
+    - Tags as legacy shared pool when called via transitional legacy token.
     """
     fav_id = f"fav_{uuid.uuid4().hex[:12]}"
     now = utc_now()
 
     row = Favorite(
         id=fav_id,
+        user_id=user.user_id,
+        is_legacy=bool(user.user_id is None),
         name=fav_in.name,
         address=fav_in.address,
         latitude=fav_in.latitude,
@@ -103,22 +114,39 @@ def create_favorite(
     return _to_favorite_response(row)
 
 
+def _check_favorite_access(row: Favorite, user: AuthenticatedUser) -> None:
+    """Enforces strict user isolation: users can only access their own favorites."""
+    if user.role == "admin":
+        return
+    if user.user_id:
+        if row.user_id != user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Favorite '{row.id}' not found.",
+            )
+    else:
+        # Legacy token caller: can only access legacy favorites
+        if row.user_id is not None and not row.is_legacy:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Favorite '{row.id}' not found.",
+            )
+
+
 @router.get("/{favorite_id}", response_model=FavoriteResponse)
 def get_favorite(
     favorite_id: str,
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(require_phone_or_admin),
+    user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
-    """
-    Retrieve single favorite location by ID.
-    Requires phone or admin authentication.
-    """
+    """Retrieve single favorite location with ownership isolation."""
     row = db.query(Favorite).filter(Favorite.id == favorite_id).first()
     if not row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Favorite '{favorite_id}' not found.",
         )
+    _check_favorite_access(row, user)
     return _to_favorite_response(row)
 
 
@@ -128,18 +156,16 @@ def update_favorite(
     favorite_id: str,
     fav_in: FavoriteUpdateRequest,
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(require_phone_or_admin),
+    user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
-    """
-    Update an existing favorite location.
-    Requires phone or admin authentication.
-    """
+    """Update favorite location with ownership validation."""
     row = db.query(Favorite).filter(Favorite.id == favorite_id).first()
     if not row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Favorite '{favorite_id}' not found.",
         )
+    _check_favorite_access(row, user)
 
     # Check which fields were explicitly provided in update request
     update_data = fav_in.model_dump(exclude_unset=True)
@@ -168,19 +194,16 @@ def update_favorite(
 def delete_favorite(
     favorite_id: str,
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(require_phone_or_admin),
+    user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
-    """
-    Delete a favorite location.
-    Requires phone or admin authentication.
-    Client must prompt for confirmation prior to calling this endpoint.
-    """
+    """Delete a favorite location with ownership validation."""
     row = db.query(Favorite).filter(Favorite.id == favorite_id).first()
     if not row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Favorite '{favorite_id}' not found.",
         )
+    _check_favorite_access(row, user)
 
     db.delete(row)
     db.commit()

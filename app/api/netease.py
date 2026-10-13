@@ -18,7 +18,11 @@ from fastapi.responses import StreamingResponse
 import httpx
 from sqlalchemy.orm import Session
 
-from app.api.auth import get_current_user
+from app.api.auth import (
+    get_current_user,
+    require_admin,
+    require_admin_or_legacy_phone,
+)
 from app.config import settings
 from app.repositories.database import SessionLocal, get_db
 from app.repositories.models import utc_now
@@ -372,9 +376,9 @@ def get_media_cache_stats(
 def trigger_cache_cleanup(
     target_bytes: Optional[int] = Query(None, description="Max cache size limit to enforce"),
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
-    """Manually invoke LRU cache quota eviction."""
+    """Manually invoke LRU cache quota eviction (Admin or authorized phone)."""
     evicted_count, evicted_bytes = cache_manager.enforce_lru_quota(db, max_bytes=target_bytes)
     return {
         "status": "ok",
@@ -386,9 +390,9 @@ def trigger_cache_cleanup(
 
 @router.get("/netease/login/qr/key", response_model=NeteaseQRKeyResponse)
 async def get_login_qr_key(
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
-    """Generate unikey for Netease QR login session."""
+    """Generate unikey for Netease QR login session (Admin or authorized phone)."""
     key = await netease_service.get_qr_key()
     return NeteaseQRKeyResponse(code=200, unikey=key)
 
@@ -396,9 +400,9 @@ async def get_login_qr_key(
 @router.get("/netease/login/qr/create", response_model=NeteaseQRCreateResponse)
 async def create_login_qr(
     key: str = Query(..., description="Unikey from /login/qr/key"),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
-    """Create QR code image (Base64 PNG) and URL for scanning."""
+    """Create QR code image (Base64 PNG) and URL for scanning (Admin or authorized phone)."""
     data = await netease_service.create_qr(key=key)
     return NeteaseQRCreateResponse(
         code=200,
@@ -410,9 +414,9 @@ async def create_login_qr(
 @router.get("/netease/login/qr/check", response_model=NeteaseQRCheckResponse)
 async def check_login_qr(
     key: str = Query(..., description="Unikey from /login/qr/key"),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
-    """Poll QR code scan and authorization status."""
+    """Poll QR code scan and authorization status (Admin or authorized phone)."""
     res = await netease_service.check_qr(key=key)
     return NeteaseQRCheckResponse(**res)
 
@@ -421,10 +425,17 @@ async def check_login_qr(
 async def get_login_status(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """Check current user login status and profile from stored cookie."""
+    """
+    Check current user login status from stored cookie.
+    Hides private account profile from standard registered users to protect administrator privacy.
+    """
     info = netease_service.cookie_store.get_info()
     if not info.get("logged_in"):
         return NeteaseLoginStatusResponse(code=200, logged_in=False)
+
+    # For standard registered users, only expose logged_in boolean to protect administrator privacy
+    if user.role == "user" and not user.is_legacy_token:
+        return NeteaseLoginStatusResponse(code=200, logged_in=True)
 
     profile = info.get("profile") or {}
     return NeteaseLoginStatusResponse(
@@ -440,18 +451,18 @@ async def get_login_status(
 
 @router.post("/netease/login/refresh")
 async def refresh_login_cookie(
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
-    """Refresh and renew stored Netease login cookie."""
+    """Refresh and renew stored Netease login cookie (Admin or authorized phone)."""
     ok = await netease_service.refresh_cookie()
     return {"status": "ok" if ok else "failed", "refreshed": ok}
 
 
 @router.post("/netease/login/logout")
 async def logout_netease(
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
-    """Clear Netease login session and remove stored cookie."""
+    """Clear Netease login session and remove stored cookie (Admin or authorized phone)."""
     ok = await netease_service.logout()
     return {"status": "ok", "logged_out": ok}
 
@@ -459,9 +470,9 @@ async def logout_netease(
 @router.post("/netease/login/cookie", response_model=NeteaseLoginStatusResponse)
 async def login_with_cookie(
     body: NeteaseCookieLoginRequest,
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
-    """Directly save and authenticate with a provided Netease Cookie string (e.g. MUSIC_U=...)."""
+    """Directly save and authenticate with a provided Netease Cookie string (Admin or authorized phone)."""
     raw_cookie = body.cookie.strip()
     if not raw_cookie.startswith("MUSIC_U=") and "=" not in raw_cookie:
         cookie_str = f"MUSIC_U={raw_cookie};"
