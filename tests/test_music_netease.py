@@ -1,5 +1,6 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+import httpx
 import pytest
 
 from app.config import settings
@@ -41,6 +42,64 @@ def test_netease_search_endpoint(client, phone_headers):
         assert song["artist"] == "陈奕迅"
         assert song["cached"] is False
         assert "/api/v1/music/netease/stream/1901371647" in song["stream_url"]
+
+
+def test_netease_search_legitimate_empty_results(client, phone_headers):
+    mock_search_data = {
+        "code": 200,
+        "result": {
+            "songCount": 0,
+            "songs": [],
+        },
+    }
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_search_data
+        mock_get.return_value = mock_resp
+
+        resp = client.get("/api/v1/music/netease/search?keyword=nonexistentsong12345", headers=phone_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["code"] == 200
+        assert data["total"] == 0
+        assert data["songs"] == []
+
+
+def test_netease_search_upstream_500_error(client, phone_headers):
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_get.return_value = mock_resp
+
+        resp = client.get("/api/v1/music/netease/search?keyword=孤勇者", headers=phone_headers)
+        assert resp.status_code == 502
+        assert "upstream search failed" in resp.json()["detail"].lower()
+
+
+def test_netease_search_upstream_timeout(client, phone_headers):
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.side_effect = httpx.TimeoutException("Connection timed out")
+
+        resp = client.get("/api/v1/music/netease/search?keyword=孤勇者", headers=phone_headers)
+        assert resp.status_code == 504
+        assert "timed out" in resp.json()["detail"].lower()
+
+
+def test_netease_search_upstream_business_error(client, phone_headers):
+    mock_search_data = {
+        "code": 400,
+        "message": "Bad request parameters",
+    }
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_search_data
+        mock_get.return_value = mock_resp
+
+        resp = client.get("/api/v1/music/netease/search?keyword=孤勇者", headers=phone_headers)
+        assert resp.status_code == 502
+        assert "code 400" in resp.json()["detail"].lower()
 
 
 def test_netease_intelligence_endpoint(client, phone_headers):

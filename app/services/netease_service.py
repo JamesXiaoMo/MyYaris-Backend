@@ -16,6 +16,15 @@ from app.services.media_service import is_valid_audio_magic, record_track_access
 logger = logging.getLogger(__name__)
 
 
+class NeteaseUpstreamError(Exception):
+    """Raised when upstream Netease API returns an error or fails to connect."""
+
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
 class NeteaseCookieStore:
     """Manages persistent encrypted/local storage of Netease user authorization Cookie."""
 
@@ -190,11 +199,27 @@ class NeteaseService:
                 resp = await client.get(url, params=params)
                 if resp.status_code != 200:
                     logger.warning(f"Upstream Netease search returned status {resp.status_code}")
-                    return {"total": 0, "songs": []}
+                    raise NeteaseUpstreamError(
+                        f"Upstream Netease search returned status {resp.status_code}",
+                        status_code=502,
+                    )
                 data = resp.json()
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout calling Netease search: {e}")
+            raise NeteaseUpstreamError("Upstream Netease search timed out", status_code=504)
+        except httpx.RequestError as e:
+            logger.error(f"Network error calling Netease search: {e}")
+            raise NeteaseUpstreamError(f"Upstream Netease search connection failed: {e}", status_code=502)
+        except NeteaseUpstreamError:
+            raise
         except Exception as e:
             logger.error(f"Error calling Netease search: {e}")
-            return {"total": 0, "songs": []}
+            raise NeteaseUpstreamError(f"Failed to query upstream Netease search: {e}", status_code=502)
+
+        code = data.get("code")
+        if code is not None and code != 200:
+            logger.warning(f"Upstream Netease search returned business code {code}: {data.get('message')}")
+            raise NeteaseUpstreamError(f"Upstream Netease search returned code {code}", status_code=502)
 
         result = data.get("result", {})
         total = result.get("songCount", 0)

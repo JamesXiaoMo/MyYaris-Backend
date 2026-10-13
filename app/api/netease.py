@@ -45,7 +45,11 @@ from app.services.media_service import (
     parse_range_header,
     record_track_access,
 )
-from app.services.netease_service import cache_manager, netease_service
+from app.services.netease_service import (
+    NeteaseUpstreamError,
+    cache_manager,
+    netease_service,
+)
 
 router = APIRouter(prefix="/api/v1/music", tags=["Netease Cloud Music & Caching"])
 
@@ -60,7 +64,13 @@ async def search_netease_songs(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Search Netease Cloud Music library with metadata cleaning and local cache status."""
-    res = await netease_service.search(keyword=keyword, page=page, limit=limit)
+    try:
+        res = await netease_service.search(keyword=keyword, page=page, limit=limit)
+    except NeteaseUpstreamError as e:
+        raise HTTPException(
+            status_code=e.status_code,
+            detail=f"Netease upstream search failed: {e.message}",
+        )
     base_url = str(request.base_url).rstrip("/")
 
     items = []
