@@ -77,6 +77,10 @@ class WebSocketConnectionManager:
             targets = list(self.active_connections.items())
 
         for ws, meta in targets:
+            # Broadcast playback status to phone and admin clients only
+            if meta.get("client_type") not in ("phone", "admin"):
+                continue
+
             ws_dev = meta.get("device_id")
             if norm_device and ws_dev and not is_same_device(norm_device, ws_dev):
                 continue
