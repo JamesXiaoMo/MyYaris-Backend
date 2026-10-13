@@ -1,8 +1,8 @@
 # MyYaris 全量后端 API 参考手册 (API Reference)
 
-**版本**：V2.3.0  
+**版本**：V2.3.1  
 **基准日期**：2026-10-13  
-**后端 Git 提交 Hash**：`d05fb89` (`d05fb894f426fd2b5c253ea3d824cfdd2f04ebb9`)  
+**后端 Git 提交 Hash**：`3dde1d8` (`3dde1d85a5fa1cd284fc53f6483de8229d757fc3`)  
 **部署宿主机**：Lenovo Legion R9000P (Ubuntu, systemd user service: `myyaris.service`)  
 **关联核心契约**：
 - [三端协同与播控契约 (docs/API-V2三端契约.md)](file:///path/to/user/Desktop/MyYaris/docs/API-V2三端契约.md)
@@ -288,6 +288,9 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 
 ### 8.2 曲库检索与播放
 - `GET /api/v1/music/netease/search?keyword=...&limit=20`：在线歌曲检索
+  - **正常命中**：返回 HTTP 200，包含清洗后的音轨元数据列表与分页总量；
+  - **合法空结果**：上游检索确实无匹配曲目时，返回 HTTP 200，`{"code": 200, "total": 0, "songs": []}`；
+  - **上游异常处理**：若网易云服务不可用、上游返回 5xx/4xx 错误或连接超时，直接向客户端返回 **HTTP 502 Bad Gateway** 或 **HTTP 504 Gateway Timeout**，杜绝将上游挂死/网络故障伪装为 0 结果空列表；
 - `GET /api/v1/music/netease/song_url?song_id=...`：解析音频直链
 - `GET /api/v1/music/netease/lyric?song_id=...`：获取逐字歌词
 - `POST /api/v1/music/netease/intelligence`：基于目标歌曲生成心动智能推荐队列
@@ -298,8 +301,9 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 - **工作机制**：
   - **HEAD 探测支持**：原生支持 HTTP HEAD 请求，返回音频元数据头（`Accept-Ranges: bytes`, `Content-Length`, `Content-Type: audio/mpeg`）而无需拉取音频实体，彻底规避播放器预检 405 Method Not Allowed；
   - **真实音频 Magic Bytes 校验**：严格校验上游首分块 Magic Bytes（ID3v2, MPEG Frame Sync, FLAC, Ogg, RIFF 等），如遭遇上游风控/VIP 限制返回的 200 HTML/JSON 伪装错误页，立即中断并返回 `502 Bad Gateway`，杜绝播放器解析 HTML 崩溃；
-  - **Cache HIT**：命中本地 SSD 缓存时，立即以标准 `206 Partial Content` 毫秒级零延迟流式返回；
-  - **Cache MISS & 后台静默缓存**：未命中时代理上游 CDN 流，支持 `bytes=0-` 及任意 Range 分片，并在后台静默将完整音轨同步写入持久化 SSD 缓存库。
+  - **缓存写入原子性保障**：采用 `netease_<id>.tmp` 临时文件流式写入并在流完整拉取 (`total_bytes > 0`) 后通过系统级 `os.replace` 原子替换为最终缓存文件，若中途连接中断则立即清理临时文件，从根本上杜绝部分截断破损音频被错误索引并永久缓存在 SSD 中的风险；
+  - **Cache HIT**：命中本地 SSD 缓存时，立即以标准 `206 Partial Content` 毫秒级零延迟流式返回，响应头带有 `X-Cache-Status: HIT`；
+  - **Cache MISS & 后台静默缓存**：未命中时代理上游 CDN 流，支持 `bytes=0-` 及任意 Range 分片，并在后台静默将完整音轨同步写入持久化 SSD 缓存库（首片全量流带有 `X-Cache-Status: MISS-CACHING`）。
 - **缓存统计与清理**：
   - `GET /api/v1/music/cache/stats`：查询已缓存曲目总数与磁盘占用字节
   - `POST /api/v1/music/cache/clean`：按 LRU 策略清理陈旧缓存
@@ -346,5 +350,5 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 | 状态层级 | 验证范围与实际依据 |
 | :--- | :--- |
 | **代码实现 (Code Completed)** | 后端 41 个路由（40 个 HTTP 接口 + 1 个 WebSocket 接口）全量源码已就绪，位于 `app/api/` 各路由模块中。 |
-| **部署验证 (Deployment Verified)** | 部署于 R9000P 生产服务（Git Commit: `fc0f98c`），系统全量通过 **111 项自动化测试 (0 失败)**。公网 TLS 健康检查返回 `200 OK`，实测拒绝非 WGS84 坐标返回 `422`，生产库洁净无脏数据。 |
-| **真机端到端未测 (Client Hardware Unverified)** | 车机 Android 硬件播放器实机音频输出效果、iOS 端行驶页 UI 收藏夹实际交互与真实网络抖动，需待三端联合实机验收时确认。 |
+| **部署验证 (Deployment Verified)** | 部署于 R9000P 生产服务（Git Commit: `3dde1d8`），系统全量通过 **119 项自动化测试 (0 失败)**。Tailscale TLS 健康检查返回 `200 OK`，实测拒绝非 WGS84 坐标返回 `422`，网易云搜索失败返回 `502/504`，生产库洁净无脏数据。 |
+| **真机端到端未测 (Client Hardware Unverified)** | 车机 Android 硬件播放器实机物理音频发声效果、iOS 端行驶页 UI 收藏夹实际交互与真实网络抖动，需待三端联合实机验收时确认。 |
