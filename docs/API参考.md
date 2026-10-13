@@ -1,9 +1,8 @@
 # MyYaris 全量后端 API 参考手册 (API Reference)
 
-**版本**：V2.2.0  
+**版本**：V2.3.0  
 **基准日期**：2026-10-13  
-**后端 Git 提交 Hash**：`fc0f98c` (`fc0f98c99bba046550ef11111c9fdb01d354747e`)  
-**根仓库 Git Hash**：`f128a0d`  
+**后端 Git 提交 Hash**：`d05fb89` (`d05fb894f426fd2b5c253ea3d824cfdd2f04ebb9`)  
 **部署宿主机**：Lenovo Legion R9000P (Ubuntu, systemd user service: `myyaris.service`)  
 **关联核心契约**：
 - [三端协同与播控契约 (docs/API-V2三端契约.md)](file:///path/to/user/Desktop/MyYaris/docs/API-V2三端契约.md)
@@ -294,11 +293,13 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 - `POST /api/v1/music/netease/intelligence`：基于目标歌曲生成心动智能推荐队列
 
 ### 8.3 边播边存智能缓存代理 (`/api/v1/music/netease/stream/{song_id}`)
-- **方法 & 路径**：`GET /api/v1/music/netease/stream/{song_id}`
+- **方法 & 路径**：`GET, HEAD /api/v1/music/netease/stream/{song_id}`
+- **鉴权**：支持 Header 鉴权或 URL 携带 Token (`?token=...`)
 - **工作机制**：
-  - 车机发起播放时优先检查本地 SQLite `MediaTrack` 与磁盘文件；
-  - 若命中本地缓存，立即以 `206 Partial Content` 流式返回；
-  - 若未命中，后端自动代理下载网易云高保真音频并写入持久化缓存库，后续播放零流量消耗。
+  - **HEAD 探测支持**：原生支持 HTTP HEAD 请求，返回音频元数据头（`Accept-Ranges: bytes`, `Content-Length`, `Content-Type: audio/mpeg`）而无需拉取音频实体，彻底规避播放器预检 405 Method Not Allowed；
+  - **真实音频 Magic Bytes 校验**：严格校验上游首分块 Magic Bytes（ID3v2, MPEG Frame Sync, FLAC, Ogg, RIFF 等），如遭遇上游风控/VIP 限制返回的 200 HTML/JSON 伪装错误页，立即中断并返回 `502 Bad Gateway`，杜绝播放器解析 HTML 崩溃；
+  - **Cache HIT**：命中本地 SSD 缓存时，立即以标准 `206 Partial Content` 毫秒级零延迟流式返回；
+  - **Cache MISS & 后台静默缓存**：未命中时代理上游 CDN 流，支持 `bytes=0-` 及任意 Range 分片，并在后台静默将完整音轨同步写入持久化 SSD 缓存库。
 - **缓存统计与清理**：
   - `GET /api/v1/music/cache/stats`：查询已缓存曲目总数与磁盘占用字节
   - `POST /api/v1/music/cache/clean`：按 LRU 策略清理陈旧缓存
