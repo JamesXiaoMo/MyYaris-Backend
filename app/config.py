@@ -49,6 +49,7 @@ class Settings(BaseSettings):
 
     # User Account & Session Authentication (Cookie & DB Sessions)
     SESSION_COOKIE_NAME: str = "myyaris_session"
+    CSRF_COOKIE_NAME: str = "myyaris_csrf"
     SESSION_EXPIRE_DAYS: int = 30
     COOKIE_SECURE: bool = True
     COOKIE_SAMESITE: str = "lax"
@@ -56,6 +57,8 @@ class Settings(BaseSettings):
     LOCKOUT_MINUTES: int = 15
     AVATARS_DIR: str = ""
     ENABLE_LEGACY_TOKEN_AUTH: bool = True
+    ENABLE_BOOTSTRAP_ADMIN: bool = True
+    ALLOWED_ORIGINS: str = "*"
 
     # External providers
     ASR_PROVIDER: str = "none"  # none | whisper_local | openai | mock (test only)

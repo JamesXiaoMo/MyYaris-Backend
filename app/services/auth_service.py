@@ -1,6 +1,10 @@
+import hashlib
+import hmac
+import io
 import ipaddress
 import logging
 import secrets
+import threading
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta
@@ -8,6 +12,7 @@ from typing import List, Optional, Tuple
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+from PIL import Image
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -35,6 +40,8 @@ _ph = PasswordHasher(
     hash_len=32,
 )
 
+_bootstrap_lock = threading.Lock()
+
 
 def hash_password(password: str) -> str:
     """Hashes a plaintext password using Argon2id."""
@@ -49,10 +56,17 @@ def verify_password(password_hash: str, password: str) -> bool:
         return False
 
 
+def generate_csrf_token(session_id: str) -> str:
+    """Derives a deterministic CSRF token bound to the session."""
+    secret = (settings.ADMIN_TOKEN or "myyaris_csrf_default_salt").encode()
+    return hmac.new(secret, session_id.encode(), hashlib.sha256).hexdigest()[:32]
+
+
 def validate_avatar_url(url: Optional[str]) -> Optional[str]:
     """
-    Strictly validates avatar URL to prevent SSRF vulnerabilities.
-    Rejects private IPs, loopbacks, internal hostnames, and non-http(s) schemes.
+    Validates avatar URL format.
+    NOTE: The backend server does NOT fetch external URLs. This URL is strictly
+    stored as a client-side display reference to eliminate server-side SSRF risks.
     """
     if not url:
         return None
@@ -67,8 +81,8 @@ def validate_avatar_url(url: Optional[str]) -> Optional[str]:
         return url
 
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Avatar URL must use http or https scheme.")
+    if parsed.scheme != "https":
+        raise ValueError("External avatar URL must use https scheme.")
 
     hostname = parsed.hostname
     if not hostname:
@@ -82,19 +96,67 @@ def validate_avatar_url(url: Optional[str]) -> Optional[str]:
         or lower_host.endswith(".internal")
         or lower_host.endswith(".lan")
     ):
-        raise ValueError("Internal or loopback avatar URLs are strictly prohibited (SSRF prevention).")
+        raise ValueError("Internal or loopback avatar URLs are not allowed.")
 
-    is_ip = False
+    # Disallow direct IP addresses
     try:
-        ip = ipaddress.ip_address(hostname)
-        is_ip = True
-    except ValueError:
-        pass
-
-    if is_ip and (ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local):
-        raise ValueError("Private or loopback IP avatar URLs are strictly prohibited (SSRF prevention).")
+        ipaddress.ip_address(hostname)
+        raise ValueError("Direct IP address avatar URLs are not allowed.")
+    except ValueError as e:
+        if "Direct IP address" in str(e):
+            raise
 
     return url
+
+
+def process_and_sanitize_avatar_image(content: bytes, user_id: str) -> Tuple[str, bytes]:
+    """
+    Decodes image using Pillow, verifies dimensions and pixel count,
+    strips EXIF / arbitrary metadata via transcoding, and enforces 2MB size limit.
+    """
+    if len(content) > 2 * 1024 * 1024:
+        raise ValueError("Avatar image size exceeds 2 MB limit.")
+
+    try:
+        img = Image.open(io.BytesIO(content))
+        img.verify()
+    except Exception as e:
+        raise ValueError(f"Invalid or corrupted image file: {e}")
+
+    # Re-open image after verify()
+    img = Image.open(io.BytesIO(content))
+
+    format_upper = (img.format or "").upper()
+    if format_upper not in ("PNG", "JPEG", "JPG", "WEBP"):
+        raise ValueError(f"Unsupported image format: {img.format}. Allowed formats: PNG, JPEG, WebP.")
+
+    width, height = img.size
+    if width < 16 or height < 16:
+        raise ValueError("Image dimensions too small (minimum 16x16 pixels).")
+    if width > 4096 or height > 4096:
+        raise ValueError("Image dimensions too large (maximum 4096x4096 pixels).")
+    if width * height > 16_000_000:
+        raise ValueError("Image pixel count exceeds safe threshold.")
+
+    # Re-encode image to strip EXIF, metadata, and non-image chunks
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        clean_img = img.convert("RGBA")
+        out_fmt = "PNG"
+        ext = ".png"
+    else:
+        clean_img = img.convert("RGB")
+        out_fmt = "JPEG"
+        ext = ".jpg"
+
+    output_io = io.BytesIO()
+    clean_img.save(output_io, format=out_fmt, quality=85, optimize=True)
+    clean_bytes = output_io.getvalue()
+
+    if len(clean_bytes) > 2 * 1024 * 1024:
+        raise ValueError("Transcoded image size exceeds 2 MB limit.")
+
+    safe_filename = f"{user_id}_{secrets.token_hex(8)}{ext}"
+    return safe_filename, clean_bytes
 
 
 def _ensure_aware(dt: Optional[datetime]) -> Optional[datetime]:
@@ -144,34 +206,53 @@ def user_to_response(db: Session, user: User) -> UserResponse:
 
 
 class AuthService:
+    generate_csrf_token = staticmethod(generate_csrf_token)
+
     def bootstrap_admin(self, db: Session, req: BootstrapAdminRequest) -> User:
         """
-        Creates the very first admin user.
-        Strictly disallowed once any user already exists in the database.
+        Bootstraps initial system administrator.
+        - Race-protected via thread lock and database transactional checks.
+        - Permitted only when no existing user has role='admin'.
+        - If standard users already exist, creates admin or promotes requested user.
+        - Password is provided by caller, never hardcoded.
         """
-        existing_users_count = db.query(User).count()
-        if existing_users_count > 0:
-            raise PermissionError("Bootstrap is closed: Administrator already exists.")
+        with _bootstrap_lock:
+            existing_admin = db.query(User).filter(User.role == "admin").first()
+            if existing_admin:
+                raise PermissionError("Bootstrap is closed: Administrator already exists.")
 
-        username_clean = req.username.strip().lower()
-        pwd_hash = hash_password(req.password)
-        now = utc_now()
+            username_clean = req.username.strip().lower()
+            pwd_hash = hash_password(req.password)
+            now = utc_now()
 
-        admin_user = User(
-            id=f"user_{uuid.uuid4().hex[:12]}",
-            username=username_clean,
-            password_hash=pwd_hash,
-            nickname=req.nickname or "System Administrator",
-            role="admin",
-            is_active=True,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(admin_user)
-        db.commit()
-        db.refresh(admin_user)
-        logger.info(f"Initial administrator '{username_clean}' successfully bootstrapped.")
-        return admin_user
+            # Check if this username exists as an ordinary user
+            existing_user = db.query(User).filter(User.username == username_clean).first()
+            if existing_user:
+                existing_user.password_hash = pwd_hash
+                existing_user.role = "admin"
+                existing_user.nickname = req.nickname or existing_user.nickname or username_clean
+                existing_user.updated_at = now
+                self.revoke_all_user_sessions(db, existing_user.id)
+                db.commit()
+                db.refresh(existing_user)
+                logger.info(f"Promoted existing user '{username_clean}' to initial administrator.")
+                return existing_user
+
+            admin_user = User(
+                id=f"user_{uuid.uuid4().hex[:12]}",
+                username=username_clean,
+                password_hash=pwd_hash,
+                nickname=req.nickname or "System Administrator",
+                role="admin",
+                is_active=True,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(admin_user)
+            db.commit()
+            db.refresh(admin_user)
+            logger.info(f"Initial administrator '{username_clean}' successfully bootstrapped.")
+            return admin_user
 
     def register_user(self, db: Session, req: UserRegisterRequest) -> User:
         """

@@ -36,6 +36,12 @@ def get_destination(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    if user.role == "user" and not user.has_device_control:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: User account lacks vehicle device control permission.",
+        )
+
     req = db.query(ParseRequest).filter(ParseRequest.request_id == id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Destination request not found.")

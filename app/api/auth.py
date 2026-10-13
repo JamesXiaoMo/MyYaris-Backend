@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import secrets
 from typing import Optional
+import urllib.parse
 
 from fastapi import (
     APIRouter,
@@ -19,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.repositories.database import SessionLocal, get_db
-from app.repositories.models import User
+from app.repositories.models import User, utc_now
 from app.schemas.auth import (
     AuthenticatedUser,
     BootstrapAdminRequest,
@@ -35,7 +36,9 @@ from app.schemas.auth import (
 )
 from app.services.auth_service import (
     auth_service,
+    generate_csrf_token,
     has_user_device_control,
+    process_and_sanitize_avatar_image,
     user_to_response,
 )
 
@@ -133,11 +136,13 @@ def get_current_user(
     3. X-Device-Token Header
     """
     token_candidate = None
+    is_cookie = False
 
     # Priority 1: HttpOnly Session Cookie
     cookie_token = request.cookies.get(settings.SESSION_COOKIE_NAME)
     if cookie_token and cookie_token.strip():
         token_candidate = cookie_token.strip()
+        is_cookie = True
 
     # Priority 2: X-Device-Token Header
     elif x_device_token and x_device_token.strip():
@@ -158,7 +163,101 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return verify_token_string(token_candidate, db=db)
+    user = verify_token_string(token_candidate, db=db)
+    user.auth_via_cookie = is_cookie
+    return user
+
+
+def verify_csrf(request: Request, user: AuthenticatedUser) -> None:
+    """
+    Enforces Origin validation and CSRF token verification on state-changing requests
+    when authenticated via cookies.
+    """
+    if not user.auth_via_cookie:
+        # Bearer tokens in Authorization header cannot be automatically attached by cross-site requests
+        return
+
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+
+    # 1. Origin / Referer Validation (if provided)
+    origin = request.headers.get("origin")
+    host = request.headers.get("host")
+    if origin and host:
+        parsed_origin = urllib.parse.urlparse(origin)
+        origin_netloc = parsed_origin.netloc
+        if origin_netloc != host and settings.ALLOWED_ORIGINS != "*":
+            allowed = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+            if origin not in allowed and f"{parsed_origin.scheme}://{origin_netloc}" not in allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="CSRF check failed: Origin header mismatch.",
+                )
+
+    # 2. X-CSRF-Token Header Validation
+    csrf_header = request.headers.get("x-csrf-token")
+    cookie_token = request.cookies.get(settings.SESSION_COOKIE_NAME)
+    csrf_cookie = request.cookies.get(settings.CSRF_COOKIE_NAME)
+
+    if not csrf_header or not csrf_header.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CSRF check failed: Missing X-CSRF-Token header for cookie-authenticated write operation.",
+        )
+
+    csrf_header = csrf_header.strip()
+    valid = False
+    if csrf_cookie and secrets.compare_digest(csrf_header, csrf_cookie):
+        valid = True
+    elif cookie_token:
+        from app.services.auth_service import generate_csrf_token
+        derived_csrf = generate_csrf_token(cookie_token)
+        if secrets.compare_digest(csrf_header, derived_csrf):
+            valid = True
+
+    if not valid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CSRF check failed: Invalid X-CSRF-Token.",
+        )
+
+
+def require_legacy_admin(
+    authorization: Optional[str] = Header(None),
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+) -> None:
+    """
+    Guards bootstrap admin initialization.
+    Requires server-side configured ADMIN_TOKEN and ENABLE_BOOTSTRAP_ADMIN=True.
+    Rejects phone tokens, car tokens, or empty tokens.
+    """
+    if not settings.ENABLE_BOOTSTRAP_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bootstrap disabled by server configuration (ENABLE_BOOTSTRAP_ADMIN=False).",
+        )
+    if not settings.ADMIN_TOKEN or not settings.ADMIN_TOKEN.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bootstrap disabled: ADMIN_TOKEN is not configured on this server.",
+        )
+
+    token_candidate = None
+    if x_admin_token and x_admin_token.strip():
+        token_candidate = x_admin_token.strip()
+    elif authorization and authorization.strip():
+        raw = authorization.strip()
+        if raw.startswith("Bearer "):
+            token_candidate = raw[len("Bearer ") :].strip()
+        else:
+            token_candidate = raw
+
+    if not token_candidate or token_candidate != settings.ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Valid legacy ADMIN_TOKEN is required to bootstrap initial administrator.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def require_admin(user: AuthenticatedUser = Depends(get_current_user)) -> AuthenticatedUser:
@@ -226,12 +325,19 @@ def require_phone_or_admin(user: AuthenticatedUser = Depends(get_current_user)) 
 
 
 def require_car_or_admin(user: AuthenticatedUser = Depends(get_current_user)) -> AuthenticatedUser:
-    if user.role not in ["car", "admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden: Vehicle device or Admin required.",
-        )
-    return user
+    """
+    Guards vehicle-side operations (task execution, polling).
+    Allows:
+    - Physical vehicle clients (role="car")
+    - Legacy system admin token (is_legacy_token=True and role="admin")
+    Forbids standard user-session admins from masquerading as vehicle hardware.
+    """
+    if user.role == "car" or (user.is_legacy_token and user.role == "admin"):
+        return user
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access forbidden: Vehicle device token or legacy system admin required. Standard user admin sessions cannot execute vehicle operations.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +348,15 @@ def require_car_or_admin(user: AuthenticatedUser = Depends(get_current_user)) ->
 def bootstrap_first_admin(
     req: BootstrapAdminRequest,
     db: Session = Depends(get_db),
+    _legacy_admin: None = Depends(require_legacy_admin),
 ):
     """
     Securely bootstraps the initial system administrator.
-    Only permitted when the database has ZERO registered users.
-    Once an administrator exists, this endpoint is permanently closed (403 Forbidden).
+    - Requires valid static ADMIN_TOKEN (phone or car tokens are strictly forbidden).
+    - Race-protected against concurrent creation.
+    - Only permitted when no user with role='admin' exists.
+    - Permitted even if ordinary users exist (promotes or creates admin).
+    - Caller supplies password, never hardcoded.
     """
     try:
         admin_user = auth_service.bootstrap_admin(db, req)
@@ -310,6 +420,7 @@ def login(
         )
 
     # Set secure revocable session cookie
+    csrf_val = auth_service.generate_csrf_token(session.session_id)
     response.set_cookie(
         key=settings.SESSION_COOKIE_NAME,
         value=session.session_id,
@@ -319,11 +430,22 @@ def login(
         samesite=settings.COOKIE_SAMESITE,
         path="/",
     )
+    # Set double-submit CSRF cookie readable by client-side JavaScript
+    response.set_cookie(
+        key=settings.CSRF_COOKIE_NAME,
+        value=csrf_val,
+        max_age=settings.SESSION_EXPIRE_DAYS * 86400,
+        httponly=False,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        path="/",
+    )
 
     return LoginResponse(
         code=200,
         message="Login successful",
         session_id=session.session_id,
+        csrf_token=csrf_val,
         token_type="bearer",
         expires_at=session.expires_at.isoformat(),
         user=user_to_response(db, user),
@@ -341,10 +463,19 @@ def logout(
     Logs out the current session.
     Revokes the session in SQLite database and deletes the session cookie.
     """
-    # 1. Clear session cookie
+    verify_csrf(request, user_auth)
+
+    # 1. Clear session and CSRF cookies
     response.delete_cookie(
         key=settings.SESSION_COOKIE_NAME,
         httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        path="/",
+    )
+    response.delete_cookie(
+        key=settings.CSRF_COOKIE_NAME,
+        httponly=False,
         secure=settings.COOKIE_SECURE,
         samesite=settings.COOKIE_SAMESITE,
         path="/",
@@ -395,10 +526,12 @@ def get_current_user_profile(
 @router.patch("/profile", response_model=UserResponse)
 def update_profile(
     req: UpdateProfileRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user_auth: AuthenticatedUser = Depends(get_current_user),
 ):
     """Updates current user profile with safe avatar URL validation (SSRF protected)."""
+    verify_csrf(request, user_auth)
     if not user_auth.user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -427,6 +560,7 @@ def change_password(
     Changes user password.
     Requires confirming the old password. Revokes all other sessions on success.
     """
+    verify_csrf(request, user_auth)
     if not user_auth.user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -452,17 +586,20 @@ def change_password(
 
 @router.post("/avatar", response_model=UserResponse)
 async def upload_avatar(
+    request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user_auth: AuthenticatedUser = Depends(get_current_user),
 ):
     """
     Safely uploads a user avatar image.
-    - Validates file extensions (.png, .jpg, .jpeg, .webp)
-    - Validates binary magic bytes to prevent masquerading
-    - Enforces a 2 MB file size limit
+    - Decodes image with Pillow to verify valid image stream
+    - Validates pixel dimensions and memory limits (16px <= W,H <= 4096px, <= 16 MP)
+    - Strips EXIF and metadata chunks via safe re-encoding
+    - Enforces 2 MB size limit
     - Stores with an isolated UUID filename
     """
+    verify_csrf(request, user_auth)
     if not user_auth.user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -473,46 +610,18 @@ async def upload_avatar(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
-    # 1. Validate file extension
-    filename_lower = (file.filename or "").lower()
-    allowed_exts = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
-    ext = Path(filename_lower).suffix
-    if ext not in allowed_exts:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported image format: {ext}. Allowed formats: PNG, JPEG, WebP.",
-        )
-
-    # 2. Read content and enforce 2MB limit
     content = await file.read()
-    if len(content) > 2 * 1024 * 1024:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Avatar image size exceeds 2 MB limit.",
-        )
+    try:
+        safe_filename, clean_bytes = process_and_sanitize_avatar_image(content, user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    # 3. Magic bytes validation
-    is_valid_magic = False
-    if ext == ".png" and content.startswith(b"\x89PNG\r\n\x1a\n"):
-        is_valid_magic = True
-    elif ext in (".jpg", ".jpeg") and content.startswith(b"\xff\xd8\xff"):
-        is_valid_magic = True
-    elif ext == ".webp" and content.startswith(b"RIFF") and b"WEBP" in content[:16]:
-        is_valid_magic = True
-
-    if not is_valid_magic:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File content does not match image format magic bytes.",
-        )
-
-    # 4. Save file safely
-    save_filename = f"{user.id}_{Path(file.filename).stem[:8]}_{secrets.token_hex(4)}{ext}"
-    save_path = Path(settings.AVATARS_DIR) / save_filename
+    save_path = Path(settings.AVATARS_DIR) / safe_filename
     with open(save_path, "wb") as f:
-        f.write(content)
+        f.write(clean_bytes)
 
-    user.avatar_url = f"/api/v1/auth/avatar/{save_filename}"
+    user.avatar_url = f"/api/v1/auth/avatar/{safe_filename}"
+    user.updated_at = utc_now()
     db.commit()
     db.refresh(user)
 
@@ -558,6 +667,7 @@ def list_users(
 def update_user_device_binding(
     user_id: str,
     req: DeviceBindingRequest,
+    request: Request,
     db: Session = Depends(get_db),
     admin_user: AuthenticatedUser = Depends(require_admin),
 ):
@@ -565,6 +675,7 @@ def update_user_device_binding(
     Admin only: grants or revokes vehicle control permission for a user.
     Prevents unauthorized accounts from commanding vehicle hardware.
     """
+    verify_csrf(request, admin_user)
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
@@ -588,10 +699,12 @@ def update_user_device_binding(
 def update_user_role(
     user_id: str,
     req: UserRoleUpdateRequest,
+    request: Request,
     db: Session = Depends(get_db),
     admin_user: AuthenticatedUser = Depends(require_admin),
 ):
     """Admin only: updates user role ('user' or 'admin')."""
+    verify_csrf(request, admin_user)
     try:
         user = auth_service.set_user_role(db, user_id=user_id, new_role=req.role)
         return user_to_response(db, user)

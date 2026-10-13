@@ -9,6 +9,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     Response,
     WebSocket,
     WebSocketDisconnect,
@@ -20,6 +21,7 @@ from app.api.auth import (
     get_current_user,
     require_car_or_admin,
     require_phone_or_admin,
+    verify_csrf,
     verify_token_string,
 )
 from app.config import settings
@@ -71,9 +73,11 @@ VALID_ACTIONS = {
 @router.post("/music/control/command", response_model=MusicCommandResponse)
 async def send_music_command(
     cmd: MusicCommandRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_phone_or_admin),
 ):
+    verify_csrf(request, user)
     """
     iPhone client dispatches an immediate playback control command to the vehicle.
     Persisted to SQLite, checked for idempotency/conflict, pushed to online WS car clients,
@@ -203,6 +207,12 @@ def get_music_command_status(
     """
     Query detailed lifecycle and delivery status for a specific command.
     """
+    if user.role == "user" and not user.has_device_control:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: User account lacks vehicle device control permission.",
+        )
+
     cmd = get_music_command_by_id(db, command_id)
     if not cmd:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Command not found.")
@@ -260,6 +270,12 @@ def get_car_playback_status(
     Query the latest real-time vehicle playback snapshot.
     Returns current playback state, track ID, seek position, and volume.
     """
+    if user.role == "user" and not user.has_device_control:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: User account lacks vehicle device control permission.",
+        )
+
     target_device = resolve_car_device_id(device_id)
     status_row = get_car_status_by_id(db, target_device)
 

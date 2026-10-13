@@ -1,10 +1,10 @@
 import uuid
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_user_or_phone_or_admin
+from app.api.auth import require_user_or_phone_or_admin, verify_csrf
 from app.repositories.database import get_db
 from app.repositories.models import Favorite, utc_now
 from app.schemas.auth import AuthenticatedUser
@@ -82,6 +82,7 @@ def list_favorites(
 @router.post("", response_model=FavoriteResponse, status_code=status.HTTP_201_CREATED)
 def create_favorite(
     fav_in: FavoriteCreateRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
@@ -90,6 +91,7 @@ def create_favorite(
     - Associates favorite with current user_id for logged-in accounts.
     - Tags as legacy shared pool when called via transitional legacy token.
     """
+    verify_csrf(request, user)
     fav_id = f"fav_{uuid.uuid4().hex[:12]}"
     now = utc_now()
 
@@ -155,10 +157,12 @@ def get_favorite(
 def update_favorite(
     favorite_id: str,
     fav_in: FavoriteUpdateRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
     """Update favorite location with ownership validation."""
+    verify_csrf(request, user)
     row = db.query(Favorite).filter(Favorite.id == favorite_id).first()
     if not row:
         raise HTTPException(
@@ -193,10 +197,12 @@ def update_favorite(
 @router.delete("/{favorite_id}")
 def delete_favorite(
     favorite_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_user_or_phone_or_admin),
 ):
     """Delete a favorite location with ownership validation."""
+    verify_csrf(request, user)
     row = db.query(Favorite).filter(Favorite.id == favorite_id).first()
     if not row:
         raise HTTPException(

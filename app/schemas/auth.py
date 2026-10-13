@@ -13,6 +13,7 @@ class AuthenticatedUser(BaseModel):
     device_id: Optional[str] = None
     is_legacy_token: bool = False
     has_device_control: bool = False
+    auth_via_cookie: bool = False
 
 
 class UserRegisterRequest(BaseModel):
@@ -51,6 +52,7 @@ class LoginResponse(BaseModel):
     message: str = "Login successful"
     session_id: str
     token_type: str = "bearer"
+    csrf_token: Optional[str] = None
     expires_at: str
     user: UserResponse
 

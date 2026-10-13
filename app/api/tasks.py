@@ -117,6 +117,12 @@ def get_task(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    if user.role == "user" and not user.has_device_control:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: User account lacks vehicle device control permission.",
+        )
+
     task = db.query(Task).filter(Task.task_id == id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
