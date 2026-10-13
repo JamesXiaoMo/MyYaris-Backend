@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
@@ -30,6 +32,14 @@ class NeteaseCookieStore:
 
     def __init__(self, storage_path: Optional[Path] = None):
         self.path = storage_path or (Path(settings.DATA_DIR) / "netease_cookie.json")
+        self.on_change_callbacks: List[Any] = []
+
+    def _trigger_on_change(self):
+        for cb in self.on_change_callbacks:
+            try:
+                cb()
+            except Exception as e:
+                logger.warning(f"Error in cookie on_change callback: {e}")
 
     def save(self, cookie: str, profile: Optional[dict] = None):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,6 +51,7 @@ class NeteaseCookieStore:
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         logger.info(f"Netease cookie successfully saved to {self.path}")
+        self._trigger_on_change()
 
     def load(self) -> Optional[str]:
         if not self.path.exists():
@@ -75,6 +86,7 @@ class NeteaseCookieStore:
                 logger.info("Netease cookie cleared from disk")
             except OSError:
                 pass
+        self._trigger_on_change()
 
     @property
     def has_cookie(self) -> bool:
@@ -87,6 +99,17 @@ class NeteaseService:
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or settings.NETEASE_API_BASE_URL).rstrip("/")
         self.cookie_store = NeteaseCookieStore()
+        self.cookie_store.on_change_callbacks.append(self.invalidate_favorite_cache)
+        self._cached_favorite_playlist: Optional[Dict[str, Any]] = None
+        self._cached_cookie_signature: Optional[str] = None
+        self._cached_fav_timestamp: float = 0.0
+        self._fav_cache_ttl_seconds: float = 300.0  # 5 minutes TTL
+
+    def invalidate_favorite_cache(self):
+        """Invalidates cached favorite playlist metadata upon session changes or manual refresh."""
+        self._cached_favorite_playlist = None
+        self._cached_cookie_signature = None
+        self._cached_fav_timestamp = 0.0
 
     def _with_cookie_param(self, params: Optional[dict] = None) -> dict:
         p = dict(params or {})
@@ -373,6 +396,194 @@ class NeteaseService:
             logger.error(f"Error getting lyric for {song_id}: {e}")
 
         return {"song_id": song_id, "lrc": None, "tlyric": None}
+
+    async def get_favorite_playlist_info(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Resolves non-sensitive metadata for the current account's system favorite playlist (我喜欢的音乐).
+        Uses third-party upstream API (Binaryify/NeteaseCloudMusicApi) specification:
+        Matches specialType == 5 and creator.userId == current_user_uid.
+        Never relies on localized Chinese title matching or static hardcoded IDs.
+        """
+        cookie = self.cookie_store.load()
+        if not cookie:
+            raise PermissionError("Netease Cloud Music account is not logged in on backend.")
+
+        cookie_sig = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+        now = time.time()
+        if (
+            not force_refresh
+            and self._cached_favorite_playlist
+            and self._cached_cookie_signature == cookie_sig
+            and (now - self._cached_fav_timestamp) < self._fav_cache_ttl_seconds
+        ):
+            return dict(self._cached_favorite_playlist)
+
+        profile = await self.get_profile_by_cookie(cookie)
+        if not profile or not profile.get("user_id"):
+            raise NeteaseUpstreamError(
+                "Failed to obtain Netease user profile from current session",
+                status_code=502,
+            )
+
+        uid = profile["user_id"]
+        url = f"{self.base_url}/user/playlist"
+        params = self._with_cookie_param({"uid": uid, "limit": 50, "offset": 0})
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    raise NeteaseUpstreamError(
+                        f"Upstream user playlist query returned HTTP {resp.status_code}",
+                        status_code=502,
+                    )
+                data = resp.json()
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout calling Netease user/playlist: {e}")
+            raise NeteaseUpstreamError("Upstream Netease user playlist query timed out", status_code=504)
+        except httpx.RequestError as e:
+            logger.error(f"Network error calling Netease user/playlist: {e}")
+            raise NeteaseUpstreamError(f"Upstream Netease user playlist connection failed: {e}", status_code=502)
+        except NeteaseUpstreamError:
+            raise
+        except Exception as e:
+            logger.error(f"Error calling Netease user/playlist: {e}")
+            raise NeteaseUpstreamError(f"Failed to query upstream Netease user playlist: {e}", status_code=502)
+
+        code = data.get("code")
+        if code is not None and code != 200:
+            raise NeteaseUpstreamError(
+                f"Upstream user playlist returned code {code}: {data.get('message')}",
+                status_code=502,
+            )
+
+        playlists = data.get("playlist", [])
+        matched = None
+        for pl in playlists:
+            creator_id = (pl.get("creator") or {}).get("userId")
+            # Standard third-party API convention: specialType == 5 designates the default favorite playlist
+            if pl.get("specialType") == 5:
+                if creator_id is None or creator_id == uid:
+                    matched = pl
+                    break
+
+        if not matched:
+            raise NeteaseUpstreamError(
+                "Owner favorite playlist (specialType==5) not found in user playlists",
+                status_code=404,
+            )
+
+        fav_info = {
+            "playlist_id": matched["id"],
+            "name": matched.get("name") or "我喜欢的音乐",
+            "cover_url": matched.get("coverImgUrl"),
+            "track_count": matched.get("trackCount", 0),
+            "play_count": matched.get("playCount", 0),
+            "user_id": uid,
+        }
+
+        self._cached_favorite_playlist = fav_info
+        self._cached_cookie_signature = cookie_sig
+        self._cached_fav_timestamp = now
+        return dict(fav_info)
+
+    async def get_favorite_playlist_tracks(self, offset: int = 0, limit: int = 30) -> Dict[str, Any]:
+        """
+        Paginates tracks from the owner's favorite playlist.
+        Maintains upstream sorting order without asserting reverse-chronological guarantee.
+        Handles empty playlists and out-of-range offsets gracefully.
+        """
+        fav_info = await self.get_favorite_playlist_info()
+        pid = fav_info["playlist_id"]
+        total = fav_info["track_count"]
+
+        if offset >= total or total == 0:
+            return {
+                "playlist_id": pid,
+                "name": fav_info["name"],
+                "cover_url": fav_info["cover_url"],
+                "track_count": total,
+                "play_count": fav_info["play_count"],
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "has_more": False,
+                "songs": [],
+            }
+
+        url = f"{self.base_url}/playlist/track/all"
+        params = self._with_cookie_param({"id": pid, "limit": limit, "offset": offset})
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    raise NeteaseUpstreamError(
+                        f"Upstream playlist track all returned HTTP {resp.status_code}",
+                        status_code=502,
+                    )
+                data = resp.json()
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout calling Netease playlist/track/all: {e}")
+            raise NeteaseUpstreamError("Upstream Netease playlist tracks timed out", status_code=504)
+        except httpx.RequestError as e:
+            logger.error(f"Network error calling Netease playlist/track/all: {e}")
+            raise NeteaseUpstreamError(f"Upstream Netease playlist tracks connection failed: {e}", status_code=502)
+        except NeteaseUpstreamError:
+            raise
+        except Exception as e:
+            logger.error(f"Error calling Netease playlist/track/all: {e}")
+            raise NeteaseUpstreamError(f"Failed to query upstream playlist tracks: {e}", status_code=502)
+
+        code = data.get("code")
+        if code is not None and code != 200:
+            raise NeteaseUpstreamError(
+                f"Upstream playlist tracks returned code {code}: {data.get('message')}",
+                status_code=502,
+            )
+
+        raw_songs = data.get("songs", [])
+        privilege_list = data.get("privileges", [])
+        priv_map = {p["id"]: p for p in privilege_list if isinstance(p, dict) and "id" in p}
+
+        songs = []
+        for s in raw_songs:
+            song_id = s.get("id")
+            if not song_id:
+                continue
+            priv = priv_map.get(song_id) or s.get("privilege") or {}
+            st = priv.get("st", s.get("st", 0))
+            fee = priv.get("fee", s.get("fee", 0))
+
+            ar_names = [ar.get("name", "") for ar in s.get("ar", []) if ar.get("name")]
+            artist_str = " / ".join(ar_names) or "Unknown Artist"
+            al_dict = s.get("al") or {}
+
+            songs.append({
+                "id": song_id,
+                "title": s.get("name") or "Unknown Title",
+                "artist": artist_str,
+                "album": al_dict.get("name"),
+                "duration_ms": s.get("dt") or 0,
+                "cover_url": al_dict.get("picUrl"),
+                "fee": fee,
+                "playable": bool(st >= 0),
+            })
+
+        has_more = (offset + len(songs)) < total
+
+        return {
+            "playlist_id": pid,
+            "name": fav_info["name"],
+            "cover_url": fav_info["cover_url"],
+            "track_count": total,
+            "play_count": fav_info["play_count"],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "songs": songs,
+        }
 
 
 class CacheManager:

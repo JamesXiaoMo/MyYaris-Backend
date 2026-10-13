@@ -398,3 +398,262 @@ def test_music_command_params_preserves_source_and_song_id():
     assert dumped["seek_ms"] == 15000
     assert dumped["loop_mode"] == "all"
 
+
+# ---------------------------------------------------------------------------
+# Favorite Playlist Endpoint Tests
+# ---------------------------------------------------------------------------
+
+def test_favorite_playlist_unauthenticated_returns_401(client):
+    resp = client.get("/api/v1/music/netease/playlist/favorite")
+    assert resp.status_code == 401
+
+
+def test_favorite_playlist_car_device_forbidden_returns_403(client, car_headers):
+    resp = client.get("/api/v1/music/netease/playlist/favorite", headers=car_headers)
+    assert resp.status_code == 403
+    assert "Administrator privileges required" in resp.json()["detail"]
+
+
+def test_favorite_playlist_standard_user_forbidden_returns_403(client, db_session):
+    from datetime import timedelta
+    from app.repositories.models import User, UserSession, utc_now
+    import secrets
+
+    # Create standard user
+    test_uid = f"user_{secrets.token_hex(4)}"
+    test_session_id = secrets.token_urlsafe(32)
+    user = User(
+        id=test_uid,
+        username=f"standard_{secrets.token_hex(4)}",
+        password_hash="fakehash",
+        role="user",
+        is_active=True,
+    )
+    session = UserSession(
+        session_id=test_session_id,
+        user_id=test_uid,
+        expires_at=utc_now() + timedelta(days=1),
+        is_revoked=False,
+    )
+    db_session.add(user)
+    db_session.add(session)
+    db_session.commit()
+
+    user_headers = {"Authorization": f"Bearer {test_session_id}"}
+    resp = client.get("/api/v1/music/netease/playlist/favorite", headers=user_headers)
+    assert resp.status_code == 403
+
+
+def test_favorite_playlist_not_logged_in_netease_returns_409(client, admin_headers):
+    with patch.object(netease_service.cookie_store, "load", return_value=None):
+        resp = client.get("/api/v1/music/netease/playlist/favorite", headers=admin_headers)
+        assert resp.status_code == 409
+        assert "not logged in" in resp.json()["detail"].lower()
+
+
+def test_favorite_playlist_success_pagination_and_special_type_identification(client, admin_headers):
+    fake_uid = 88887777
+    netease_service.invalidate_favorite_cache()
+
+    mock_profile = {"user_id": fake_uid, "nickname": "FavOwner"}
+    mock_playlists_data = {
+        "code": 200,
+        "playlist": [
+            {
+                "id": 1001,
+                "name": "普通歌单",
+                "specialType": 0,
+                "creator": {"userId": fake_uid},
+                "trackCount": 10,
+            },
+            {
+                "id": 1002,
+                "name": "我喜欢的音乐(伪)",
+                "specialType": 0,
+                "creator": {"userId": 999999},  # Other user's playlist with same name
+                "trackCount": 20,
+            },
+            {
+                "id": 777777,
+                "name": "My Favorite Music",  # English name
+                "specialType": 5,  # Official convention for favorite playlist
+                "creator": {"userId": fake_uid},
+                "trackCount": 45,
+                "playCount": 1200,
+                "coverImgUrl": "https://p1.music.126.net/fav_cover.jpg",
+            },
+        ],
+    }
+
+    mock_tracks_data = {
+        "code": 200,
+        "songs": [
+            {
+                "id": 123456,
+                "name": "测试歌曲A",
+                "ar": [{"id": 1, "name": "歌手A"}],
+                "al": {"id": 10, "name": "专辑A", "picUrl": "https://p1.music.126.net/a.jpg"},
+                "dt": 180000,
+            },
+            {
+                "id": 654321,
+                "name": "测试歌曲B",
+                "ar": [{"id": 2, "name": "歌手B"}],
+                "al": {"id": 20, "name": "专辑B", "picUrl": "https://p1.music.126.net/b.jpg"},
+                "dt": 210000,
+            },
+        ],
+        "privileges": [
+            {"id": 123456, "st": 0, "fee": 0},
+            {"id": 654321, "st": -200, "fee": 1},  # Unavailable / grayed out copyright
+        ],
+    }
+
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=valid_mock_cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                def fake_get(url, **kwargs):
+                    m = MagicMock()
+                    m.status_code = 200
+                    if "/user/playlist" in url:
+                        m.json.return_value = mock_playlists_data
+                    elif "/playlist/track/all" in url:
+                        m.json.return_value = mock_tracks_data
+                    else:
+                        m.json.return_value = {"code": 200}
+                    return m
+
+                mock_get.side_effect = fake_get
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite?offset=0&limit=30", headers=admin_headers)
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["code"] == 200
+                assert data["playlist_id"] == 777777  # Matched specialType == 5, not the other two!
+                assert data["name"] == "My Favorite Music"
+                assert data["total"] == 45
+                assert data["offset"] == 0
+                assert data["limit"] == 30
+                assert data["has_more"] is True
+                assert len(data["songs"]) == 2
+                assert len(data["tracks"]) == 2
+
+                # Verify first song fields
+                song_a = data["songs"][0]
+                assert song_a["id"] == 123456
+                assert song_a["song_id"] == 123456
+                assert song_a["title"] == "测试歌曲A"
+                assert song_a["artist"] == "歌手A"
+                assert song_a["album"] == "专辑A"
+                assert song_a["duration_ms"] == 180000
+                assert song_a["source"] == "netease"
+                assert song_a["playable"] is True
+                assert song_a["fee"] == 0
+                assert "/api/v1/music/netease/stream/123456" in song_a["stream_url"]
+
+                # Verify second song (copyright unavailable st < 0)
+                song_b = data["songs"][1]
+                assert song_b["id"] == 654321
+                assert song_b["playable"] is False
+                assert song_b["fee"] == 1
+
+
+def test_favorite_playlist_out_of_range_offset_returns_empty_page(client, admin_headers):
+    fake_uid = 88887777
+    netease_service.invalidate_favorite_cache()
+
+    mock_profile = {"user_id": fake_uid, "nickname": "FavOwner"}
+    mock_playlists_data = {
+        "code": 200,
+        "playlist": [
+            {
+                "id": 777777,
+                "name": "我喜欢的音乐",
+                "specialType": 5,
+                "creator": {"userId": fake_uid},
+                "trackCount": 10,
+            },
+        ],
+    }
+
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=valid_mock_cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                def fake_get(url, **kwargs):
+                    m = MagicMock()
+                    m.status_code = 200
+                    m.json.return_value = mock_playlists_data
+                    return m
+
+                mock_get.side_effect = fake_get
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite?offset=50&limit=30", headers=admin_headers)
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["total"] == 10
+                assert data["offset"] == 50
+                assert data["has_more"] is False
+                assert data["songs"] == []
+                assert data["tracks"] == []
+
+
+def test_favorite_playlist_limit_validation(client, admin_headers):
+    resp_over = client.get("/api/v1/music/netease/playlist/favorite?limit=101", headers=admin_headers)
+    assert resp_over.status_code == 422
+
+    resp_neg = client.get("/api/v1/music/netease/playlist/favorite?offset=-1", headers=admin_headers)
+    assert resp_neg.status_code == 422
+
+
+def test_favorite_playlist_upstream_error_propagation(client, admin_headers):
+    netease_service.invalidate_favorite_cache()
+    mock_profile = {"user_id": 12345, "nickname": "FavOwner"}
+
+    # 1. Upstream 500 error propagation -> HTTP 502
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                m = MagicMock()
+                m.status_code = 500
+                mock_get.return_value = m
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite", headers=admin_headers)
+                assert resp.status_code == 502
+                assert "upstream error" in resp.json()["detail"].lower()
+
+    # 2. Upstream Timeout propagation -> HTTP 504
+    netease_service.invalidate_favorite_cache()
+    with patch.object(netease_service.cookie_store, "load", return_value="MUSIC_U=cookie"):
+        with patch.object(netease_service, "get_profile_by_cookie", new_callable=AsyncMock) as mock_prof:
+            mock_prof.return_value = mock_profile
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                mock_get.side_effect = httpx.TimeoutException("Upstream timed out")
+
+                resp = client.get("/api/v1/music/netease/playlist/favorite", headers=admin_headers)
+                assert resp.status_code == 504
+                assert "timed out" in resp.json()["detail"].lower()
+
+
+def test_favorite_playlist_cache_invalidation_on_cookie_change():
+    netease_service.invalidate_favorite_cache()
+    netease_service._cached_favorite_playlist = {"playlist_id": 9999}
+    netease_service._cached_cookie_signature = "sig123"
+
+    # Saving a new cookie must invalidate cache
+    netease_service.cookie_store.save("MUSIC_U=new_token")
+    assert netease_service._cached_favorite_playlist is None
+    assert netease_service._cached_cookie_signature is None
+
+    # Setting cache again
+    netease_service._cached_favorite_playlist = {"playlist_id": 8888}
+    netease_service._cached_cookie_signature = "sig456"
+
+    # Clearing cookie must invalidate cache
+    netease_service.cookie_store.clear()
+    assert netease_service._cached_favorite_playlist is None
+    assert netease_service._cached_cookie_signature is None
+
+

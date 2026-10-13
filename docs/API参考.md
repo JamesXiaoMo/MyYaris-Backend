@@ -291,6 +291,14 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   - **正常命中**：返回 HTTP 200，包含清洗后的音轨元数据列表与分页总量；
   - **合法空结果**：上游检索确实无匹配曲目时，返回 HTTP 200，`{"code": 200, "total": 0, "songs": []}`；
   - **上游异常处理**：若网易云服务不可用、上游返回 5xx/4xx 错误或连接超时，直接向客户端返回 **HTTP 502 Bad Gateway** 或 **HTTP 504 Gateway Timeout**，杜绝将上游挂死/网络故障伪装为 0 结果空列表；
+- `GET /api/v1/music/netease/playlist/favorite?offset=0&limit=30`：分页获取当前网易云账号专属「我喜欢的音乐」
+  - **权限约束**：仅限 `admin` 管理员角色（及过渡期 legacy phone 凭据）访问；普通注册用户 (`user`) 或车机硬件 (`car`) 访问返回 **HTTP 403 Forbidden**；匿名未鉴权请求返回 **HTTP 401 Unauthorized**；
+  - **会话状态**：若后端全局网易云账号尚未登录，返回 **HTTP 409 Conflict**，避免误触发客户端注销 MyYaris 自身会话；
+  - **歌单定位**：依据第三方 API（`Binaryify/NeteaseCloudMusicApi`）规范，通过 `specialType == 5` 及所有者 UID 精确匹配，不硬编码 ID，不依赖歌单中文名匹配；
+  - **分页与排序**：支持 `offset`（ge=0）与 `limit`（ge=1, le=100，默认 30），保持上游原生返回顺序；offset 越界或空歌单返回合法空页 (`songs: []`, `has_more: false`)；
+  - **音轨与权限元数据**：返回标准化 `NeteaseSongItem`（包含 `id`, `song_id`, `title`, `artist`, `album`, `duration_ms`, `cover_url`, `cached`, `stream_url`, `fee`, `playable`, `source: "netease"`），兼容现有 Stage 1 播放模型（同时提供 `songs` 与 `tracks` 字段便于客户端直接调用 `playTrack`）；
+  - **上游错误透传**：上游 5xx 返回 **HTTP 502 Bad Gateway**，超时返回 **HTTP 504 Gateway Timeout**，严禁吞咽异常掩盖为空列表；
+  - **零副作用保障**：纯只读拉取，不触发点赞/取消红心，不派发播控或导航指令，不改变全局账号授权数据，不自动预探测、预下载或预缓存全量 700+ 音频；
 - `GET /api/v1/music/netease/song_url?song_id=...`：解析音频直链
 - `GET /api/v1/music/netease/lyric?song_id=...`：获取逐字歌词
 - `POST /api/v1/music/netease/intelligence`：基于目标歌曲生成心动智能推荐队列

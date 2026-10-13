@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 class NeteaseSongItem(BaseModel):
     id: int = Field(..., description="Netease song ID")
+    song_id: Optional[int] = Field(None, description="Alias for song ID for client compatibility")
     title: str = Field(..., description="Song title")
     artist: str = Field(..., description="Joined artist names")
     album: Optional[str] = Field(None, description="Album name")
@@ -13,6 +14,22 @@ class NeteaseSongItem(BaseModel):
     stream_url: str = Field(..., description="Direct or proxy stream URL")
     fee: Optional[int] = Field(0, description="0=free, 1=vip, 4=album, 8=pay")
     playable: Optional[bool] = Field(True, description="Whether playable without regional/copyright restriction")
+    source: str = Field("netease", description="Music source identifier")
+
+
+class NeteaseFavoritePlaylistResponse(BaseModel):
+    code: int = 200
+    playlist_id: int = Field(..., description="Unique favorite playlist ID")
+    name: str = Field(..., description="Playlist display name")
+    cover_url: Optional[str] = Field(None, description="Playlist cover image URL")
+    track_count: int = Field(..., description="Total track count reported by playlist")
+    play_count: Optional[int] = Field(None, description="Cumulative play count")
+    total: int = Field(..., description="Total track count available")
+    offset: int = Field(..., description="Pagination offset")
+    limit: int = Field(..., description="Pagination page limit")
+    has_more: bool = Field(..., description="Whether subsequent tracks exist")
+    songs: List[NeteaseSongItem] = Field(default_factory=list, description="List of track items on this page")
+    tracks: List[NeteaseSongItem] = Field(default_factory=list, description="Alias for songs compatible with client models")
 
 
 class NeteaseSearchResponse(BaseModel):

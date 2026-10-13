@@ -30,6 +30,7 @@ from app.schemas.auth import AuthenticatedUser
 from app.schemas.netease import (
     CacheStatsResponse,
     NeteaseCookieLoginRequest,
+    NeteaseFavoritePlaylistResponse,
     NeteaseIntelligenceRequest,
     NeteaseIntelligenceResponse,
     NeteaseLoginStatusResponse,
@@ -101,6 +102,76 @@ async def search_netease_songs(
         code=200,
         total=res.get("total", len(items)),
         songs=items,
+    )
+
+
+@router.get("/netease/playlist/favorite", response_model=NeteaseFavoritePlaylistResponse)
+async def get_netease_favorite_playlist(
+    request: Request,
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    limit: int = Query(30, ge=1, le=100, description="Items per page (default 30, max 100)"),
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
+):
+    """
+    Paginates the current NetEase account's default favorite music playlist (我喜欢的音乐).
+    - Strictly restricted to MyYaris Administrator (or authorized legacy phone token for transitional compatibility).
+    - Standard registered users (role='user') and vehicle devices (role='car') are forbidden (403).
+    - Unauthenticated requests are rejected (401).
+    - Returns HTTP 409 Conflict if backend NetEase account is not logged in, avoiding invalidating MyYaris session.
+    - System favorite playlist is automatically identified via specialType==5 and owner UID match.
+    - Preserves upstream track ordering and limits pagination.
+    - Does NOT pre-download, cache, or probe audio streams for all playlist tracks.
+    """
+    try:
+        data = await netease_service.get_favorite_playlist_tracks(offset=offset, limit=limit)
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
+    except NeteaseUpstreamError as e:
+        raise HTTPException(
+            status_code=e.status_code,
+            detail=f"Netease upstream error: {e.message}",
+        )
+
+    base_url = str(request.base_url).rstrip("/")
+    items = []
+    for s in data.get("songs", []):
+        s_id = s["id"]
+        cached = cache_manager.get_cached_track(db, s_id) is not None
+        stream_url = f"{base_url}/api/v1/music/netease/stream/{s_id}"
+        items.append(
+            NeteaseSongItem(
+                id=s_id,
+                song_id=s_id,
+                title=s["title"],
+                artist=s["artist"],
+                album=s.get("album"),
+                duration_ms=s.get("duration_ms", 0),
+                cover_url=s.get("cover_url"),
+                cached=cached,
+                stream_url=stream_url,
+                fee=s.get("fee", 0),
+                playable=s.get("playable", True),
+                source="netease",
+            )
+        )
+
+    return NeteaseFavoritePlaylistResponse(
+        code=200,
+        playlist_id=data["playlist_id"],
+        name=data["name"],
+        cover_url=data.get("cover_url"),
+        track_count=data["track_count"],
+        play_count=data.get("play_count"),
+        total=data["total"],
+        offset=data["offset"],
+        limit=data["limit"],
+        has_more=data["has_more"],
+        songs=items,
+        tracks=items,
     )
 
 
