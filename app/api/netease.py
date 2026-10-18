@@ -276,7 +276,7 @@ async def stream_netease_audio(
 ):
     """
     Dynamic 'stream-and-cache' streaming endpoint supporting HTTP 206 Partial Content and HEAD probing.
-    - If song is cached on R9000P SSD, serves directly with instant seek and zero network cost.
+    - If song is cached on local server SSD, serves directly with instant seek and zero network cost.
     - If uncached, streams from Netease CDN while asynchronously piping into local cache.
     - Strictly rejects non-audio error masquerades (HTML/JSON) with HTTP 502/404.
     """

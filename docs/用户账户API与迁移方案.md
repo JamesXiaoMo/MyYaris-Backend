@@ -2,7 +2,7 @@
 
 > **文件版本**：V1.1  
 > **编写日期**：2026-10-13  
-> **当前状态**：后端已完成加固与 R9000P 生产部署（提交 `d8831fe`），自动化测试 136/136 全绿通过。  
+> **当前状态**：后端已完成加固与生产部署（提交 `d8831fe`），自动化测试 136/136 全绿通过。  
 > **客户端状态说明**：严格遵守未授权约束，**未对 `ios_app/`、`car_app/` 及 iOS 快捷指令进行任何修改**。当前后端开启了过渡期兼容支持（`ENABLE_LEGACY_TOKEN_AUTH=True`），现有手机端与车机继续正常工作，等待用户确认后再决定是否同步 iOS 端。
 
 ---
@@ -164,17 +164,17 @@ erDiagram
 - **请求体**：
   ```json
   {
-    "username": "myyaris-user",
+    "username": "admin",
     "password": "UserProvidedAdminPassword123!",
-    "nickname": "维护者"
+    "nickname": "Admin"
   }
   ```
 - **响应体 (`201 Created`)**：
   ```json
   {
     "id": "user_1a2b3c4d5e6f",
-    "username": "myyaris-user",
-    "nickname": "维护者",
+    "username": "admin",
+    "nickname": "Admin",
     "avatar_url": null,
     "role": "admin",
     "is_active": true,
@@ -189,7 +189,7 @@ erDiagram
 - **请求体**：
   ```json
   {
-    "username": "myyaris-user",
+    "username": "admin",
     "password": "UserProvidedAdminPassword123!"
   }
   ```
@@ -209,8 +209,8 @@ erDiagram
     "expires_at": "2026-11-12T11:00:00Z",
     "user": {
       "id": "user_1a2b3c4d5e6f",
-      "username": "myyaris-user",
-      "nickname": "维护者",
+      "username": "admin",
+      "nickname": "Admin",
       "avatar_url": null,
       "role": "admin",
       "is_active": true,
@@ -246,12 +246,12 @@ erDiagram
 
 1. **代码提交记录**：
    - 后端仓库当前提交：`d8831fe` (`fix(auth): harden bootstrap admin with legacy token check, add CSRF defense, and sanitize avatar with PIL`)
-2. **R9000P 运行状态**：
+2. **服务器运行状态**：
    - 服务 Unit：`myyaris.service`
    - 主进程 PID：`1578616`（Uvicorn 正常监听中）
-   - 车机心跳：已正常接收来自 Ottocast P3 Pro（Tailscale IP `192.0.2.10`）的播控状态上报（`200 OK`）。
+   - 车机心跳：已正常接收来自 Ottocast P3 Pro（Tailscale IP `<CAR_TAILSCALE_IP>`）的播控状态上报（`200 OK`）。
 3. **自动化测试套件结果**：
-   - 在 R9000P 实际执行全量测试：
+   - 实际执行全量测试：
      ```text
      tests/test_auth_and_user.py .................                            [ 12%]
      tests/test_auto_input.py .............                                   [ 22%]

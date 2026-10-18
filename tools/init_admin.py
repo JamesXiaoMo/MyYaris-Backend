@@ -80,8 +80,8 @@ def prompt_credentials() -> tuple[str, str, str]:
 
     # 1. Username
     while True:
-        raw_user = input("请输入初始管理员用户名 [默认: myyaris-user]: ").strip()
-        username = raw_user if raw_user else "myyaris-user"
+        raw_user = input("请输入初始管理员用户名 [默认: admin]: ").strip()
+        username = raw_user if raw_user else "admin"
         if USERNAME_PATTERN.match(username):
             break
         print("❌ 用户名格式不合法: 必须为 3-32 位字母、数字、下划线或连字符。请重新输入。")

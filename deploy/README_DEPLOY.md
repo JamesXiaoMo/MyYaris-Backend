@@ -2,9 +2,9 @@
 
 ## 1. 运行环境与架构
 
-- **主机**: Lenovo Legion R9000P (Ubuntu 24.04 LTS)
-- **部署路径**: `/path/to/user/桌面/MyYaris/backend`
-- **数据与数据库目录**: `/path/to/user/.local/share/myyaris/`（包含 `myyaris.db` 与 `audio_temp/`）
+- **主机**: Linux Edge Server (Ubuntu 24.04 LTS)
+- **部署路径**: `/home/<USER>/myyaris/backend`
+- **数据与数据库目录**: `~/.local/share/myyaris/`（包含 `myyaris.db` 与 `audio_temp/`）
 - **网络接入**: Tailscale 私有网段 + Tailscale HTTPS 证书代理
 
 ---
@@ -14,7 +14,7 @@
 在后端目录启动开发/调试服务：
 
 ```bash
-cd /path/to/user/桌面/MyYaris/backend
+cd /home/<USER>/myyaris/backend
 source .venv/bin/activate
 uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
@@ -24,7 +24,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ## 3. Tailscale HTTPS 暴露与证书管理
 
 Tailscale 在本机已启用 MagicDNS 及 TLS 域名：
-`myyaris.example.com`
+`<YOUR_SERVER>.your-tailnet.ts.net`
 
 通过 Tailscale Serve 可以原生提供受信任的 HTTPS 终止并将流量反向代理到本地 8000 端口：
 
@@ -43,8 +43,8 @@ tailscale serve status
 ```
 
 ### 客户端访问地址:
-- **健康检查**: `https://myyaris.example.com/health`
-- **长轮询接口**: `https://myyaris.example.com/devices/car_p3pro/tasks/next?timeout=20`
+- **健康检查**: `https://<YOUR_SERVER>.your-tailnet.ts.net/health`
+- **长轮询接口**: `https://<YOUR_SERVER>.your-tailnet.ts.net/devices/car_p3pro/tasks/next?timeout=20`
 
 ---
 
@@ -54,7 +54,7 @@ tailscale serve status
 
 ```bash
 # 复制服务文件
-sudo cp /path/to/user/桌面/MyYaris/backend/deploy/myyaris.service /etc/systemd/system/
+sudo cp /home/<USER>/myyaris/backend/deploy/myyaris.service /etc/systemd/system/
 
 # 重载并启动
 sudo systemctl daemon-reload
@@ -73,5 +73,5 @@ journalctl -u myyaris.service -f
 - **备份注意**：由于处于 WAL 模式，直接 `cp myyaris.db` 可能导致复制到未提交或不一致的状态。
 - 建议使用 SQLite 在线备份命令：
   ```bash
-  sqlite3 /path/to/user/.local/share/myyaris/myyaris.db ".backup /path/to/user/backup/myyaris_$(date +%Y%m%d).db"
+  sqlite3 ~/.local/share/myyaris/myyaris.db ".backup ~/backup/myyaris_$(date +%Y%m%d).db"
   ```

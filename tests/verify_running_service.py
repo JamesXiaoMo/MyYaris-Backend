@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import httpx
 
 # Load production .env without printing secrets
-env_path = Path("/path/to/user/桌面/MyYaris/backend/.env")
+env_path = Path(os.environ.get("MYYARIS_ENV_PATH", Path(__file__).resolve().parents[1] / ".env"))
 load_dotenv(env_path)
 
 phone_token = os.getenv("PHONE_TOKEN", "")

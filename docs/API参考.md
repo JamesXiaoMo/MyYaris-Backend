@@ -3,10 +3,10 @@
 **版本**：V2.3.1  
 **基准日期**：2026-10-13  
 **后端 Git 提交 Hash**：`3dde1d8` (`3dde1d85a5fa1cd284fc53f6483de8229d757fc3`)  
-**部署宿主机**：Lenovo Legion R9000P (Ubuntu, systemd user service: `myyaris.service`)  
+**部署宿主机**：Linux Edge Server (Ubuntu, systemd user service: `myyaris.service`)  
 **关联核心契约**：
-- [三端协同与播控契约 (docs/API-V2三端契约.md)](file:///path/to/user/Desktop/MyYaris/docs/API-V2三端契约.md)
-- [收藏夹业务契约 (docs/收藏夹API契约.md)](file:///path/to/user/Desktop/MyYaris/docs/收藏夹API契约.md)
+- [三端协同与播控契约 (docs/API-V2三端契约.md)](../../docs/API-V2三端契约.md)
+- [收藏夹业务契约 (docs/收藏夹API契约.md)](../../docs/收藏夹API契约.md)
 
 ---
 
@@ -28,8 +28,8 @@
 ## 一、 网络架构与网络访问边界
 
 ### 1.1 服务端点与协议
-- **本机/局域网回环**：`http://127.0.0.1:8000` / `http://192.0.2.20:8000`
-- **安全传输基地址 (HTTPS / WSS)**：`https://myyaris.example.com`
+- **本机/局域网回环**：`http://127.0.0.1:8000` / `http://<LAN_IP>:8000`
+- **安全传输基地址 (HTTPS / WSS)**：`https://<YOUR_SERVER>.your-tailnet.ts.net`
 
 ### 1.2 Tailscale 私网访问性重要说明 (非公网暴露)
 > [!IMPORTANT]
@@ -379,5 +379,5 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 | 状态层级 | 验证范围与实际依据 |
 | :--- | :--- |
 | **代码实现 (Code Completed)** | 后端 41 个路由（40 个 HTTP 接口 + 1 个 WebSocket 接口）全量源码已就绪，位于 `app/api/` 各路由模块中。 |
-| **部署验证 (Deployment Verified)** | 部署于 R9000P 生产服务（Git Commit: `3dde1d8`），系统全量通过 **119 项自动化测试 (0 失败)**。Tailscale TLS 健康检查返回 `200 OK`，实测拒绝非 WGS84 坐标返回 `422`，网易云搜索失败返回 `502/504`，生产库洁净无脏数据。 |
+| **部署验证 (Deployment Verified)** | 部署于生产服务（Git Commit: `3dde1d8`），系统全量通过 **119 项自动化测试 (0 失败)**。Tailscale TLS 健康检查返回 `200 OK`，实测拒绝非 WGS84 坐标返回 `422`，网易云搜索失败返回 `502/504`，生产库洁净无脏数据。 |
 | **真机端到端未测 (Client Hardware Unverified)** | 车机 Android 硬件播放器实机物理音频发声效果、iOS 端行驶页 UI 收藏夹实际交互与真实网络抖动，需待三端联合实机验收时确认。 |

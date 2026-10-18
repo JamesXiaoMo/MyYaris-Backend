@@ -15,7 +15,7 @@
 
 ---
 
-运行于 Ubuntu R9000P 的 FastAPI 服务，使用 SQLite 持久化用户、地址收藏、导航任务和音乐控制指令。通过 Tailscale Serve 提供 Tailnet 内的 HTTPS 入口。
+运行于 Linux 边缘宿主机的 FastAPI 服务，使用 SQLite 持久化用户、地址收藏、导航任务和音乐控制指令。通过 Tailscale Serve 提供 Tailnet 内的 HTTPS 入口。
 
 ## 核心模块
 

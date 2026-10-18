@@ -4,12 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/path/to/user/桌面/MyYaris/backend
-ExecStart=/path/to/user/桌面/MyYaris/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+WorkingDirectory=/home/<DEPLOY_USER>/myyaris/backend
+ExecStart=/home/<DEPLOY_USER>/myyaris/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=3s
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/path/to/user/桌面/MyYaris/backend/.env
+EnvironmentFile=-/home/<DEPLOY_USER>/myyaris/backend/.env
 
 [Install]
 WantedBy=default.target
