@@ -1,212 +1,81 @@
-# MyYaris 后端服务 (FastAPI + SQLite)
+<div align="center">
 
-MyYaris 是一套针对车机与外出手机联动的目的地自动流转后端服务。  
-它负责统一接收：
-1. **iPhone 快捷指令**分享的 Google Maps 地图链接或文本地址；
-2. **车机前端 (Flutter / Ottocast P3 Pro)** 的中文语音与文字输入；
-并在解析确认目的地后生成单调流转任务，通过 Tailscale 安全网络及 HTTPS 长轮询机制下发给车机，触发 CAR NAVITIME 导航。
+# ⚙️ MyYaris · Backend
 
----
+**连接手机、车机与持久化任务**
 
-## 核心特性
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white)
+![Tailscale](https://img.shields.io/badge/Tailscale-242424?logo=tailscale&logoColor=white)
 
-- **Tailscale 私有网络与 HTTPS 契约**：服务监听在 Tailscale 私网内部，客户端统一通过带有合法 TLS 证书的 HTTPS 连接。
-- **SQLite 坚固持久化**：启用 WAL（Write-Ahead Logging）模式、5 秒 busy_timeout 以及外键约束，保证轻量且可靠的状态事实来源。
-- **任务单调流转与回执**：状态严格遵循 `queued` -> `received` -> `launch_requested`，自动抵御网络乱序、重复回执造成的倒退。
-- **幂等性与去重**：支持客户端请求 `idempotency_key` 去重，相同请求直接返回已有结果，不同载荷冲突抛出 409。
-- **任务替代（Supersede）**：提交新目的地时，在同一事务中将尚未执行的旧任务标记为 `superseded`，车机仅领取最新有效任务。
-- **长轮询与低功耗即时唤醒**：内置内存通知器 `QueueNotifier`，新任务入队瞬间唤醒挂起请求；无任务时 20 秒超时返回 204。
-- **SSRF 严密防御**：地图外部链接重定向跟随严格校验白名单域名与真实解析 IP（禁止内网、回环及多播 IP）。
-- **供应商解耦与可插拔**：ASR（语音识别）、NLP（地点意图抽取）、Maps（地图搜索）均具备抽象接口，未配置实际 Key 时支持平滑返回明确不可用状态或使用测试替身（Test Doubles）。
+[项目总览](https://github.com/JamesXiaoMo/MyYaris) · [iPhone 客户端](https://github.com/JamesXiaoMo/MyYaris-iOS) · [API 参考](docs/API参考.md)
+
+</div>
 
 ---
 
-## API 端点概览
+运行于 Ubuntu R9000P 的 FastAPI 服务，使用 SQLite 持久化用户、地址收藏、导航任务和音乐控制指令。通过 Tailscale Serve 提供 Tailnet 内的 HTTPS 入口。
 
-| 方法 | 路径 | 鉴权角色 | 描述 |
-| --- | --- | --- | --- |
-| `GET` | `/health` | 公开 | 服务健康检查 |
-| `POST` | `/destinations` | Phone / Admin | 提交文字、明确坐标或地图分享链接 |
-| `GET` | `/destinations/{id}` | Any (已认证) | 查询解析进度、候选列表、澄清问题或关联任务 |
-| `POST` | `/destinations/{id}/confirm` | Phone / Admin | 确认候选地点并生成下发任务 |
-| `GET` | `/devices/{id}/tasks/next` | Car / Admin | 车机端长轮询获取下一条待执行任务 |
-| `POST` | `/tasks/{id}/ack` | Car / Admin | 车机端上报接收或打开导航回执 |
-| `GET` | `/tasks/{id}` | Any (已认证) | 查询指定任务详细流转状态与地理坐标 |
-| `POST` | `/voice` | Any (已认证) | 上传车机/手机录音并触发转写与地点解析 |
+## 核心模块
 
----
+| 模块 | 职责 |
+| --- | --- |
+| 账户 | 用户名与密码登录、Argon2id 密码哈希、会话、头像及设备授权。 |
+| 导航 | 解析经纬度、Plus Code 和地图链接；歧义澄清、候选确认、任务分发和回执。 |
+| 收藏 | 用户地址及 WGS84 坐标的数据库保存与维护。 |
+| 音乐 | 搜索、流媒体转发/缓存、“我喜欢的音乐”分页读取与歌单归属校验。 |
+| 设备控制 | WebSocket 与 HTTP 轮询、指令有效期、幂等处理和状态同步。 |
 
-## iPhone 快捷指令对接指南
+```mermaid
+flowchart LR
+    Client["iPhone / 车机"] <-->|HTTPS / WSS| Serve["Tailscale Serve"]
+    Serve <--> API["FastAPI · 127.0.0.1:8000"]
+    API <--> DB[(SQLite)]
+    API <--> Music["网易云第三方服务"]
+    API --> Maps["地图解析 / 地名查询"]
+```
 
-iPhone 快捷指令配置为在“共享表单 (Share Sheet)”中接收 URL 或文本，向 MyYaris 后端发送 POST 请求。
+## 本地启动
 
-### 1. 提交明确 WGS84 坐标
-适用于已获得经纬度的自动化流：
 ```bash
-curl -X POST "https://myyaris.example.com/destinations" \
-  -H "Authorization: Bearer <PHONE_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input_type": "coords",
-    "coordinate": {
-      "latitude": 35.658581,
-      "longitude": 139.745433,
-      "coord_system": "wgs84"
-    },
-    "target_device_id": "car_p3pro"
-  }'
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
-响应直接进入 `resolved` 状态并生成 `task_id`。
 
-### 2. 提交 Google Maps 分享链接
-快捷指令从 Google Maps App 点击“分享”获取链接（如 `https://maps.app.goo.gl/...`）：
+启动前编辑 `.env`，配置独立设备凭据、账户认证和所需的外部服务。示例不包含生产凭据。
+
 ```bash
-curl -X POST "https://myyaris.example.com/destinations" \
-  -H "Authorization: Bearer <PHONE_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input_type": "share_link",
-    "url": "https://maps.app.goo.gl/EXAMPLE",
-    "target_device_id": "car_p3pro"
-  }'
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-#### 快捷指令处理流程（含确认流程）：
-1. 若响应 `status == "resolved"`：链接含有明确图钉或坐标，`task_id` 已生成，车机将自动拉取并导航。
-2. 若响应 `status == "needs_clarification"` 且包含 `candidates`：
-   - 链接属于地址/区域描述（无明确图钉坐标），系统通过 Nominatim 返回了概略候选列表；
-   - 快捷指令提示用户选取候选（或默认选用首个候选），随后调用确认接口：
-   ```bash
-   curl -X POST "https://myyaris.example.com/destinations/<REQUEST_ID>/confirm" \
-     -H "Authorization: Bearer <PHONE_TOKEN>" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "candidate_id": "<CANDIDATE_ID>",
-       "target_device_id": "car_p3pro"
-     }'
-   ```
-   确认后即刻生成任务并下发车机，成功唤起 CAR NAVITIME。
+- 健康检查：`GET /health`
+- Swagger：`http://127.0.0.1:8000/docs`
+- 自动化测试：`.venv/bin/pytest`
+- 部署文件与说明：[deploy/](deploy/)
+- 管理员初始化工具：[tools/init_admin.py](tools/init_admin.py)，在服务器交互执行并自行输入密码。
 
----
+## 接口与架构文档
 
-## 链接真实支持范围与 Nominatim 地点查询兜底
+- [API 参考](docs/API参考.md)
+- [账户 API 与迁移方案](docs/用户账户API与迁移方案.md)
+- [后端架构说明](docs/后端当前架构.md)
+- [网易云喜欢歌单说明](docs/网易云喜欢歌单接入可行性.md)
+- [三端共享契约](https://github.com/JamesXiaoMo/MyYaris/blob/main/docs/API-V2三端契约.md)
 
-后端严格执行真实导航坐标保障准则，**坚决不猜测、不伪造假坐标**：
+“我喜欢的音乐”接口：`GET /api/v1/music/netease/playlist/favorite?offset=0&limit=30`。具体权限、响应字段和异常码以 API 参考为准。
 
-1. **直接解析成功并生成任务**（支持合法整数与浮点 WGS84 坐标）：
-   - 包含明确单一地点图钉（`!3d<lat>!4d<lon>`）的长/短链接；
-   - 包含明确终点查询参数的链接（`destination=<lat>,<lon>`、`daddr=<lat>,<lon>`）；
-   - 包含明确经纬度图钉搜索参数（`q=<lat>,<lon>` 或 `query=<lat>,<lon>`，即使附带 `ll` 视野中心亦优先采用图钉坐标）；
-   - 兼容合法整数坐标（例如 `35, 139` 或 `0, 0`）与标准浮点坐标。
-2. **Nominatim (OpenStreetMap) 地名/地址查询兜底**：
-   - 针对无直接经纬度、仅包含地址文字或 Place 描述的链接（如 `https://maps.app.goo.gl/EXAMPLE` 展开为 `q=Saijocho Jike, 东广岛市广岛县 739-0041`）：
-   - **日文地址规范化**：自动完成常见汉字转换（如“东广岛市”->“東広島市”、“广岛县”->“広島県”）、罗马字转换（如“Saijocho Jike”->“西条町寺家”）与日本 47 都道府县层级识别，规避无意义猜词；
-   - **严格遵守 OSMF 使用政策**：
-     - 配置独立标识性 `User-Agent`，携带项目与联系信息；
-     - 进程级硬性限流 **1 request/s**（`NominatimRateLimiter`）；
-     - 内存查询缓存（TTL 24小时）与并发防击穿（In-flight Deduplication）；
-     - 明确来源标注：*Data © OpenStreetMap contributors*；
-   - **安全确认机制**：**任何检索候选必须返回 `needs_clarification`，在确认前 `task_id` 严格为空**，地区/行政区中心明确标注 `(地区中心·非精确图钉)`，杜绝将非图钉概略点静默自动下发至车机；
-   - **无结果明确提示**：若检索无匹配，明确返回无候选并提示用户补充详细番地门牌或分享精确图钉，不伪造坐标。
-3. **返回 `needs_clarification`（澄清）而非猜测假坐标**：
-   - **`ll` 单独出现或仅视野中心**（`/@lat,lon,zoom` 或 `?ll=lat,lon`）：此类链接仅代表地图浏览视野中心，并非具体目的地。系统返回清晰说明：“所分享链接仅为地图视野中心，并非具体的目的地或图钉。请在地图上长按放置图钉或点击具体地点后再分享。”
-   - **路线导航链接缺终点参数**（`/dir/` 链接）：路线链接中首个出现的坐标通常为出发地/起点，为杜绝将出发地误当终点下发车机，系统不自动选取首个坐标，要求用户直接提供终点图钉或明确坐标。
-   - **包含多个地点坐标**：存在多个不同 `!3d!4d` 候选点且无法证明终点时，系统不盲目取第一个，返回澄清提示。
-4. **SSRF 安全防护与重定向处理**：
-   - 相对重定向统一使用 `urljoin` 正确还原完整 URL；
-   - 重定向每跳及最终落地 URL 严格校验白名单域名（`maps.google.com`, `maps.app.goo.gl` 等）与真实解析 IP（禁止内网、回环及多播 IP）；
-   - 重定向跳数耗尽时安全拦截报错，杜绝解析未经验证的目的地。
+## 运行边界
 
----
+- Tailscale Serve 的当前方案只在 Tailnet 内可达，客户端保留 HTTPS 证书验证。
+- 手机使用账户会话；车机设备凭据独立管理，旧 Token 仅按迁移配置兼容。
+- 地图分享链接不一定包含精确坐标；不明确的候选需要确认。
+- `launch_requested` 表示请求打开导航；指令回执不单独证明导航开始或音乐实际出声。
+- 网易云接口依赖第三方实现，不是网易云官方公开 API；可播放性受登录、权限、版权和网络条件影响。
+- 语音及 AI 供应商接口的存在不代表已部署可用模型。
 
-## 状态机与流转契约
+## 仓库维护
 
-### 解析请求状态 (`ParseRequest.status`)
-- `resolving`: 正在异步处理或等待外部解析。
-- `resolved`: 目的地坐标已明确确定，`task_id` 已创建并下发。
-- `needs_clarification`: 存在歧义或需要用户确认（包含 `candidates` 列表与 `clarification_question`）。
-- `failed`: 参数校验失败或未配置的供应商调用失败。
-
-### 任务状态 (`Task.status`)
-状态严格遵循**单调递增**流转：
-- `queued`: 任务已在数据库持久化排队，等待车机领取。
-- `received`: 车机长轮询已成功拉取该任务并上报回执。
-- `launch_requested`: 车机已成功发出调用系统 CAR NAVITIME 的 Intent。
-- `failed`: 车机调起失败或超时失败（终端状态，**不可倒退**）。
-- `superseded`: 用户发起新目的地，旧任务在事务中自动失效替代。
-- `expired`: 任务超过有效期限（默认 60 分钟）未被执行。
-
----
-
----
-
-## 生产运行状态与日志 (无凭据)
-
-- **运行方式**：Linux User Systemd 服务 (`systemctl --user status myyaris.service`)，已配置开机与无登录会话持久常驻 (`loginctl enable-linger myyaris-user`)，进程崩溃自动拉起 (`Restart=always, RestartSec=3s`)。
-- **监听绑定**：`http://127.0.0.1:8000`（安全绑定本机回环，预备由 Tailscale Serve 终结 HTTPS 并反向代理）。
-- **实时日志查看**：`journalctl --user -u myyaris.service -f`
-- **数据持久化目录**：`/path/to/user/.local/share/myyaris/myyaris.db`（SQLite WAL 模式，WAL + SHM 双缓冲）。
-- **运行配置与凭据**：高强度随机 Token 已由脚本初始化至 `/path/to/user/桌面/MyYaris/backend/.env`（权限 `0600`，绝不输出），`ALLOW_MOCK_FALLBACK=false`（严格禁用任何 mock 假坐标回退）。
-- **运行记录时间**：`2026-10-06 20:00:09 JST`（PID: 1067821，验证通过）。
-
----
-
-## Tailscale 私网访问与 HTTPS 配置指南
-
-当前 Tailnet 三端实时在线状态：
-- **Linux R9000P**：`192.0.2.10` (`myyaris.example.com`)
-- **iPhone**：`192.0.2.10` (`iphone182`)（R9000P `tailscale ping` 响应时间 13ms）
-- **车机 Ottocast P3 Pro**：`192.0.2.10` (`ottoaibox-p3-pro`)（R9000P `tailscale ping` 响应时间 45ms）
-
-### 真实 HTTPS 目标地址（供 Flutter 与 iPhone 快捷指令使用）
-```text
-https://myyaris.example.com
-```
-
-### Tailscale Serve 当前状态与剩余用户操作
-Tailscale 守护进程对 `serve` 配置实施权限限制：
-执行 `tailscale serve --bg http://127.0.0.1:8000` 报错：
-```text
-sending serve config: Access denied: serve config denied
-Use 'sudo tailscale serve --bg http://127.0.0.1:8000'.
-To not require root, use 'sudo tailscale set --operator=$USER' once.
-```
-因 sudo 需要用户交互输入密码，系统遵循安全原则不猜测密码，**剩余操作需用户在 R9000P 终端执行一次授权**：
-
-**选项 A（直接启动 Serve 反代）**：
-```bash
-sudo tailscale serve --bg http://127.0.0.1:8000
-```
-
-**选项 B（一次性赋予 operator 权限，后续无需 sudo）**：
-```bash
-sudo tailscale set --operator=myyaris-user
-tailscale serve --bg http://127.0.0.1:8000
-```
-
-执行后，Tailscale 将在私网端口 443 终结 TLS 证书并自动代理至本机的 `http://127.0.0.1:8000`，使 iPhone 快捷指令与车机 P3 Pro 均能通过上述统一 HTTPS 域名安全访问。
-
----
-
-## 运行自动化测试与现网巡检
-
-1. **运行 Pytest 单元与安全测试套件**：
-```bash
-cd /path/to/user/桌面/MyYaris/backend
-.venv/bin/pytest -v
-```
-*(42 项测试全量通过，覆盖 Nominatim 地名检索、OSM 限流与缓存、并发去重、整数坐标、路线起点保护、ll/q优先级、多坐标澄清、SSRF防护及跳转耗尽拦截)*
-
-2. **运行当前活跃服务黑盒验证**：
-```bash
-cd /path/to/user/桌面/MyYaris/backend
-.venv/bin/python tests/verify_running_service.py
-```
-*(已通过真实 Token 验证 /health、未鉴权与越权拒绝、测试设备 car_test_probe 坐标入队与轮询，未发送虚假车机 ack)*
-
-
-### Google Plus Code
-
-`POST /destinations` 新增 `input_type: plus_code`，输入字段 `plus_code`，可选 `reference_coordinate: {latitude, longitude, coord_system: "wgs84"}`。原有 `coords` 不变。Open Location Code 离线解码为编码区域中心，不需要 Google Maps API Key。
-
-完整编码精度 >=10 位可直接创建任务；粗编码或按参照恢复的短编码必须通过现有 confirm 接口确认。Google 复制的短编码＋市＋县（例如 `CPF8+Q7 东广岛市 广岛县`）可查询 Nominatim 城市参照，自动归一化中日文地区名称；日本市、县均匹配、4+2 格式且所有结果还原同一完整编码时自动创建任务，其他城市匹配需确认。无地区、查无城市或缺参照时返回 needs_clarification，不猜测目的地。iPhone 具体配置见 `docs/iPhone快捷指令配置.md`。现有 share_link/text 输入不自动识别 Plus Code，请明确使用 plus_code 输入类型。
+改动完成并通过必要检查后，在本仓库提交并推送 GitHub。不上传 `.env`、Cookie、密码、数据库、音乐缓存或运行日志。历史验证记录不代表当前设备在线状态。
