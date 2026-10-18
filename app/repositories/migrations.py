@@ -58,7 +58,48 @@ def run_db_migrations(engine) -> None:
                 )
                 conn.commit()
 
-            # Ensure indexes on favorites(user_id), favorites(folder_id), and favorite_folders(user_id) exist
+            # 3. Check and migrate SQLite columns & unique constraints for 'favorite_folders' table
+            folder_table_check = conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='favorite_folders'")
+            ).fetchone()
+
+            if folder_table_check:
+                folder_cols = [
+                    row[1]
+                    for row in conn.execute(text("PRAGMA table_info(favorite_folders)")).fetchall()
+                ]
+                if "owner_scope" not in folder_cols:
+                    logger.info("Migrating favorite_folders table: Adding owner_scope column")
+                    conn.execute(
+                        text("ALTER TABLE favorite_folders ADD COLUMN owner_scope VARCHAR(64) DEFAULT '__legacy__'")
+                    )
+                    conn.commit()
+
+                if "name_norm" not in folder_cols:
+                    logger.info("Migrating favorite_folders table: Adding name_norm column")
+                    conn.execute(
+                        text("ALTER TABLE favorite_folders ADD COLUMN name_norm VARCHAR(64) DEFAULT ''")
+                    )
+                    conn.commit()
+
+                # Backfill owner_scope and name_norm for any existing rows
+                conn.execute(
+                    text(
+                        """
+                        UPDATE favorite_folders
+                        SET owner_scope = CASE
+                            WHEN user_id IS NOT NULL AND is_legacy = 0 THEN 'user:' || user_id
+                            ELSE '__legacy__'
+                        END,
+                        name_norm = lower(trim(name)),
+                        name = trim(name)
+                        WHERE owner_scope IS NULL OR owner_scope = '' OR name_norm IS NULL OR name_norm = ''
+                        """
+                    )
+                )
+                conn.commit()
+
+            # Ensure indexes and unique constraints on favorites and favorite_folders exist
             conn.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_favorites_user_id ON favorites (user_id)")
             )
@@ -71,9 +112,22 @@ def run_db_migrations(engine) -> None:
             conn.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_favorite_folders_name ON favorite_folders (name)")
             )
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_favorite_folders_scope_name_norm "
+                    "ON favorite_folders (owner_scope, name_norm)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_favorite_folders_user_expr "
+                    "ON favorite_folders (coalesce(user_id, '__legacy__'), is_legacy, lower(trim(name)))"
+                )
+            )
             conn.commit()
 
             logger.info("Database schema migration completed successfully.")
         except Exception as e:
             logger.error(f"Error during schema migration: {e}", exc_info=True)
+
 

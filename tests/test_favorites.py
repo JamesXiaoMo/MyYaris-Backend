@@ -561,3 +561,151 @@ def test_migrations_idempotent_on_legacy_sqlite_schema(tmp_path):
         assert row[2] == 1
         assert row[3] is None
 
+        folder_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(favorite_folders)")).fetchall()]
+        assert "owner_scope" in folder_cols
+        assert "name_norm" in folder_cols
+
+
+def test_folder_db_unique_constraint_and_concurrent_race_409(
+    client: TestClient,
+    db_session: Session,
+    phone_headers: dict,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from sqlalchemy.exc import IntegrityError
+    import app.api.favorites as fav_api
+
+    # 1. Seed initial folders
+    f1 = client.post("/api/v1/favorite-folders", json={"name": "并发测试夹"}, headers=phone_headers).json()
+    f2 = client.post("/api/v1/favorite-folders", json={"name": "待改名文件夹"}, headers=phone_headers).json()
+
+    # 2. Simulate concurrent race where check-then-insert is bypassed by two simultaneous requests:
+    # SQLite's UniqueConstraint on (owner_scope, name_norm) must catch the race at commit time and map to 409 Conflict!
+    monkeypatch.setattr(fav_api, "_ensure_unique_folder_name", lambda *args, **kwargs: None)
+
+    r_race_create = client.post(
+        "/api/v1/favorite-folders",
+        json={"name": "  并发测试夹  "},
+        headers=phone_headers,
+    )
+    assert r_race_create.status_code == 409
+
+    # Also test case-insensitive collision at DB constraint level when check-then-rename is bypassed
+    r_race_rename = client.patch(
+        f"/api/v1/favorite-folders/{f2['id']}",
+        json={"name": "并发测试夹"},
+        headers=phone_headers,
+    )
+    assert r_race_rename.status_code == 409
+
+    # Verify session was cleanly rolled back and subsequent valid operations still succeed
+    r_after = client.get("/api/v1/favorite-folders", headers=phone_headers)
+    assert r_after.status_code == 200
+    assert r_after.json()["total"] == 2
+
+    # 3. Direct DB insert of duplicate (owner_scope, name_norm) must raise IntegrityError
+    dup_model = FavoriteFolder(
+        id="fld_direct_dup",
+        user_id=None,
+        is_legacy=True,
+        owner_scope="__legacy__",
+        name="并发测试夹",
+        name_norm="并发测试夹",
+    )
+    db_session.add(dup_model)
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
+
+
+def test_pagination_tiebreaker_conflicting_filters_and_repeated_delete(
+    client: TestClient,
+    db_session: Session,
+    phone_headers: dict,
+):
+    from datetime import datetime, timezone
+
+    # 1. Deterministic tie-breaker when timestamps are identical
+    fixed_time = datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc)
+    for fid, fname in [("fld_001", "FolderB"), ("fld_002", "FolderA"), ("fld_003", "FolderC")]:
+        db_session.add(
+            FavoriteFolder(
+                id=fid,
+                user_id=None,
+                is_legacy=True,
+                owner_scope="__legacy__",
+                name=fname,
+                name_norm=fname.lower(),
+                created_at=fixed_time,
+                updated_at=fixed_time,
+            )
+        )
+    db_session.commit()
+
+    # Ascending by created_at (all equal) -> secondary sort by id asc: fld_001, fld_002, fld_003
+    p_asc_1 = client.get("/api/v1/favorite-folders?sort_by=created_at&order=asc&limit=2&offset=0", headers=phone_headers).json()
+    assert [x["id"] for x in p_asc_1["items"]] == ["fld_001", "fld_002"]
+    assert p_asc_1["has_more"] is True
+
+    p_asc_2 = client.get("/api/v1/favorite-folders?sort_by=created_at&order=asc&limit=2&offset=2", headers=phone_headers).json()
+    assert [x["id"] for x in p_asc_2["items"]] == ["fld_003"]
+    assert p_asc_2["has_more"] is False
+
+    # Out-of-range offset -> empty items, has_more=False
+    p_oob = client.get("/api/v1/favorite-folders?limit=10&offset=99", headers=phone_headers).json()
+    assert p_oob["items"] == []
+    assert p_oob["total"] == 3
+    assert p_oob["has_more"] is False
+
+    # Descending by created_at -> secondary sort by id desc: fld_003, fld_002, fld_001
+    p_desc = client.get("/api/v1/favorite-folders?sort_by=created_at&order=desc", headers=phone_headers).json()
+    assert [x["id"] for x in p_desc["items"]] == ["fld_003", "fld_002", "fld_001"]
+
+    # 2. Conflicting filter: uncategorized=true + concrete folder_id -> 422
+    r_conflict = client.get("/api/v1/favorites?uncategorized=true&folder_id=fld_001", headers=phone_headers)
+    assert r_conflict.status_code == 422
+
+    # Non-existent folder_id filter -> 404
+    r_missing_fld = client.get("/api/v1/favorites?folder_id=fld_does_not_exist", headers=phone_headers)
+    assert r_missing_fld.status_code == 404
+
+    # 3. Repeated DELETE on folder returns 200 first, then 404 on retry
+    d1 = client.delete("/api/v1/favorite-folders/fld_003", headers=phone_headers)
+    assert d1.status_code == 200
+    d2 = client.delete("/api/v1/favorite-folders/fld_003", headers=phone_headers)
+    assert d2.status_code == 404
+
+    # 4. Explicit regression: PUT/PATCH on categorized favorite with omitted folder_id vs explicit "" / "uncategorized" / null
+    fav = client.post(
+        "/api/v1/favorites",
+        json={"name": "初始归类点", "address": "东京塔", "latitude": 35.6586, "longitude": 139.7454, "folder_id": "fld_001"},
+        headers=phone_headers,
+    ).json()
+    assert fav["folder_id"] == "fld_001"
+
+    # PUT without folder_id keeps fld_001
+    put_keep = client.put(
+        f"/api/v1/favorites/{fav['id']}",
+        json={"name": "PUT未传folder_id保持归属"},
+        headers=phone_headers,
+    ).json()
+    assert put_keep["folder_id"] == "fld_001"
+
+    # PATCH with empty string "" clears folder_id to None
+    patch_empty = client.patch(
+        f"/api/v1/favorites/{fav['id']}",
+        json={"folder_id": "   "},
+        headers=phone_headers,
+    ).json()
+    assert patch_empty["folder_id"] is None
+
+    # Re-assign to fld_002, then clear via "uncategorized" sentinel
+    client.patch(f"/api/v1/favorites/{fav['id']}", json={"folder_id": "fld_002"}, headers=phone_headers)
+    patch_sentinel = client.patch(
+        f"/api/v1/favorites/{fav['id']}",
+        json={"folder_id": "uncategorized"},
+        headers=phone_headers,
+    ).json()
+    assert patch_sentinel["folder_id"] is None
+
+

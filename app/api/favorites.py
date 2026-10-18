@@ -2,6 +2,7 @@ import uuid
 from typing import Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.auth import require_user_or_phone_or_admin, verify_csrf
@@ -23,6 +24,11 @@ router = APIRouter(prefix="/api/v1/favorites", tags=["Favorites"])
 folders_router = APIRouter(prefix="/api/v1/favorite-folders", tags=["Favorite Folders"])
 
 _UNCATEGORIZED_SENTINELS = {"uncategorized", "__uncategorized__", "null", "none"}
+
+
+def _get_owner_scope_key(user: AuthenticatedUser) -> str:
+    """Returns canonical owner scope string for database-level unique constraints."""
+    return f"user:{user.user_id}" if user.user_id else "__legacy__"
 
 
 def _is_same_owner_scope(
@@ -204,18 +210,28 @@ def create_favorite_folder(
 
     folder_id = f"fld_{uuid.uuid4().hex[:12]}"
     now = utc_now()
+    clean_name = folder_in.name.strip()
 
     folder = FavoriteFolder(
         id=folder_id,
         user_id=user.user_id,
         is_legacy=bool(user.user_id is None),
-        name=folder_in.name,
+        owner_scope=_get_owner_scope_key(user),
+        name=clean_name,
+        name_norm=clean_name.lower(),
         created_by=user.identity,
         created_at=now,
         updated_at=now,
     )
     db.add(folder)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Favorite folder '{clean_name}' already exists.",
+        )
     db.refresh(folder)
 
     return _to_folder_response(folder, favorite_count=0)
@@ -254,9 +270,19 @@ def update_favorite_folder(
     folder = _get_owned_folder_or_404(db, folder_id, user)
     _ensure_unique_folder_name(db, folder_in.name, user, exclude_folder_id=folder.id)
 
-    folder.name = folder_in.name
+    clean_name = folder_in.name.strip()
+    folder.name = clean_name
+    folder.name_norm = clean_name.lower()
+    folder.owner_scope = _get_owner_scope_key(user)
     folder.updated_at = utc_now()
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Favorite folder '{clean_name}' already exists.",
+        )
     db.refresh(folder)
 
     fav_count = (

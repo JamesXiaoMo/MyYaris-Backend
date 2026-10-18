@@ -331,9 +331,10 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 
 ### 9.1 核心约束
 1. **WGS84 原生坐标约束**：严格仅接受 `"wgs84"`，传入 `gcj02` 或 `bd09` 直接返回 **422 Unprocessable Entity**（杜绝无转换算法导致 NAVITIME 偏移）。
-2. **严格单账号隔离（含管理员）**：登录账号（`user_id` 非空）仅访问自己的文件夹与收藏地址；过渡期 Legacy 静态 Token 仅访问 Legacy 池（`user_id IS NULL`）。严禁任何跨账号文件夹/地址引用（包括管理员跨用户归类）。
-3. **非空文件夹安全删除语义**：删除文件夹时，在同一数据库事务中将其下所有地址的 `folder_id` 置为 `NULL`（回到未分类），**严禁级联删除用户已存地址**。
-4. **安全非目标**：仅支持单层文件夹；不提供后端 POI 搜索接口；不自动逆地理编码；不自动生成车机导航任务。
+2. **严格单账号隔离与数据库级同名唯一约束**：登录账号（`user_id` 非空）仅访问自己的文件夹与收藏地址；过渡期 Legacy 静态 Token 仅访问 Legacy 池（`user_id IS NULL`）。严禁任何跨账号文件夹/地址引用（包括管理员跨用户归类）。`favorite_folders` 通过 `(owner_scope, name_norm)` 数据库级唯一索引与 `IntegrityError -> 409 Conflict` 事务回滚映射保障并发创建/重命名无重名绕过。
+3. **非空文件夹安全删除与新旧表约束边界**：新库建表 `favorites.folder_id` 带 `REFERENCES favorite_folders(id) ON DELETE SET NULL`；既有生产库经 `ALTER TABLE favorites ADD COLUMN folder_id VARCHAR(64)` 迁移不带底层 `REFERENCES` 约束，由应用层在删除文件夹时于同一数据库事务内执行 `UPDATE favorites SET folder_id = NULL` + `DELETE FROM favorite_folders`、写入校验及读取孤儿归一化保障，**严禁级联删除用户已存地址**。
+4. **安全非目标与重试约束**：仅支持单层文件夹；不提供后端 POI 搜索接口；不自动逆地理编码；不自动生成车机导航任务；`POST /api/v1/favorites` 无 `idempotency_key`，客户端超时不得盲目自动重试；重复 `DELETE` 返回 `404`，客户端收到 `404` 应刷新列表。
+
 
 ### 9.2 单层文件夹接口 (`/api/v1/favorite-folders`，兼容 `/api/v1/favorites/folders`)
 - **文件夹列表**：`GET /api/v1/favorite-folders?limit=50&offset=0&sort_by=created_at&order=asc&search=...`（返回 `items` 含 `favorite_count`、`total`、`has_more`、`uncategorized_count`）

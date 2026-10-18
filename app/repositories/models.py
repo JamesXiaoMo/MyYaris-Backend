@@ -8,6 +8,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from app.repositories.database import Base
@@ -160,14 +161,20 @@ class MusicCommand(Base):
 
 class FavoriteFolder(Base):
     __tablename__ = "favorite_folders"
+    __table_args__ = (
+        UniqueConstraint("owner_scope", "name_norm", name="uq_favorite_folders_scope_name_norm"),
+    )
 
     id = Column(String(64), primary_key=True, index=True)
     user_id = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     is_legacy = Column(Boolean, default=False, nullable=False)
+    owner_scope = Column(String(64), nullable=False, default="__legacy__", index=True)
     name = Column(String(64), nullable=False, index=True)
+    name_norm = Column(String(64), nullable=False, default="", index=True)
     created_by = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
 
 
 class Favorite(Base):
