@@ -3,12 +3,58 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+class FavoriteFolderCreateRequest(BaseModel):
+    name: str = Field(..., description="Folder name (1-64 characters after trimming)")
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_folder_name(cls, v: str) -> str:
+        if not isinstance(v, str):
+            raise ValueError("Folder name must be a string.")
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("Folder name cannot be empty or whitespace only.")
+        if len(stripped) > 64:
+            raise ValueError("Folder name must be at most 64 characters.")
+        return stripped
+
+
+class FavoriteFolderUpdateRequest(FavoriteFolderCreateRequest):
+    pass
+
+
+class FavoriteFolderResponse(BaseModel):
+    id: str
+    name: str
+    favorite_count: int = 0
+    created_at: str
+    updated_at: str
+
+
+class FavoriteFolderListResponse(BaseModel):
+    items: List[FavoriteFolderResponse]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+    uncategorized_count: int = 0
+
+
 class FavoriteBase(BaseModel):
     name: Optional[str] = Field(None, max_length=128, description="Optional custom name or label")
     address: str = Field(..., max_length=512, description="Address text")
     latitude: float = Field(..., description="Latitude [-90.0, 90.0]")
     longitude: float = Field(..., description="Longitude [-180.0, 180.0]")
     coord_system: Optional[str] = Field("wgs84", max_length=32, description="Coordinate system")
+    folder_id: Optional[str] = Field(None, max_length=64, description="Optional folder ID")
+
+    @field_validator("folder_id")
+    @classmethod
+    def validate_folder_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        stripped = v.strip()
+        return stripped if stripped else None
 
     @field_validator("address")
     @classmethod
@@ -64,6 +110,15 @@ class FavoriteUpdateRequest(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     coord_system: Optional[str] = Field(None, max_length=32)
+    folder_id: Optional[str] = Field(None, max_length=64)
+
+    @field_validator("folder_id")
+    @classmethod
+    def validate_folder_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        stripped = v.strip()
+        return stripped if stripped else None
 
     @field_validator("address")
     @classmethod
@@ -117,6 +172,8 @@ class FavoriteUpdateRequest(BaseModel):
 
 class FavoriteResponse(BaseModel):
     id: str
+    folder_id: Optional[str] = None
+    folder_name: Optional[str] = None
     name: Optional[str] = None
     address: str
     latitude: float
@@ -131,3 +188,5 @@ class FavoriteListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    has_more: bool = False
+

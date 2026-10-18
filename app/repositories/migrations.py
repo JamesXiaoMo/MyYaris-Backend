@@ -44,18 +44,36 @@ def run_db_migrations(engine) -> None:
                     )
                     conn.commit()
 
+                # Migrate folder_id column
+                if "folder_id" not in columns:
+                    logger.info("Migrating favorites table: Adding folder_id column")
+                    conn.execute(
+                        text("ALTER TABLE favorites ADD COLUMN folder_id VARCHAR(64)")
+                    )
+                    conn.commit()
+
                 # Mark legacy entries
                 conn.execute(
                     text("UPDATE favorites SET is_legacy = 1 WHERE user_id IS NULL AND is_legacy = 0")
                 )
                 conn.commit()
 
-            # Ensure index on favorites(user_id) exists
+            # Ensure indexes on favorites(user_id), favorites(folder_id), and favorite_folders(user_id) exist
             conn.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_favorites_user_id ON favorites (user_id)")
+            )
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_favorites_folder_id ON favorites (folder_id)")
+            )
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_favorite_folders_user_id ON favorite_folders (user_id)")
+            )
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_favorite_folders_name ON favorite_folders (name)")
             )
             conn.commit()
 
             logger.info("Database schema migration completed successfully.")
         except Exception as e:
             logger.error(f"Error during schema migration: {e}", exc_info=True)
+

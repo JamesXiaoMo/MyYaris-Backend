@@ -325,23 +325,36 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 
 ---
 
-## 九、 收藏夹管理模块 (WGS84-Only)
+## 九、 收藏夹与单层分类文件夹管理模块 (WGS84-Only)
 
-专为 iOS 第二页「行驶」打造的常用地点管理模块。
+专为 iOS 第二页「行驶」底部抽屉打造的常用地点与单层分类文件夹管理模块。
 
 ### 9.1 核心约束
-1. **WGS84 原生坐标约束**：首版**严格仅接受 `"wgs84"`**，传入 `gcj02` 或 `bd09` 直接返回 **422 Unprocessable Entity**（杜绝无转换算法导致 NAVITIME 偏移）。
-2. **账号边界说明**：属于单车车主自用/家庭共享收藏夹池（基于 `PHONE_TOKEN` 鉴权），`created_by` 记录调用者角色，不属于多租户独立隔离体系。
-3. **安全非目标**：不自动逆地理编码、不自动生成车机导航任务、删除前必须由客户端完成二次确认。
+1. **WGS84 原生坐标约束**：严格仅接受 `"wgs84"`，传入 `gcj02` 或 `bd09` 直接返回 **422 Unprocessable Entity**（杜绝无转换算法导致 NAVITIME 偏移）。
+2. **严格单账号隔离（含管理员）**：登录账号（`user_id` 非空）仅访问自己的文件夹与收藏地址；过渡期 Legacy 静态 Token 仅访问 Legacy 池（`user_id IS NULL`）。严禁任何跨账号文件夹/地址引用（包括管理员跨用户归类）。
+3. **非空文件夹安全删除语义**：删除文件夹时，在同一数据库事务中将其下所有地址的 `folder_id` 置为 `NULL`（回到未分类），**严禁级联删除用户已存地址**。
+4. **安全非目标**：仅支持单层文件夹；不提供后端 POI 搜索接口；不自动逆地理编码；不自动生成车机导航任务。
 
-### 9.2 接口列表
-- **列表查询**：`GET /api/v1/favorites?limit=50&offset=0&sort_by=created_at&order=desc&search=...`
+### 9.2 单层文件夹接口 (`/api/v1/favorite-folders`，兼容 `/api/v1/favorites/folders`)
+- **文件夹列表**：`GET /api/v1/favorite-folders?limit=50&offset=0&sort_by=created_at&order=asc&search=...`（返回 `items` 含 `favorite_count`、`total`、`has_more`、`uncategorized_count`）
+- **新建文件夹**：`POST /api/v1/favorite-folders`
+  - Body：`{"name": "日常通勤"}`（去空白后 1~64 字符，同账号重名返回 `409 Conflict`）
+- **文件夹详情**：`GET /api/v1/favorite-folders/{folder_id}`
+- **重命名文件夹**：`PATCH /api/v1/favorite-folders/{folder_id}`（同时支持 `PUT`）
+- **删除文件夹**：`DELETE /api/v1/favorite-folders/{folder_id}`（同事务将旗下地址 `folder_id` 置为 `NULL`，返回 `moved_to_uncategorized_count`）
+
+### 9.3 收藏地址接口 (`/api/v1/favorites`)
+- **列表与分类筛选**：`GET /api/v1/favorites?limit=50&offset=0&sort_by=created_at&order=desc&search=...&folder_id=...&uncategorized=...`
+  - 不传 `folder_id` / `uncategorized`：返回当前账号全部收藏；
+  - `folder_id=fld_xxx`：仅返回指定文件夹下的收藏；
+  - `uncategorized=true` 或 `folder_id=uncategorized`：仅返回未分类（`folder_id IS NULL`）收藏；
 - **新建收藏**：`POST /api/v1/favorites`
-  - Body：`{"name": "公司", "address": "详细地址", "latitude": 39.9567, "longitude": 116.3212, "coord_system": "wgs84"}`
+  - Body：`{"name": "公司", "address": "详细地址", "latitude": 39.9567, "longitude": 116.3212, "coord_system": "wgs84", "folder_id": "fld_xxx"}`（`folder_id` 可选）
   - 返回：`201 Created`
 - **详情查询**：`GET /api/v1/favorites/{favorite_id}`
-- **修改编辑**：`PATCH /api/v1/favorites/{favorite_id}`（同时支持 `PUT`）
+- **修改编辑与移动归类**：`PATCH /api/v1/favorites/{favorite_id}`（同时支持 `PUT`；不传 `folder_id` 保持原归属，传 `"fld_xxx"` 移动至目标文件夹，传 `null` 或 `""` 移回未分类）
 - **删除项**：`DELETE /api/v1/favorites/{favorite_id}`
+
 
 ---
 

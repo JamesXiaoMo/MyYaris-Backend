@@ -158,12 +158,25 @@ class MusicCommand(Base):
     error_detail = Column(Text, nullable=True)
 
 
+class FavoriteFolder(Base):
+    __tablename__ = "favorite_folders"
+
+    id = Column(String(64), primary_key=True, index=True)
+    user_id = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    is_legacy = Column(Boolean, default=False, nullable=False)
+    name = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class Favorite(Base):
     __tablename__ = "favorites"
 
     id = Column(String(64), primary_key=True, index=True)
     user_id = Column(String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     is_legacy = Column(Boolean, default=False, nullable=False)
+    folder_id = Column(String(64), ForeignKey("favorite_folders.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String(128), nullable=True, index=True)
     address = Column(String(512), nullable=False)
     latitude = Column(Float, nullable=False)
@@ -172,6 +185,9 @@ class Favorite(Base):
     created_by = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+    folder = relationship("FavoriteFolder", foreign_keys=[folder_id])
+
 
 
 class User(Base):

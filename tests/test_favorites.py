@@ -1,18 +1,23 @@
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.repositories.models import Favorite
+from app.repositories.migrations import run_db_migrations
+from app.repositories.models import Favorite, FavoriteFolder, User, UserSession
 
 
 @pytest.fixture(autouse=True)
 def clean_favorites(db_session: Session):
     db_session.query(Favorite).delete()
+    db_session.query(FavoriteFolder).delete()
     db_session.commit()
     yield
     db_session.query(Favorite).delete()
+    db_session.query(FavoriteFolder).delete()
     db_session.commit()
+
 
 
 def test_create_favorite_success(client: TestClient, phone_headers: dict):
@@ -255,3 +260,304 @@ def test_restart_persistence_sqlite(client: TestClient, phone_headers: dict, db_
         assert row.address == "苏州市工业园区金鸡湖大道99号"
         assert abs(row.latitude - 31.312) < 1e-4
         assert abs(row.longitude - 120.678) < 1e-4
+
+
+def test_folder_crud_and_validation(client: TestClient, phone_headers: dict):
+    # 1. Create folder with leading/trailing spaces -> trimmed
+    r1 = client.post("/api/v1/favorite-folders", json={"name": "  日常通勤  "}, headers=phone_headers)
+    assert r1.status_code == 201
+    f1 = r1.json()
+    assert f1["id"].startswith("fld_")
+    assert f1["name"] == "日常通勤"
+    assert f1["favorite_count"] == 0
+
+    # 2. Duplicate folder name in same scope -> 409 Conflict (case-insensitive & trimmed)
+    r_dup = client.post("/api/v1/favorite-folders", json={"name": "日常通勤"}, headers=phone_headers)
+    assert r_dup.status_code == 409
+
+    r_dup_case = client.post("/api/v1/favorite-folders", json={"name": "  Work Places "}, headers=phone_headers)
+    assert r_dup_case.status_code == 201
+    r_dup_case2 = client.post("/api/v1/favorite-folders", json={"name": "work places"}, headers=phone_headers)
+    assert r_dup_case2.status_code == 409
+
+    # 3. Empty / whitespace-only / too long (>64 chars) -> 422
+    assert client.post("/api/v1/favorite-folders", json={"name": ""}, headers=phone_headers).status_code == 422
+    assert client.post("/api/v1/favorite-folders", json={"name": "   \t\n "}, headers=phone_headers).status_code == 422
+    assert client.post("/api/v1/favorite-folders", json={"name": "a" * 65}, headers=phone_headers).status_code == 422
+
+    # 4. List folders (both /api/v1/favorite-folders and /api/v1/favorites/folders alias)
+    list_resp = client.get("/api/v1/favorite-folders?limit=1&offset=0", headers=phone_headers)
+    assert list_resp.status_code == 200
+    list_data = list_resp.json()
+    assert list_data["total"] == 2
+    assert len(list_data["items"]) == 1
+    assert list_data["has_more"] is True
+
+    alias_resp = client.get("/api/v1/favorites/folders", headers=phone_headers)
+    assert alias_resp.status_code == 200
+    assert alias_resp.json()["total"] == 2
+
+    # 5. Rename folder (PATCH & PUT) + duplicate check on rename
+    r_rename_conflict = client.patch(
+        f"/api/v1/favorite-folders/{f1['id']}",
+        json={"name": "Work Places"},
+        headers=phone_headers,
+    )
+    assert r_rename_conflict.status_code == 409
+
+    r_rename_ok = client.patch(
+        f"/api/v1/favorite-folders/{f1['id']}",
+        json={"name": "  周末出游  "},
+        headers=phone_headers,
+    )
+    assert r_rename_ok.status_code == 200
+    assert r_rename_ok.json()["name"] == "周末出游"
+
+
+def test_favorite_categorization_move_and_non_empty_folder_delete(client: TestClient, phone_headers: dict):
+    # Create two folders
+    f_commute = client.post("/api/v1/favorite-folders", json={"name": "通勤"}, headers=phone_headers).json()
+    f_travel = client.post("/api/v1/favorite-folders", json={"name": "旅行"}, headers=phone_headers).json()
+
+    # Create 2 favorites in f_commute and 1 uncategorized favorite
+    fav1 = client.post(
+        "/api/v1/favorites",
+        json={"name": "公司", "address": "千代田区丸之内", "latitude": 35.6812, "longitude": 139.7671, "folder_id": f_commute["id"]},
+        headers=phone_headers,
+    ).json()
+    assert fav1["folder_id"] == f_commute["id"]
+    assert fav1["folder_name"] == "通勤"
+
+    fav2 = client.post(
+        "/api/v1/favorites",
+        json={"name": "分部", "address": "港区六本木", "latitude": 35.6628, "longitude": 139.7314, "folder_id": f_commute["id"]},
+        headers=phone_headers,
+    ).json()
+
+    fav_uncat = client.post(
+        "/api/v1/favorites",
+        json={"name": "超市", "address": "新宿区歌舞伎町", "latitude": 35.6938, "longitude": 139.7034},
+        headers=phone_headers,
+    ).json()
+    assert fav_uncat["folder_id"] is None
+    assert fav_uncat["folder_name"] is None
+
+    # Check folder list counts and uncategorized_count
+    folders_data = client.get("/api/v1/favorite-folders", headers=phone_headers).json()
+    assert folders_data["uncategorized_count"] == 1
+    counts = {item["id"]: item["favorite_count"] for item in folders_data["items"]}
+    assert counts[f_commute["id"]] == 2
+    assert counts[f_travel["id"]] == 0
+
+    # Filter favorites: all vs specific folder vs uncategorized
+    all_favs = client.get("/api/v1/favorites", headers=phone_headers).json()
+    assert all_favs["total"] == 3
+    assert all_favs["has_more"] is False
+
+    commute_favs = client.get(f"/api/v1/favorites?folder_id={f_commute['id']}", headers=phone_headers).json()
+    assert commute_favs["total"] == 2
+    assert {i["id"] for i in commute_favs["items"]} == {fav1["id"], fav2["id"]}
+
+    uncat_favs = client.get("/api/v1/favorites?uncategorized=true", headers=phone_headers).json()
+    assert uncat_favs["total"] == 1
+    assert uncat_favs["items"][0]["id"] == fav_uncat["id"]
+
+    uncat_sentinel = client.get("/api/v1/favorites?folder_id=uncategorized", headers=phone_headers).json()
+    assert uncat_sentinel["total"] == 1
+    assert uncat_sentinel["items"][0]["id"] == fav_uncat["id"]
+
+    # PATCH fav1 without folder_id in body -> keeps existing folder_id
+    patch_keep = client.patch(
+        f"/api/v1/favorites/{fav1['id']}",
+        json={"name": "总部大楼"},
+        headers=phone_headers,
+    ).json()
+    assert patch_keep["name"] == "总部大楼"
+    assert patch_keep["folder_id"] == f_commute["id"]
+
+    # PATCH fav1 to move to f_travel
+    patch_move = client.patch(
+        f"/api/v1/favorites/{fav1['id']}",
+        json={"folder_id": f_travel["id"]},
+        headers=phone_headers,
+    ).json()
+    assert patch_move["folder_id"] == f_travel["id"]
+    assert patch_move["folder_name"] == "旅行"
+
+    # PATCH fav1 with folder_id: null -> moves back to uncategorized
+    patch_clear = client.patch(
+        f"/api/v1/favorites/{fav1['id']}",
+        json={"folder_id": None},
+        headers=phone_headers,
+    ).json()
+    assert patch_clear["folder_id"] is None
+    assert patch_clear["folder_name"] is None
+
+    # Move fav1 back into f_commute so f_commute has 2 items again, then delete non-empty f_commute
+    client.patch(f"/api/v1/favorites/{fav1['id']}", json={"folder_id": f_commute["id"]}, headers=phone_headers)
+
+    del_folder_resp = client.delete(f"/api/v1/favorite-folders/{f_commute['id']}", headers=phone_headers)
+    assert del_folder_resp.status_code == 200
+    del_data = del_folder_resp.json()
+    assert del_data["status"] == "ok"
+    assert del_data["deleted_id"] == f_commute["id"]
+    assert del_data["moved_to_uncategorized_count"] == 2
+
+    # Verify all 3 favorites STILL exist and fav1, fav2 are now uncategorized (folder_id is None)
+    all_after_del = client.get("/api/v1/favorites", headers=phone_headers).json()
+    assert all_after_del["total"] == 3
+    for item in all_after_del["items"]:
+        assert item["folder_id"] is None
+        assert item["folder_name"] is None
+
+    uncat_after_del = client.get("/api/v1/favorites?uncategorized=true", headers=phone_headers).json()
+    assert uncat_after_del["total"] == 3
+
+
+def test_cross_account_and_admin_folder_isolation(client: TestClient, db_session: Session, phone_headers: dict):
+    # Clean users first to register fresh users
+    db_session.query(UserSession).delete()
+    db_session.query(User).delete()
+    db_session.commit()
+
+    # Register & login User A, User B, and an Admin User
+    client.post("/api/v1/auth/register", json={"username": "folder_user_a", "password": "PasswordA123!"})
+    s_a = client.post("/api/v1/auth/login", json={"username": "folder_user_a", "password": "PasswordA123!"}).json()["session_id"]
+    h_a = {"Authorization": f"Bearer {s_a}"}
+
+    client.post("/api/v1/auth/register", json={"username": "folder_user_b", "password": "PasswordB123!"})
+    s_b = client.post("/api/v1/auth/login", json={"username": "folder_user_b", "password": "PasswordB123!"}).json()["session_id"]
+    h_b = {"Authorization": f"Bearer {s_b}"}
+
+    client.post("/api/v1/auth/register", json={"username": "folder_admin", "password": "PasswordAdmin123!"})
+    admin_user = db_session.query(User).filter(User.username == "folder_admin").first()
+    admin_user.role = "admin"
+    db_session.commit()
+    s_adm = client.post("/api/v1/auth/login", json={"username": "folder_admin", "password": "PasswordAdmin123!"}).json()["session_id"]
+    h_adm = {"Authorization": f"Bearer {s_adm}"}
+
+    # Both User A and User B can create a folder with the same name "常用地点"
+    fld_a = client.post("/api/v1/favorite-folders", json={"name": "常用地点"}, headers=h_a).json()
+    fld_b = client.post("/api/v1/favorite-folders", json={"name": "常用地点"}, headers=h_b).json()
+    fld_adm = client.post("/api/v1/favorite-folders", json={"name": "管理员文件夹"}, headers=h_adm).json()
+    fld_legacy = client.post("/api/v1/favorite-folders", json={"name": "常用地点"}, headers=phone_headers).json()
+
+    fav_a = client.post(
+        "/api/v1/favorites",
+        json={"name": "A的家", "address": "东京站", "latitude": 35.6812, "longitude": 139.7671, "folder_id": fld_a["id"]},
+        headers=h_a,
+    ).json()
+
+    # 1. User B cannot view, rename, delete, or filter by User A's folder
+    assert client.get(f"/api/v1/favorite-folders/{fld_a['id']}", headers=h_b).status_code == 404
+    assert client.patch(f"/api/v1/favorite-folders/{fld_a['id']}", json={"name": "篡改"}, headers=h_b).status_code == 404
+    assert client.delete(f"/api/v1/favorite-folders/{fld_a['id']}", headers=h_b).status_code == 404
+    assert client.get(f"/api/v1/favorites?folder_id={fld_a['id']}", headers=h_b).status_code == 404
+
+    # 2. User B cannot create a favorite in User A's folder or move B's favorite into A's folder
+    r_cross_create = client.post(
+        "/api/v1/favorites",
+        json={"name": "越权", "address": "涩谷", "latitude": 35.6580, "longitude": 139.7016, "folder_id": fld_a["id"]},
+        headers=h_b,
+    )
+    assert r_cross_create.status_code == 404
+
+    fav_b = client.post(
+        "/api/v1/favorites",
+        json={"name": "B的家", "address": "品川", "latitude": 35.6284, "longitude": 139.7387},
+        headers=h_b,
+    ).json()
+    r_cross_move = client.patch(
+        f"/api/v1/favorites/{fav_b['id']}",
+        json={"folder_id": fld_a["id"]},
+        headers=h_b,
+    )
+    assert r_cross_move.status_code == 404
+
+    # 3. Admin account cannot cross-assign User A's favorite or folder across accounts
+    assert client.post(
+        "/api/v1/favorites",
+        json={"name": "Admin放入A文件夹", "address": "秋叶原", "latitude": 35.6983, "longitude": 139.7730, "folder_id": fld_a["id"]},
+        headers=h_adm,
+    ).status_code == 404
+    assert client.patch(
+        f"/api/v1/favorites/{fav_a['id']}",
+        json={"folder_id": fld_adm["id"]},
+        headers=h_adm,
+    ).status_code == 404
+    assert client.patch(
+        f"/api/v1/favorites/{fav_a['id']}",
+        json={"folder_id": fld_b["id"]},
+        headers=h_adm,
+    ).status_code == 404
+
+    # 4. Legacy token caller and logged-in user are mutually isolated on folders
+    assert client.post(
+        "/api/v1/favorites",
+        json={"name": "Legacy越权", "address": "银座", "latitude": 35.6719, "longitude": 139.7640, "folder_id": fld_a["id"]},
+        headers=phone_headers,
+    ).status_code == 404
+    assert client.post(
+        "/api/v1/favorites",
+        json={"name": "User越权Legacy", "address": "银座", "latitude": 35.6719, "longitude": 139.7640, "folder_id": fld_legacy["id"]},
+        headers=h_a,
+    ).status_code == 404
+
+
+def test_migrations_idempotent_on_legacy_sqlite_schema(tmp_path):
+    db_path = tmp_path / "legacy_migration_test.db"
+    eng = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+
+    # Simulate an older favorites table before folder_id existed
+    with eng.connect() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE favorites (
+                    id VARCHAR(64) PRIMARY KEY,
+                    name VARCHAR(128),
+                    address VARCHAR(512) NOT NULL,
+                    latitude FLOAT NOT NULL,
+                    longitude FLOAT NOT NULL,
+                    coord_system VARCHAR(32) NOT NULL DEFAULT 'wgs84',
+                    created_by VARCHAR(64),
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO favorites (id, name, address, latitude, longitude, coord_system, created_at, updated_at)
+                VALUES ('fav_old_1', '老家', '旧地址1号', 35.0, 139.0, 'wgs84', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                """
+            )
+        )
+        conn.commit()
+
+    # Run migration twice to verify idempotency
+    run_db_migrations(eng)
+    run_db_migrations(eng)
+
+    with eng.connect() as conn:
+        cols = [r[1] for r in conn.execute(text("PRAGMA table_info(favorites)")).fetchall()]
+        assert "user_id" in cols
+        assert "is_legacy" in cols
+        assert "folder_id" in cols
+
+        folder_table = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='favorite_folders'")
+        ).fetchone()
+        assert folder_table is not None
+
+        row = conn.execute(
+            text("SELECT id, name, is_legacy, folder_id FROM favorites WHERE id='fav_old_1'")
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "fav_old_1"
+        assert row[1] == "老家"
+        assert row[2] == 1
+        assert row[3] is None
+
