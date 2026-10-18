@@ -70,7 +70,7 @@ class Settings(BaseSettings):
 
     # Nominatim (OpenStreetMap) Provider Settings
     NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org/search"
-    NOMINATIM_USER_AGENT: str = "MyYaris/1.0 (https://github.com/myyaris/myyaris; contact: contact@myyaris.local)"
+    NOMINATIM_USER_AGENT: str = "MyYaris/1.0 (https://github.com/JamesXiaoMo/MyYaris)"
     NOMINATIM_COUNTRY_CODES: str = "jp"
     NOMINATIM_RATE_LIMIT_SECONDS: float = 1.05
     NOMINATIM_CACHE_TTL_SECONDS: float = 86400.0
