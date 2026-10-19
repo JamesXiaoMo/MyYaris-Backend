@@ -15,7 +15,7 @@
 
 ---
 
-运行于 Linux 边缘宿主机的 FastAPI 服务，使用 SQLite 持久化用户、地址收藏、导航任务和音乐控制指令。通过 Tailscale Serve 提供 Tailnet 内的 HTTPS 入口。
+可自行部署的 FastAPI 服务，使用 SQLite 持久化用户、地址收藏、导航任务和音乐控制指令。不依赖特定服务器型号；可通过 Tailscale Serve 提供 Tailnet 内的 HTTPS 入口。
 
 ## 核心模块
 
@@ -69,7 +69,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ## 运行边界
 
-- Tailscale Serve 的当前方案只在 Tailnet 内可达，客户端保留 HTTPS 证书验证。
+- 使用 Tailscale Serve 部署时，服务只在对应 Tailnet 内可达，客户端保留 HTTPS 证书验证。
 - 手机使用账户会话；车机设备凭据独立管理，旧 Token 仅按迁移配置兼容。
 - 地图分享链接不一定包含精确坐标；不明确的候选需要确认。
 - `launch_requested` 表示请求打开导航；指令回执不单独证明导航开始或音乐实际出声。

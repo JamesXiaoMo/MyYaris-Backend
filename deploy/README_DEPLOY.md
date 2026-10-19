@@ -2,7 +2,7 @@
 
 ## 1. 运行环境与架构
 
-- **主机**: Linux Edge Server (Ubuntu 24.04 LTS)
+- **主机**: 支持 Python 的 Linux 主机（以下以 systemd 环境为例，不限定硬件型号）
 - **部署路径**: `/home/<USER>/myyaris/backend`
 - **数据与数据库目录**: `~/.local/share/myyaris/`（包含 `myyaris.db` 与 `audio_temp/`）
 - **网络接入**: Tailscale 私有网段 + Tailscale HTTPS 证书代理
@@ -23,7 +23,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 ## 3. Tailscale HTTPS 暴露与证书管理
 
-Tailscale 在本机已启用 MagicDNS 及 TLS 域名：
+使用前，在自己的 Tailnet 中启用 MagicDNS 和 HTTPS，并将下方示例替换为自己的服务域名：
 `<YOUR_SERVER>.your-tailnet.ts.net`
 
 通过 Tailscale Serve 可以原生提供受信任的 HTTPS 终止并将流量反向代理到本地 8000 端口：
@@ -44,7 +44,7 @@ tailscale serve status
 
 ### 客户端访问地址:
 - **健康检查**: `https://<YOUR_SERVER>.your-tailnet.ts.net/health`
-- **长轮询接口**: `https://<YOUR_SERVER>.your-tailnet.ts.net/devices/car_p3pro/tasks/next?timeout=20`
+- **长轮询接口**: `https://<YOUR_SERVER>.your-tailnet.ts.net/devices/<DEVICE_ID>/tasks/next?timeout=20`
 
 ---
 
