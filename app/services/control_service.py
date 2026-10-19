@@ -427,19 +427,18 @@ class QueueSnapshot:
         self.updated_at = utc_now()
 
 
-_GLOBAL_VERSION_WATERMARK = 0
-
-
 class MusicQueueSnapshotManager:
     """
-    Manages in-memory versioned immutable queue snapshots per vehicle device.
+    Manages versioned immutable queue snapshots per vehicle device.
     Supports pure read-only pagination, version conflict detection (409),
-    authentic intelligence queue generation and appending, and cache invalidation on logout.
+    authentic intelligence queue generation and appending, SQLite persistent monotonic versioning,
+    and two-phase pending vs applied queue state promotion upon vehicle ACK.
     """
 
     def __init__(self):
         self._active_queues: Dict[str, QueueSnapshot] = {}
-        self._snapshots: Dict[Tuple[str, str, int], QueueSnapshot] = {}
+        self._pending_queues: Dict[Tuple[str, str], QueueSnapshot] = {}  # (norm_dev, command_id) -> snapshot
+        self._snapshots: Dict[Tuple[str, str, int], QueueSnapshot] = {}  # (norm_dev, queue_id, version) -> snapshot
         self._replenish_cache: Dict[Tuple[str, str], QueueSnapshot] = {}
         self._last_version: Dict[str, int] = {}
         self._lock = asyncio.Lock()
@@ -447,39 +446,122 @@ class MusicQueueSnapshotManager:
     def clear_all(self):
         """Clears all in-memory queue snapshots and replenishment caches."""
         self._active_queues.clear()
+        self._pending_queues.clear()
         self._snapshots.clear()
         self._replenish_cache.clear()
         self._last_version.clear()
         logger.info("Cleared all music queue snapshots and caches.")
 
-    def get_next_queue_version(self, device_id: str) -> int:
-        global _GLOBAL_VERSION_WATERMARK
+    def get_next_queue_version(self, device_id: str, db: Optional[Session] = None) -> int:
+        """
+        Generates the next monotonically increasing queue version for device_id.
+        Persists to SQLite CarDeviceStatus table to guarantee strictly monotonic non-colliding
+        versions across process restarts, memory clears, and system clock rollbacks.
+        """
         norm_dev = resolve_car_device_id(device_id)
-        current = max(self._last_version.get(norm_dev, 0), _GLOBAL_VERSION_WATERMARK)
-        base_time = int(time.time() * 1000)
-        nxt = max(current + 1, base_time)
-        self._last_version[norm_dev] = nxt
-        _GLOBAL_VERSION_WATERMARK = nxt
-        return nxt
+        close_db = False
+        if db is None:
+            from app.repositories.database import SessionLocal
+            db = SessionLocal()
+            close_db = True
+        try:
+            status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == norm_dev).first()
+            if not status_row:
+                status_row = CarDeviceStatus(
+                    device_id=norm_dev,
+                    queue_version=0,
+                    playback_state="stopped",
+                )
+                db.add(status_row)
+            current_db = status_row.queue_version or 0
+            in_mem_last = self._last_version.get(norm_dev, 0)
+            baseline = max(current_db, in_mem_last)
+            epoch_ms = int(time.time() * 1000)
+            # Clock rollback protection: if epoch_ms <= baseline, guarantee baseline + 1
+            nxt = max(baseline + 1, epoch_ms)
+            status_row.queue_version = nxt
+            db.commit()
+            self._last_version[norm_dev] = nxt
+            return nxt
+        finally:
+            if close_db:
+                db.close()
 
-    def sync_device_queue_version(self, device_id: str, version: int):
-        global _GLOBAL_VERSION_WATERMARK
+    def sync_device_queue_version(self, device_id: str, version: int, db: Optional[Session] = None):
         if version and version > 0:
             norm_dev = resolve_car_device_id(device_id)
             self._last_version[norm_dev] = max(self._last_version.get(norm_dev, 0), version)
-            _GLOBAL_VERSION_WATERMARK = max(_GLOBAL_VERSION_WATERMARK, version)
+            close_db = False
+            if db is None:
+                from app.repositories.database import SessionLocal
+                db = SessionLocal()
+                close_db = True
+            try:
+                status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == norm_dev).first()
+                if status_row and (status_row.queue_version or 0) < version:
+                    status_row.queue_version = version
+                    db.commit()
+            finally:
+                if close_db:
+                    db.close()
 
     def get_active_queue(self, device_id: str) -> Optional[QueueSnapshot]:
         norm_dev = resolve_car_device_id(device_id)
         return self._active_queues.get(norm_dev)
 
-    def set_active_queue(self, device_id: str, snapshot: QueueSnapshot):
+    def set_active_queue(self, device_id: str, snapshot: QueueSnapshot, db: Optional[Session] = None):
         norm_dev = resolve_car_device_id(device_id)
         self._active_queues[norm_dev] = snapshot
         self._snapshots[(norm_dev, snapshot.queue_id, snapshot.queue_version)] = snapshot
-        self.sync_device_queue_version(norm_dev, snapshot.queue_version)
+        self.sync_device_queue_version(norm_dev, snapshot.queue_version, db=db)
 
-    async def init_favorite_queue(self, device_id: str, force_refresh: bool = False) -> QueueSnapshot:
+    def apply_command_queue(
+        self,
+        device_id: str,
+        command_id: Optional[str] = None,
+        queue_id: Optional[str] = None,
+        queue_version: Optional[int] = None,
+        db: Optional[Session] = None,
+    ) -> Optional[QueueSnapshot]:
+        """
+        Promotes a pending queue snapshot to active queue upon car ACK ('applied').
+        Leaves existing active queue intact if command failed or pending queue not found.
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        snapshot = None
+        if command_id:
+            snapshot = self._pending_queues.pop((norm_dev, command_id), None)
+        if not snapshot and queue_id and queue_version is not None:
+            snapshot = self._snapshots.get((norm_dev, queue_id, queue_version))
+        if snapshot:
+            curr_active = self._active_queues.get(norm_dev)
+            if curr_active and curr_active.queue_version > snapshot.queue_version:
+                logger.warning(
+                    f"Ignored late ACK promotion for queue '{snapshot.queue_id}' (v{snapshot.queue_version}): "
+                    f"current active queue is newer (v{curr_active.queue_version})"
+                )
+                return None
+            self._active_queues[norm_dev] = snapshot
+            self.sync_device_queue_version(norm_dev, snapshot.queue_version, db=db)
+            logger.info(
+                f"Promoted pending queue '{snapshot.queue_id}' (v{snapshot.queue_version}) to active queue for device '{norm_dev}'"
+            )
+            return snapshot
+        return None
+
+    def discard_pending_queue(self, device_id: str, command_id: str):
+        """Discards a pending queue snapshot on command failure or timeout without touching active queue."""
+        norm_dev = resolve_car_device_id(device_id)
+        self._pending_queues.pop((norm_dev, command_id), None)
+
+    async def init_favorite_queue(
+        self,
+        device_id: str,
+        force_refresh: bool = False,
+        command_id: Optional[str] = None,
+        activate: bool = True,
+        db: Optional[Session] = None,
+    ) -> QueueSnapshot:
         """
         Initializes or refreshes the full favorite playlist queue for device_id.
         Paginates exhaustively until all tracks are loaded, deduplicates, and guards queue readiness.
@@ -541,8 +623,8 @@ class MusicQueueSnapshotManager:
             formatted_tracks.append({
                 "track_id": f"netease_{s_id}",
                 "song_id": s_id,
-                "title": s["title"],
-                "artist": s["artist"],
+                "title": s.get("title") or s.get("name") or f"Track {s_id}",
+                "artist": s.get("artist") or "Unknown Artist",
                 "album": s.get("album"),
                 "duration_ms": s.get("duration_ms", 0),
                 "cover_url": s.get("cover_url"),
@@ -555,7 +637,7 @@ class MusicQueueSnapshotManager:
         owner_uid = fav_info.get("user_id") or "owner"
         opaque_hash = hashlib.sha256(f"{owner_uid}:{pid}".encode("utf-8")).hexdigest()[:12]
         queue_id = f"q_fav_{opaque_hash}"
-        version = self.get_next_queue_version(norm_dev)
+        version = self.get_next_queue_version(norm_dev, db=db)
 
         snapshot = QueueSnapshot(
             queue_id=queue_id,
@@ -570,10 +652,30 @@ class MusicQueueSnapshotManager:
         )
 
         async with self._lock:
-            self._active_queues[norm_dev] = snapshot
             self._snapshots[(norm_dev, queue_id, version)] = snapshot
+            if command_id:
+                self._pending_queues[(norm_dev, command_id)] = snapshot
+            if activate:
+                self._active_queues[norm_dev] = snapshot
+                self.sync_device_queue_version(norm_dev, version, db=db)
 
         return snapshot
+
+    async def prepare_favorite_queue(
+        self,
+        device_id: str,
+        command_id: Optional[str] = None,
+        force_refresh: bool = False,
+        db: Optional[Session] = None,
+    ) -> QueueSnapshot:
+        """Prepares favorite queue snapshot without promoting to active queue until car ACK."""
+        return await self.init_favorite_queue(
+            device_id=device_id,
+            force_refresh=force_refresh,
+            command_id=command_id,
+            activate=False,
+            db=db,
+        )
 
     async def create_intelligence_queue(
         self,
@@ -581,6 +683,9 @@ class MusicQueueSnapshotManager:
         seed_song_id: int,
         songs: List[Dict[str, Any]],
         request_id: Optional[str] = None,
+        command_id: Optional[str] = None,
+        activate: bool = True,
+        db: Optional[Session] = None,
     ) -> QueueSnapshot:
         """
         Creates a new intelligence queue for device_id from initial seed.
@@ -593,7 +698,7 @@ class MusicQueueSnapshotManager:
         now_ts = int(time.time() * 1000)
         opaque_hash = hashlib.sha256(f"{seed_song_id}:{now_ts}".encode("utf-8")).hexdigest()[:12]
         queue_id = f"q_intel_{opaque_hash}"
-        version = self.get_next_queue_version(norm_dev)
+        version = self.get_next_queue_version(norm_dev, db=db)
 
         seen_ids = set()
         formatted_tracks = []
@@ -605,8 +710,8 @@ class MusicQueueSnapshotManager:
             formatted_tracks.append({
                 "track_id": f"netease_{s_id}",
                 "song_id": s_id,
-                "title": s["title"],
-                "artist": s["artist"],
+                "title": s.get("title") or s.get("name") or f"Track {s_id}",
+                "artist": s.get("artist") or "Unknown Artist",
                 "album": s.get("album"),
                 "duration_ms": s.get("duration_ms", 0),
                 "cover_url": s.get("cover_url"),
@@ -631,18 +736,43 @@ class MusicQueueSnapshotManager:
         )
 
         async with self._lock:
-            self._active_queues[norm_dev] = snapshot
             self._snapshots[(norm_dev, queue_id, version)] = snapshot
+            if command_id:
+                self._pending_queues[(norm_dev, command_id)] = snapshot
+            if activate:
+                self._active_queues[norm_dev] = snapshot
+                self.sync_device_queue_version(norm_dev, version, db=db)
             if cache_key:
                 self._replenish_cache[cache_key] = snapshot
 
         return snapshot
+
+    async def prepare_intelligence_queue(
+        self,
+        device_id: str,
+        seed_song_id: int,
+        songs: List[Dict[str, Any]],
+        command_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        db: Optional[Session] = None,
+    ) -> QueueSnapshot:
+        """Prepares intelligence queue snapshot without promoting to active queue until car ACK."""
+        return await self.create_intelligence_queue(
+            device_id=device_id,
+            seed_song_id=seed_song_id,
+            songs=songs,
+            request_id=request_id,
+            command_id=command_id,
+            activate=False,
+            db=db,
+        )
 
     async def append_intelligence_tracks(
         self,
         device_id: str,
         songs: List[Dict[str, Any]],
         request_id: Optional[str] = None,
+        db: Optional[Session] = None,
     ) -> QueueSnapshot:
         """
         Appends a replenishment batch of intelligence tracks to active queue.
@@ -706,7 +836,7 @@ class MusicQueueSnapshotManager:
                 })
                 added_count += 1
 
-            new_version = self.get_next_queue_version(norm_dev)
+            new_version = self.get_next_queue_version(norm_dev, db=db)
             new_snapshot = QueueSnapshot(
                 queue_id=active.queue_id,
                 queue_version=new_version,
@@ -737,6 +867,9 @@ class MusicQueueSnapshotManager:
         album: Optional[str] = None,
         duration_ms: int = 0,
         cover_url: Optional[str] = None,
+        command_id: Optional[str] = None,
+        activate: bool = True,
+        db: Optional[Session] = None,
     ) -> QueueSnapshot:
         """
         Creates an explicit temporary single-track queue (source="single_track").
@@ -745,7 +878,7 @@ class MusicQueueSnapshotManager:
         now_ts = int(time.time() * 1000)
         opaque_hash = hashlib.sha256(f"{song_id}:{now_ts}".encode("utf-8")).hexdigest()[:12]
         queue_id = f"q_single_{opaque_hash}"
-        version = self.get_next_queue_version(norm_dev)
+        version = self.get_next_queue_version(norm_dev, db=db)
 
         tracks = [{
             "track_id": f"netease_{song_id}",
@@ -774,10 +907,40 @@ class MusicQueueSnapshotManager:
         )
 
         async with self._lock:
-            self._active_queues[norm_dev] = snapshot
             self._snapshots[(norm_dev, queue_id, version)] = snapshot
+            if command_id:
+                self._pending_queues[(norm_dev, command_id)] = snapshot
+            if activate:
+                self._active_queues[norm_dev] = snapshot
+                self.sync_device_queue_version(norm_dev, version, db=db)
 
         return snapshot
+
+    async def prepare_single_track_queue(
+        self,
+        device_id: str,
+        song_id: int,
+        title: str,
+        artist: str,
+        album: Optional[str] = None,
+        duration_ms: int = 0,
+        cover_url: Optional[str] = None,
+        command_id: Optional[str] = None,
+        db: Optional[Session] = None,
+    ) -> QueueSnapshot:
+        """Prepares single track queue snapshot without promoting to active queue until car ACK."""
+        return await self.create_single_track_queue(
+            device_id=device_id,
+            song_id=song_id,
+            title=title,
+            artist=artist,
+            album=album,
+            duration_ms=duration_ms,
+            cover_url=cover_url,
+            command_id=command_id,
+            activate=False,
+            db=db,
+        )
 
     async def get_queue_page(
         self,
@@ -1049,8 +1212,11 @@ def record_command_ack(
                 status_row.queue_source = "netease_intelligence"
             elif cmd.action == "set_playback_mode" and cmd_params.get("mode") in ("list_loop", "shuffle"):
                 status_row.queue_source = "netease_favorite"
-            elif cmd.action == "play_track" and cmd_params.get("song_id"):
-                status_row.queue_source = "single_track"
+            elif cmd.action == "play_track":
+                if cmd_params.get("source"):
+                    status_row.queue_source = cmd_params["source"]
+                elif cmd_params.get("song_id"):
+                    status_row.queue_source = "single_track"
 
             if cmd_params.get("queue_id"):
                 status_row.queue_id = cmd_params["queue_id"]
@@ -1061,11 +1227,21 @@ def record_command_ack(
             if current_index is not None:
                 status_row.current_index = current_index
             status_row.updated_at = utc_now()
+
+        # Promote pending queue snapshot to active queue upon car execution ACK
+        music_queue_snapshot_manager.apply_command_queue(
+            device_id=cmd.device_id,
+            command_id=command_id,
+            queue_id=cmd_params.get("queue_id") if status_row else None,
+            queue_version=(queue_version if queue_version is not None else cmd_params.get("queue_version")) if status_row else None,
+            db=db,
+        )
     elif norm_status in ("failed", "error"):
         cmd.status = "failed"
         cmd.error_code = error_code
         cmd.error_detail = error_detail
         command_queue_manager.mark_acknowledged(command_id)
+        music_queue_snapshot_manager.discard_pending_queue(cmd.device_id, command_id)
     elif norm_status == "received":
         cmd.status = "received"
         # DO NOT call mark_acknowledged: received is not execution completion
@@ -1209,6 +1385,15 @@ def save_or_update_car_status(
 
         status_row.last_heartbeat_at = now
         status_row.updated_at = now
+
+    if report.last_applied_command_id:
+        music_queue_snapshot_manager.apply_command_queue(
+            device_id=dev_id,
+            command_id=report.last_applied_command_id,
+            queue_id=report.queue_id,
+            queue_version=report.queue_version,
+            db=db,
+        )
 
     db.commit()
     db.refresh(status_row)

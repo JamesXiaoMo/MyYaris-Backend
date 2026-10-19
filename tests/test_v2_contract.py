@@ -491,7 +491,7 @@ def test_command_idempotency_and_collision_conflict(client: TestClient, phone_he
     # 1. First submission
     resp1 = client.post(
         "/api/v1/music/control/command",
-        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "resume"},
+        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "pause"},
         headers=phone_headers,
     )
     assert resp1.status_code == 200
@@ -499,7 +499,7 @@ def test_command_idempotency_and_collision_conflict(client: TestClient, phone_he
     # 2. Idempotent re-submission with identical action and params -> succeeds (200 OK)
     resp2 = client.post(
         "/api/v1/music/control/command",
-        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "resume"},
+        json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "pause"},
         headers=phone_headers,
     )
     assert resp2.status_code == 200
@@ -516,7 +516,7 @@ def test_command_idempotency_and_collision_conflict(client: TestClient, phone_he
     # 4. Conflict: same command_id for DIFFERENT device -> 409 Conflict
     resp4 = client.post(
         "/api/v1/music/control/command",
-        json={"command_id": cmd_id, "device_id": "car_other_device", "action": "resume"},
+        json={"command_id": cmd_id, "device_id": "car_other_device", "action": "pause"},
         headers=phone_headers,
     )
     assert resp4.status_code == 409
@@ -648,7 +648,7 @@ def test_websocket_car_ack_broadcasts_to_phone(client: TestClient, phone_headers
             # Phone sends command via HTTP
             client.post(
                 "/api/v1/music/control/command",
-                json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "resume"},
+                json={"command_id": cmd_id, "device_id": "car_p3pro", "action": "pause"},
                 headers=phone_headers,
             )
             # Car gets command
@@ -741,7 +741,7 @@ def test_ws_and_http_cross_entry_idempotency_and_conflict(client: TestClient, ph
             cmd_http_id = "cmd_cross_proto_idem_02"
             http_new_resp = client.post(
                 "/api/v1/music/control/command",
-                json={"command_id": cmd_http_id, "device_id": "car_p3pro", "action": "resume"},
+                json={"command_id": cmd_http_id, "device_id": "car_p3pro", "action": "pause"},
                 headers=phone_headers,
             )
             assert http_new_resp.status_code == 200
