@@ -26,6 +26,7 @@ class DestinationCreateRequest(BaseModel):
     client_time: Optional[str] = None
     target_device_id: Optional[str] = "car_p3pro"
     auto_create_task: bool = True
+    purpose: Optional[str] = None
 
 
 class CandidateOut(BaseModel):

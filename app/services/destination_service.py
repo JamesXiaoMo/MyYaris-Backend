@@ -141,7 +141,7 @@ async def create_destination_request(
         request_id=request_id,
         idempotency_key=req.idempotency_key,
         caller_id=caller_id,
-        source=req.input_type.value,
+        source=req.purpose if req.purpose else req.input_type.value,
         raw_input=raw_payload_str,
         client_lat=req.client_lat,
         client_lon=req.client_lon,
@@ -226,7 +226,7 @@ async def create_destination_request(
                         candidate_id=str(uuid.uuid4()),
                         request_id=request_id,
                         title=f"Plus Code {item.full_code}",
-                        address=item.address or "Plus Code 编码区域中心（并非原始图钉的无限精度坐标）",
+                        address=item.address or "Plus Code 编码区域中心（几何网格中心，非建筑物入口精确坐标）",
                         latitude=item.latitude,
                         longitude=item.longitude,
                         coord_system="wgs84",
@@ -316,7 +316,7 @@ async def create_destination_request(
                 cand = Candidate(
                     candidate_id=str(uuid.uuid4()), request_id=request_id,
                     title=f"Plus Code {item.full_code}",
-                    address=item.address or "Plus Code 编码区域中心（并非原始图钉的无限精度坐标）",
+                    address=item.address or "Plus Code 编码区域中心（几何网格中心，非建筑物入口精确坐标）",
                     latitude=item.latitude, longitude=item.longitude,
                     coord_system="wgs84", source="plus_code",
                 )

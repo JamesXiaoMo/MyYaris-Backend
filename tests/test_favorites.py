@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.repositories.migrations import run_db_migrations
-from app.repositories.models import Favorite, FavoriteFolder, User, UserSession
+from app.repositories.models import Favorite, FavoriteFolder, User, UserSession, Task
 
 
 @pytest.fixture(autouse=True)
@@ -728,10 +728,18 @@ def test_pagination_tiebreaker_conflicting_filters_and_repeated_delete(
     assert patch_sentinel["folder_id"] is None
 
 
-def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_headers: dict):
-    # 1. Verify initial tasks count
-    tasks_before = client.get("/tasks", headers=phone_headers).json()
-    count_before = len(tasks_before) if isinstance(tasks_before, list) else 0
+def test_optional_address_crud_and_no_task_dispatch(client: TestClient, db_session: Session, phone_headers: dict):
+    # 1. Authoritative initial tasks count from database
+    initial_tasks_count = db_session.query(Task).count()
+
+    # 1a. Verify parse-only destination resolution does NOT create task
+    r_res = client.post(
+        "/api/v1/destinations/resolve",
+        json={"raw_input": "35.6812, 139.7671", "source": "ios_share", "purpose": "favorite_preview"},
+        headers=phone_headers,
+    )
+    assert r_res.status_code == 200
+    assert db_session.query(Task).count() == initial_tasks_count
 
     # 2. Create with omitted address
     r1 = client.post(
@@ -743,6 +751,7 @@ def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_he
     fav1 = r1.json()
     assert fav1["address"] == ""
     assert fav1["name"] == "无地址点"
+    assert db_session.query(Task).count() == initial_tasks_count
 
     # 3. Create with explicit null address and empty name
     r2 = client.post(
@@ -754,6 +763,7 @@ def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_he
     fav2 = r2.json()
     assert fav2["name"] is None
     assert fav2["address"] == ""
+    assert db_session.query(Task).count() == initial_tasks_count
 
     # 4. Create with address and verify PATCH semantics
     r3 = client.post(
@@ -764,6 +774,7 @@ def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_he
     assert r3.status_code == 201
     fav3_id = r3.json()["id"]
     assert r3.json()["address"] == "原始详细地址"
+    assert db_session.query(Task).count() == initial_tasks_count
 
     # 4a. PATCH without address field keeps existing address
     p_keep = client.patch(
@@ -774,6 +785,7 @@ def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_he
     assert p_keep.status_code == 200
     assert p_keep.json()["name"] == "新名称"
     assert p_keep.json()["address"] == "原始详细地址"
+    assert db_session.query(Task).count() == initial_tasks_count
 
     # 4b. PATCH with whitespace address clears to ""
     p_clear_ws = client.patch(
@@ -783,6 +795,7 @@ def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_he
     )
     assert p_clear_ws.status_code == 200
     assert p_clear_ws.json()["address"] == ""
+    assert db_session.query(Task).count() == initial_tasks_count
 
     # 4c. PATCH with null address clears to ""
     p_clear_null = client.patch(
@@ -792,20 +805,68 @@ def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_he
     )
     assert p_clear_null.status_code == 200
     assert p_clear_null.json()["address"] == ""
+    assert db_session.query(Task).count() == initial_tasks_count
 
-    # 5. Search favorites
-    search_resp = client.get("/api/v1/favorites?query=无地址点", headers=phone_headers)
-    assert search_resp.status_code == 200
-    search_data = search_resp.json()
-    items = search_data.get("items", search_data)
-    matching = [x for x in items if x["id"] == fav1["id"]]
-    assert len(matching) == 1
-    assert matching[0]["address"] == ""
+    # 5. Search favorites using correct 'search' parameter (name and address)
+    # 5a. Matching name on empty address item
+    s_name = client.get("/api/v1/favorites?search=无地址点", headers=phone_headers)
+    assert s_name.status_code == 200
+    items_name = s_name.json()["items"]
+    assert len(items_name) == 1
+    assert items_name[0]["id"] == fav1["id"]
+    assert items_name[0]["address"] == ""
 
-    # 6. Verify zero task side effects
-    tasks_after = client.get("/tasks", headers=phone_headers).json()
-    count_after = len(tasks_after) if isinstance(tasks_after, list) else 0
-    assert count_after == count_before
+    # 5b. Non-matching keyword correctly returns empty results
+    s_none = client.get("/api/v1/favorites?search=绝对不存在的冷门关键词XYZ999", headers=phone_headers)
+    assert s_none.status_code == 200
+    assert len(s_none.json()["items"]) == 0
+
+    # 5c. Searching by previously cleared address returns 0
+    s_cleared = client.get("/api/v1/favorites?search=原始详细地址", headers=phone_headers)
+    assert s_cleared.status_code == 200
+    assert len(s_cleared.json()["items"]) == 0
+
+    # 6. Delete favorite and verify task count remains unchanged
+    del_r = client.delete(f"/api/v1/favorites/{fav3_id}", headers=phone_headers)
+    assert del_r.status_code == 200
+    assert db_session.query(Task).count() == initial_tasks_count
+
+    # 7. Cross-account isolation regression for empty address favorites
+    client.post("/api/v1/auth/register", json={"username": "empty_addr_user_a", "password": "PasswordA123!"})
+    s_a = client.post("/api/v1/auth/login", json={"username": "empty_addr_user_a", "password": "PasswordA123!"}).json()["session_id"]
+    h_a = {"Authorization": f"Bearer {s_a}"}
+
+    client.post("/api/v1/auth/register", json={"username": "empty_addr_user_b", "password": "PasswordB123!"})
+    s_b = client.post("/api/v1/auth/login", json={"username": "empty_addr_user_b", "password": "PasswordB123!"}).json()["session_id"]
+    h_b = {"Authorization": f"Bearer {s_b}"}
+
+    # User A creates folder and empty address favorite
+    fld_a = client.post("/api/v1/favorite-folders", json={"name": "A的文件夹"}, headers=h_a).json()
+    fav_a = client.post(
+        "/api/v1/favorites",
+        json={"name": "A私有无地址点", "address": "", "latitude": 35.123, "longitude": 139.456, "folder_id": fld_a["id"]},
+        headers=h_a,
+    ).json()
+
+    # User B cannot access, modify, or delete User A's empty address favorite
+    assert client.get(f"/api/v1/favorites/{fav_a['id']}", headers=h_b).status_code == 404
+    assert client.patch(f"/api/v1/favorites/{fav_a['id']}", json={"name": "越权修改"}, headers=h_b).status_code == 404
+    assert client.delete(f"/api/v1/favorites/{fav_a['id']}", headers=h_b).status_code == 404
+
+    # User B cannot find User A's empty address favorite via search
+    s_cross = client.get("/api/v1/favorites?search=A私有无地址点", headers=h_b)
+    assert s_cross.status_code == 200
+    assert len(s_cross.json()["items"]) == 0
+
+    # User B cannot create an empty address favorite referencing User A's folder
+    cross_post = client.post(
+        "/api/v1/favorites",
+        json={"name": "B试图放入A文件夹", "address": "", "latitude": 35.123, "longitude": 139.456, "folder_id": fld_a["id"]},
+        headers=h_b,
+    )
+    assert cross_post.status_code == 404
+    assert db_session.query(Task).count() == initial_tasks_count
+
 
 
 

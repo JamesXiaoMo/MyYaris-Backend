@@ -87,28 +87,45 @@
 - **请求体**：
   ```json
   {
-    "raw_input": "8Q7XMPR3+PP",        // 支持: 纯坐标、Google Maps 分享短链、Plus Code、地名关键词
+    "raw_input": "MPR3+PP",            // 支持: 纯坐标、Google Maps 分享短链、Plus Code、地名关键词
     "source": "ios_share",              // "ios_share" | "car_ui" | "voice"
-    "reference_coordinate": {          // 可选，辅助解析短 Plus Code（如 "MPR3+PP"）避免歧义
+    "purpose": "favorite_preview",      // "favorite_preview" (默认) | "navigation"
+    "reference_coordinate": {          // 短 Plus Code 必填，且必须为 wgs84
       "latitude": 35.6812,
-      "longitude": 139.7671
+      "longitude": 139.7671,
+      "coord_system": "wgs84"
     }
   }
   ```
-- **核心逻辑**：纯坐标、Plus Code 与有效地图图钉直接解析为 WGS84 经纬度；**此步骤绝对不创建任务（No Eager Task Creation，auto_create_task=False 严格生效）**。短 Plus Code 缺参考坐标时抛出 422 异常，杜绝 `(0.0, 0.0)` 伪装。
+- **核心逻辑与边界约束**：
+  - **Open Location Code 区域中心**：Plus Code 解码结果为该网格几何中心 (`latitudeCenter`, `longitudeCenter`)，非建筑物入口精确坐标；
+  - **短码严格约束**：短码必须提供显式 WGS84 参考坐标；若缺省或仅附带城市文字，直接返回 **422 Unprocessable Entity**（不调用在线城市查询服务猜测），杜绝 `(0.0, 0.0)` 伪装；
+  - **确认状态语义 (`needs_confirmation: true`)**：短码经参考还原、全码粗编码（长度 < 10）或多候选结果固定返回 `needs_confirmation: true` 与 `status: "needs_clarification"`；此确认仅用于客户端前端确认后保存至收藏夹，**严禁调用旧版 `POST /destinations/{id}/confirm` 创建车机导航任务**（违者返回 400）；
+  - **零任务副作用**：`auto_create_task=False` 严格生效，绝不提前生成车机导航任务；多候选时通过 `candidates` 数组返回全量列表。
 - **响应示例 (200 OK)**：
   ```json
   {
     "code": 200,
     "destination_id": "3b196fb4-2f34-4465-ae66-7f0cd3dc2975",
-    "name": "秋叶原电车站",
+    "name": "Plus Code 8Q7XMPR3+PP",
     "latitude": 35.698383,
     "longitude": 139.773072,
-    "confidence": 0.98,
-    "status": "resolved",
+    "confidence": 0.85,
+    "status": "needs_clarification",
     "message": null,
-    "clarification_question": null,
-    "needs_confirmation": false
+    "clarification_question": "已按参照位置还原最近匹配的短编码区域中心，请确认是否为目标地点；参照位置偏差可能导致错误地点。",
+    "needs_confirmation": true,
+    "candidates": [
+      {
+        "candidate_id": "cand_12345678",
+        "title": "Plus Code 8Q7XMPR3+PP",
+        "address": "Plus Code 编码区域中心（按参照位置还原，非建筑物入口精确坐标）",
+        "latitude": 35.698383,
+        "longitude": 139.773072,
+        "coord_system": "wgs84",
+        "source": "plus_code"
+      }
+    ]
   }
   ```
 

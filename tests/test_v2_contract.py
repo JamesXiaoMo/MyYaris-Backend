@@ -4,6 +4,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.repositories.models import MusicCommand, ParseRequest, Task, utc_now
@@ -79,8 +80,12 @@ def test_resolve_share_link_no_eager_task(client: TestClient, phone_headers: dic
     assert query_resp.json()["task_id"] is None
 
 
-def test_resolve_plus_code_flows_and_protections(client: TestClient, phone_headers: dict):
+def test_resolve_plus_code_flows_and_protections(client: TestClient, db_session: Session, phone_headers: dict):
+    from unittest.mock import patch
     from openlocationcode import openlocationcode as olc
+    from app.repositories.models import Task
+
+    initial_tasks = db_session.query(Task).count()
 
     full_code = olc.encode(35.681234, 139.767123)
     area = olc.decode(full_code)
@@ -88,7 +93,7 @@ def test_resolve_plus_code_flows_and_protections(client: TestClient, phone_heade
     # 1. Full Plus Code resolves offline without eager task
     r_full = client.post(
         "/api/v1/destinations/resolve",
-        json={"raw_input": full_code, "source": "ios_share"},
+        json={"raw_input": full_code, "source": "ios_share", "purpose": "favorite_preview"},
         headers=phone_headers,
     )
     assert r_full.status_code == 200
@@ -96,18 +101,74 @@ def test_resolve_plus_code_flows_and_protections(client: TestClient, phone_heade
     assert abs(data_full["latitude"] - area.latitudeCenter) < 1e-4
     assert abs(data_full["longitude"] - area.longitudeCenter) < 1e-4
     assert data_full["status"] == "resolved"
+    assert data_full["needs_confirmation"] is False
+    assert len(data_full["candidates"]) == 1
+    assert "几何网格中心" in data_full["candidates"][0]["address"]
     # Verify no task created
-    q_full = client.get(f"/destinations/{data_full['destination_id']}", headers=phone_headers)
-    assert q_full.json()["task_id"] is None
+    assert db_session.query(Task).count() == initial_tasks
 
-    # 2. Short Plus Code with reference_coordinate resolves correctly
+    # 2. Coarse full Plus Code requires confirmation
+    coarse_code = olc.encode(35.68, 139.76, 8)  # length 8 < 10
+    r_coarse = client.post(
+        "/api/v1/destinations/resolve",
+        json={"raw_input": coarse_code, "source": "ios_share", "purpose": "favorite_preview"},
+        headers=phone_headers,
+    )
+    assert r_coarse.status_code == 200
+    data_coarse = r_coarse.json()
+    assert data_coarse["needs_confirmation"] is True
+    assert data_coarse["status"] == "needs_clarification"
+    assert "该编码覆盖较大区域" in data_coarse["clarification_question"]
+    assert db_session.query(Task).count() == initial_tasks
+
+    # 3. Short Plus Code without reference coordinate MUST be rejected even if city text is provided
+    # AND mock city service (NominatimMapsProvider.search) MUST NOT be called!
+    with patch("app.providers.nominatim_provider.NominatimMapsProvider.search") as mock_city_search:
+        r_short_city_noref = client.post(
+            "/api/v1/destinations/resolve",
+            json={"raw_input": "CPF8+Q7 东广岛市 广岛县", "source": "ios_share", "purpose": "favorite_preview"},
+            headers=phone_headers,
+        )
+        assert r_short_city_noref.status_code == 422
+        assert "短 Plus Code" in r_short_city_noref.json()["detail"]
+        mock_city_search.assert_not_called()
+
+    # 4. Short Plus Code with invalid / non-wgs84 reference coordinate MUST be rejected (422)
     short_code = olc.shorten(full_code, 35.68, 139.77)
+    r_bad_coord_sys = client.post(
+        "/api/v1/destinations/resolve",
+        json={
+            "raw_input": short_code,
+            "source": "ios_share",
+            "reference_coordinate": {"latitude": 35.68, "longitude": 139.77, "coord_system": "gcj02"},
+            "purpose": "favorite_preview",
+        },
+        headers=phone_headers,
+    )
+    assert r_bad_coord_sys.status_code == 422
+    assert "wgs84" in r_bad_coord_sys.json()["detail"]
+
+    r_out_of_bounds = client.post(
+        "/api/v1/destinations/resolve",
+        json={
+            "raw_input": short_code,
+            "source": "ios_share",
+            "reference_coordinate": {"latitude": 95.0, "longitude": 139.77, "coord_system": "wgs84"},
+            "purpose": "favorite_preview",
+        },
+        headers=phone_headers,
+    )
+    assert r_out_of_bounds.status_code == 422
+    assert "Latitude must be between" in str(r_out_of_bounds.json()["detail"])
+
+    # 5. Short Plus Code with valid reference_coordinate resolves offline and requires confirmation
     r_short_ref = client.post(
         "/api/v1/destinations/resolve",
         json={
             "raw_input": short_code,
             "source": "ios_share",
-            "reference_coordinate": {"latitude": 35.68, "longitude": 139.77},
+            "reference_coordinate": {"latitude": 35.68, "longitude": 139.77, "coord_system": "wgs84"},
+            "purpose": "favorite_preview",
         },
         headers=phone_headers,
     )
@@ -115,17 +176,24 @@ def test_resolve_plus_code_flows_and_protections(client: TestClient, phone_heade
     data_short = r_short_ref.json()
     assert abs(data_short["latitude"] - area.latitudeCenter) < 1e-4
     assert abs(data_short["longitude"] - area.longitudeCenter) < 1e-4
+    assert data_short["needs_confirmation"] is True
+    assert data_short["status"] == "needs_clarification"
+    assert "已按参照位置还原最近匹配的短编码" in data_short["clarification_question"]
+    assert db_session.query(Task).count() == initial_tasks
 
-    # 3. Short Plus Code without reference_coordinate cannot be resolved: 422 rejected, never dummy (0,0)
-    r_short_noref = client.post(
-        "/api/v1/destinations/resolve",
-        json={"raw_input": short_code, "source": "ios_share"},
+    # 6. Confirmation for favorite_preview is strictly for saving favorite; legacy confirm MUST reject (400)
+    dest_id = data_short["destination_id"]
+    cand_id = data_short["candidates"][0]["candidate_id"]
+    bad_confirm = client.post(
+        f"/destinations/{dest_id}/confirm",
+        json={"candidate_id": cand_id, "target_device_id": "car_p3pro"},
         headers=phone_headers,
     )
-    assert r_short_noref.status_code == 422
-    assert "短 Plus Code" in r_short_noref.json()["detail"]
+    assert bad_confirm.status_code == 400
+    assert "仅用于收藏预览确认" in bad_confirm.json()["detail"]
+    assert db_session.query(Task).count() == initial_tasks
 
-    # 4. Explicit (0.0, 0.0) coordinates are legitimate and accepted
+    # 7. Explicit (0.0, 0.0) coordinates are legitimate and accepted without error
     r_zero = client.post(
         "/api/v1/destinations/resolve",
         json={"raw_input": "0.0, 0.0", "source": "ios_share"},
@@ -134,6 +202,7 @@ def test_resolve_plus_code_flows_and_protections(client: TestClient, phone_heade
     assert r_zero.status_code == 200
     assert r_zero.json()["latitude"] == 0.0
     assert r_zero.json()["longitude"] == 0.0
+    assert db_session.query(Task).count() == initial_tasks
 
 
 def test_legacy_destinations_still_auto_creates_task(client: TestClient, phone_headers: dict):
