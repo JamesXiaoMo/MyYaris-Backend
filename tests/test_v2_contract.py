@@ -22,8 +22,12 @@ def clean_queue_state(db_session):
     db_session.commit()
 
 
-def test_resolve_and_dispatch_separation(client: TestClient, phone_headers: dict):
-    # 1. Pure resolution via POST /api/v1/destinations/resolve with coordinate input
+def test_resolve_and_dispatch_separation(client: TestClient, db_session: Session, phone_headers: dict):
+    from app.repositories.models import Task, ParseRequest
+    initial_tasks = db_session.query(Task).count()
+    initial_requests = db_session.query(ParseRequest).count()
+
+    # 1. Pure resolution via POST /api/v1/destinations/resolve with default purpose (favorite_preview)
     resolve_resp = client.post(
         "/api/v1/destinations/resolve",
         json={"raw_input": "35.6812, 139.7671", "source": "ios_share"},
@@ -32,21 +36,58 @@ def test_resolve_and_dispatch_separation(client: TestClient, phone_headers: dict
     assert resolve_resp.status_code == 200
     res_data = resolve_resp.json()
     assert res_data["code"] == 200
-    dest_id = res_data["destination_id"]
-    assert dest_id is not None
+    dest_id_preview = res_data["destination_id"]
+    assert dest_id_preview is not None
     assert abs(res_data["latitude"] - 35.6812) < 1e-4
     assert abs(res_data["longitude"] - 139.7671) < 1e-4
 
     # Verify NO task was created eagerly during resolution
-    query_resp = client.get(f"/destinations/{dest_id}", headers=phone_headers)
+    query_resp = client.get(f"/destinations/{dest_id_preview}", headers=phone_headers)
     assert query_resp.status_code == 200
     assert query_resp.json()["task_id"] is None
+    assert db_session.query(Task).count() == initial_tasks
+    assert db_session.query(ParseRequest).count() == initial_requests + 1
 
-    # 2. Formal dispatch via POST /api/v1/tasks/destination with alias target_device_id
+    # 1b. Attempting dispatch on favorite_preview via POST /api/v1/tasks/destination MUST be rejected with 400
+    bad_dispatch = client.post(
+        "/api/v1/tasks/destination",
+        json={
+            "destination_id": dest_id_preview,
+            "target_device_id": "ottocast_p3_pro",
+            "expires_in_seconds": 3600,
+        },
+        headers=phone_headers,
+    )
+    assert bad_dispatch.status_code == 400
+    assert "该解析请求仅用于收藏预览确认" in bad_dispatch.json()["detail"]
+    assert db_session.query(Task).count() == initial_tasks
+
+    # 1c. Attempting legacy confirm on favorite_preview MUST also be rejected with 400
+    cand_id_preview = res_data["candidates"][0]["candidate_id"]
+    bad_legacy = client.post(
+        f"/destinations/{dest_id_preview}/confirm",
+        json={"candidate_id": cand_id_preview, "target_device_id": "ottocast_p3_pro"},
+        headers=phone_headers,
+    )
+    assert bad_legacy.status_code == 400
+    assert "该解析请求仅用于收藏预览确认" in bad_legacy.json()["detail"]
+    assert db_session.query(Task).count() == initial_tasks
+
+    # 2. Formal dispatch via explicit purpose="navigation"
+    nav_resolve_resp = client.post(
+        "/api/v1/destinations/resolve",
+        json={"raw_input": "35.6812, 139.7671", "source": "ios_share", "purpose": "navigation"},
+        headers=phone_headers,
+    )
+    assert nav_resolve_resp.status_code == 200
+    nav_data = nav_resolve_resp.json()
+    dest_id_nav = nav_data["destination_id"]
+    assert nav_data["status"] == "resolved"
+
     dispatch_resp = client.post(
         "/api/v1/tasks/destination",
         json={
-            "destination_id": dest_id,
+            "destination_id": dest_id_nav,
             "target_device_id": "ottocast_p3_pro",
             "expires_in_seconds": 3600,
         },
@@ -58,9 +99,10 @@ def test_resolve_and_dispatch_separation(client: TestClient, phone_headers: dict
     # Alias 'ottocast_p3_pro' must be normalized to canonical 'car_p3pro'
     assert task_data["device_id"] == "car_p3pro"
     assert task_data["status"] == "queued"
+    assert db_session.query(Task).count() == initial_tasks + 1
 
     # Now verify request has task_id
-    query_after = client.get(f"/destinations/{dest_id}", headers=phone_headers)
+    query_after = client.get(f"/destinations/{dest_id_nav}", headers=phone_headers)
     assert query_after.json()["task_id"] == task_data["task_id"]
 
 
@@ -78,6 +120,24 @@ def test_resolve_share_link_no_eager_task(client: TestClient, phone_headers: dic
     query_resp = client.get(f"/destinations/{dest_id}", headers=phone_headers)
     assert query_resp.status_code == 200
     assert query_resp.json()["task_id"] is None
+
+
+def test_resolve_empty_and_whitespace_input(client: TestClient, db_session: Session, phone_headers: dict):
+    from app.repositories.models import ParseRequest, Task
+    initial_tasks = db_session.query(Task).count()
+    initial_requests = db_session.query(ParseRequest).count()
+
+    for bad_input in ["", "   ", "\t  \n  ", "   \r\n"]:
+        resp = client.post(
+            "/api/v1/destinations/resolve",
+            json={"raw_input": bad_input, "source": "ios_share"},
+            headers=phone_headers,
+        )
+        assert resp.status_code == 422, f"Expected 422 for {repr(bad_input)}, got {resp.status_code}"
+        assert "输入内容不能为空" in resp.json()["detail"]
+        # Assert ZERO ParseRequest and ZERO Task side effects
+        assert db_session.query(ParseRequest).count() == initial_requests
+        assert db_session.query(Task).count() == initial_tasks
 
 
 def test_resolve_plus_code_flows_and_protections(client: TestClient, db_session: Session, phone_headers: dict):
@@ -191,6 +251,16 @@ def test_resolve_plus_code_flows_and_protections(client: TestClient, db_session:
     )
     assert bad_confirm.status_code == 400
     assert "仅用于收藏预览确认" in bad_confirm.json()["detail"]
+    assert db_session.query(Task).count() == initial_tasks
+
+    # And POST /api/v1/tasks/destination MUST also reject favorite_preview with 400
+    bad_task_dest = client.post(
+        "/api/v1/tasks/destination",
+        json={"destination_id": dest_id, "target_device_id": "car_p3pro"},
+        headers=phone_headers,
+    )
+    assert bad_task_dest.status_code == 400
+    assert "该解析请求仅用于收藏预览确认" in bad_task_dest.json()["detail"]
     assert db_session.query(Task).count() == initial_tasks
 
     # 7. Explicit (0.0, 0.0) coordinates are legitimate and accepted without error

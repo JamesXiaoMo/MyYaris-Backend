@@ -98,10 +98,14 @@
   }
   ```
 - **核心逻辑与边界约束**：
+  - **输入校验防御**：`raw_input` 严禁为空或纯空白字符，违者直接返回 **422 Unprocessable Entity**（`detail: "输入内容不能为空。"`），且无任何数据库副作用；
   - **Open Location Code 区域中心**：Plus Code 解码结果为该网格几何中心 (`latitudeCenter`, `longitudeCenter`)，非建筑物入口精确坐标；
   - **短码严格约束**：短码必须提供显式 WGS84 参考坐标；若缺省或仅附带城市文字，直接返回 **422 Unprocessable Entity**（不调用在线城市查询服务猜测），杜绝 `(0.0, 0.0)` 伪装；
-  - **确认状态语义 (`needs_confirmation: true`)**：短码经参考还原、全码粗编码（长度 < 10）或多候选结果固定返回 `needs_confirmation: true` 与 `status: "needs_clarification"`；此确认仅用于客户端前端确认后保存至收藏夹，**严禁调用旧版 `POST /destinations/{id}/confirm` 创建车机导航任务**（违者返回 400）；
-  - **零任务副作用**：`auto_create_task=False` 严格生效，绝不提前生成车机导航任务；多候选时通过 `candidates` 数组返回全量列表。
+  - **Purpose 契约与确认状态语义**：
+    - `purpose` 默认值为 `"favorite_preview"`。短码经参考还原、全码粗编码（长度 < 10）或多候选结果固定返回 `needs_confirmation: true` 与 `status: "needs_clarification"`；
+    - **统一预览防派发保护**：所有以 `purpose="favorite_preview"` 解析生成的记录，**统一严禁用于派发车机导航任务**——无论是调用 `POST /api/v1/tasks/destination` 还是 `POST /destinations/{id}/confirm`，服务端均直接返回 **400 Bad Request** 拦截；
+    - **iOS 真实导航派发**：客户端若需直接发起真实车机导航，解析时必须显式指定 `"purpose": "navigation"`，待解析状态为 `"resolved"` 后再行调度派发；
+  - **零任务副作用**：`auto_create_task=False` 严格生效，解析阶段绝不提前生成车机导航任务；多候选时通过 `candidates` 数组返回全量列表。
 - **响应示例 (200 OK)**：
   ```json
   {
@@ -140,6 +144,9 @@
     "expires_in_seconds": 3600
   }
   ```
+- **门禁拦截说明**：
+  - 若 `destination_id` 对应的解析请求为收藏预览用途（`purpose="favorite_preview"`），**直接拦截并返回 400 Bad Request**；
+  - 若解析请求状态仍为 `needs_clarification`，**直接拦截并返回 400 Bad Request**；
 - **响应示例 (200 OK)**：返回已入队的 `Task` 对象（状态为 `queued`）。
 
 ### 4.3 多候选点人工确认派发 (`/destinations/{id}/confirm`)
@@ -152,6 +159,7 @@
     "target_device_id": "car_p3pro"
   }
   ```
+- **门禁拦截说明**：若目标记录为收藏预览用途（`purpose="favorite_preview"`），**同样直接拦截并返回 400 Bad Request**。如需发起真实导航请使用 `purpose="navigation"` 解析。
 
 ### 4.4 历史单步兼容接口 (`/destinations`)
 - **方法 & 路径**：`POST /destinations`

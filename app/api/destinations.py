@@ -61,7 +61,7 @@ async def confirm_destination(
     if req.source in ("favorite_preview", "favorite"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="该解析请求仅用于收藏预览确认，禁止调用旧版 confirm 接口创建车机导航任务。如需保存请调用收藏夹接口。",
+            detail="该解析请求仅用于收藏预览确认，禁止调用旧版 confirm 接口创建车机导航任务。如需保存请调用收藏夹接口，如需发起真实导航请使用 purpose='navigation' 解析。",
         )
     task = await confirm_destination_candidate(
         db=db,
@@ -136,8 +136,14 @@ async def resolve_destination_v1(
     user: AuthenticatedUser = Depends(require_phone_or_admin),
 ):
     raw_text = (body.raw_input or "").strip()
+    if not raw_text:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="输入内容不能为空。",
+        )
     norm_val = raw_text.replace("＋", "+").strip()
-    code_part = norm_val.split(maxsplit=1)[0].upper()
+    parts = norm_val.split(maxsplit=1)
+    code_part = parts[0].upper() if parts else ""
 
     # 1. Plus Code offline resolution branch
     if olc.isValid(code_part):
@@ -355,6 +361,11 @@ async def create_task_from_destination_v1(
     req = db.query(ParseRequest).filter(ParseRequest.request_id == body.destination_id).first()
     if not req or not req.candidates:
         raise HTTPException(status_code=404, detail="Destination or candidates not found.")
+    if req.source in ("favorite_preview", "favorite"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该解析请求仅用于收藏预览确认，禁止直接派发车机导航任务。如需发起真实导航请使用 purpose='navigation' 重新解析或在收藏夹中发起导航。",
+        )
     if req.status == "needs_clarification":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

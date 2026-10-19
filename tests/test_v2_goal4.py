@@ -119,6 +119,7 @@ def test_navigation_api_v1_endpoints(client, phone_headers, car_headers):
     resolve_payload = {
         "raw_input": "https://maps.app.goo.gl/EXAMPLE_dest_goal4",
         "source": "ios_share",
+        "purpose": "navigation",
     }
     with patch("app.services.destination_service.resolve_and_parse_map_url", new_callable=AsyncMock) as mock_resolve:
         mock_resolve.return_value = MapUrlResolutionResult(candidate=mock_cand, resolved_url="https://maps.google.com/test")
