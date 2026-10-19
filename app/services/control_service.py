@@ -513,6 +513,37 @@ class MusicQueueSnapshotManager:
                 if close_db:
                     db.close()
 
+    def get_snapshot(
+        self,
+        device_id: str,
+        queue_id: str,
+        queue_version: int,
+    ) -> Optional[QueueSnapshot]:
+        """
+        Looks up an immutable snapshot by (device_id, queue_id, queue_version)
+        from snapshot cache or pending queues.
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        snap = self._snapshots.get((norm_dev, queue_id, queue_version))
+        if not snap:
+            for p in self._pending_queues.values():
+                if p.device_id == norm_dev and p.queue_id == queue_id and p.queue_version == queue_version:
+                    return p
+        return snap
+
+    def register_pending_snapshot(
+        self,
+        device_id: str,
+        command_id: str,
+        snapshot: QueueSnapshot,
+    ):
+        """
+        Associates an existing immutable snapshot as pending for command_id.
+        Does NOT generate a new version, does NOT touch active queue until ACK.
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        self._pending_queues[(norm_dev, command_id)] = snapshot
+
     def get_active_queue(self, device_id: str) -> Optional[QueueSnapshot]:
         norm_dev = resolve_car_device_id(device_id)
         return self._active_queues.get(norm_dev)
@@ -543,12 +574,24 @@ class MusicQueueSnapshotManager:
             snapshot = self._snapshots.get((norm_dev, queue_id, queue_version))
         if snapshot:
             curr_active = self._active_queues.get(norm_dev)
-            if curr_active and curr_active.queue_version > snapshot.queue_version:
+            if not command_id and curr_active and curr_active.queue_version > snapshot.queue_version:
                 logger.warning(
-                    f"Ignored late ACK promotion for queue '{snapshot.queue_id}' (v{snapshot.queue_version}): "
+                    f"Ignored late status report promotion for queue '{snapshot.queue_id}' (v{snapshot.queue_version}): "
                     f"current active queue is newer (v{curr_active.queue_version})"
                 )
                 return None
+            if command_id and curr_active and curr_active.queue_id != snapshot.queue_id and db:
+                # Check if this command is older than an already applied command
+                status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == norm_dev).first()
+                if status_row and status_row.last_applied_command_id and status_row.last_applied_command_id != command_id:
+                    applied_cmd = db.query(MusicCommand).filter(MusicCommand.command_id == status_row.last_applied_command_id).first()
+                    this_cmd = db.query(MusicCommand).filter(MusicCommand.command_id == command_id).first()
+                    if applied_cmd and this_cmd and applied_cmd.created_at > this_cmd.created_at:
+                        logger.warning(
+                            f"Ignored late ACK promotion for older command '{command_id}': "
+                            f"newer command '{status_row.last_applied_command_id}' was already applied"
+                        )
+                        return None
             self._active_queues[norm_dev] = snapshot
             self.sync_device_queue_version(norm_dev, snapshot.queue_version, db=db)
             if db:
@@ -1035,7 +1078,7 @@ class MusicQueueSnapshotManager:
 
         # 3. Generic query without queue_id (e.g. GET /api/v1/music/queue)
         else:
-            if active is not None:
+            if active is not None and (not source or active.source == source):
                 if queue_version is not None and queue_version != active.queue_version:
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
@@ -1047,10 +1090,24 @@ class MusicQueueSnapshotManager:
                         },
                     )
                 target = active
+            elif source == "netease_intelligence":
+                intel_candidates = [s for (d, _, _), s in self._snapshots.items() if d == norm_dev and s.source == "netease_intelligence"]
+                if intel_candidates:
+                    target = max(intel_candidates, key=lambda s: s.queue_version)
+                else:
+                    fav_candidates = [s for (d, _, _), s in self._snapshots.items() if d == norm_dev and s.source == "netease_favorite"]
+                    if fav_candidates and queue_version is None:
+                        fav_snap = max(fav_candidates, key=lambda s: s.queue_version)
+                    else:
+                        fav_snap = await self.prepare_favorite_queue(norm_dev, db=db)
+                    target = fav_snap
             else:
-                # Cold device: prepare favorite queue view without activating (activate=False)
-                # Caches snapshot in _snapshots, but leaves _active_queues intact/None!
-                fav_snap = await self.prepare_favorite_queue(norm_dev, db=db)
+                # Cold device or pure read query for a different source (without activating)
+                fav_candidates = [s for (d, _, _), s in self._snapshots.items() if d == norm_dev and s.source == "netease_favorite"]
+                if fav_candidates and queue_version is None:
+                    fav_snap = max(fav_candidates, key=lambda s: s.queue_version)
+                else:
+                    fav_snap = await self.prepare_favorite_queue(norm_dev, db=db)
                 if queue_version is not None and queue_version != fav_snap.queue_version:
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
@@ -1266,6 +1323,9 @@ def record_command_ack(
                 status_row.applied_mode = applied_mode
             elif cmd.action == "set_playback_mode" and cmd_params.get("mode"):
                 status_row.applied_mode = cmd_params["mode"]
+            elif cmd.action == "play_track" and cmd_params.get("source") == "netease_favorite":
+                if not status_row.applied_mode or status_row.applied_mode == "single_loop":
+                    status_row.applied_mode = "list_loop"
 
             if cmd.action == "switch_queue" and cmd_params.get("source"):
                 status_row.queue_source = cmd_params["source"]
@@ -1287,6 +1347,8 @@ def record_command_ack(
                 status_row.queue_version = cmd_params["queue_version"]
             if current_index is not None:
                 status_row.current_index = current_index
+            elif cmd_params.get("queue_index") is not None:
+                status_row.current_index = cmd_params["queue_index"]
             status_row.updated_at = utc_now()
 
         # Promote pending queue snapshot to active queue upon car execution ACK

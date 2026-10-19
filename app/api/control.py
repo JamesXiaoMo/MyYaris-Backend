@@ -124,6 +124,16 @@ async def process_and_dispatch_music_command(
                     "message": "非车主账号无权修改车主播放队列或切换播放模式",
                 },
             )
+        if cmd.action == "play_track" and cmd.params and cmd.params.source == "netease_favorite":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": 403,
+                    "error_code": "OWNER_QUEUE_PERMISSION_DENIED",
+                    "error_detail": "Action 'play_track' targeting owner favorite queue requires owner or admin role.",
+                    "message": "非车主账号无权点播车主喜欢歌单队列曲目",
+                },
+            )
         if cmd.action == "resume" and not active_q:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -384,11 +394,150 @@ async def process_and_dispatch_music_command(
                 except ValueError:
                     pass
 
-            if s_id is not None:
+            # Case A: Explicit favorite queue member playback
+            if cmd.params.source == "netease_favorite":
+                if s_id is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "code": 422,
+                            "error_code": "INVALID_TRACK_IDENTIFIER",
+                            "error_detail": "Action 'play_track' with source='netease_favorite' requires a valid song_id or netease track_id",
+                            "message": "点播我喜欢的音乐曲目缺少有效的歌曲ID",
+                        },
+                    )
+                if not cmd.params.queue_id or cmd.params.queue_version is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "code": 422,
+                            "error_code": "INVALID_QUEUE_PARAMETERS",
+                            "error_detail": "source='netease_favorite' requires queue_id and queue_version",
+                            "message": "点播我喜欢的音乐曲目必须提供queue_id与queue_version",
+                        },
+                    )
+
+                snap = music_queue_snapshot_manager.get_snapshot(
+                    norm_target,
+                    cmd.params.queue_id,
+                    cmd.params.queue_version,
+                )
+                if not snap:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": 409,
+                            "error_code": "QUEUE_VERSION_CONFLICT",
+                            "error_detail": f"Queue snapshot ({cmd.params.queue_id}, v{cmd.params.queue_version}) not found or expired",
+                            "message": "播放队列版本已过期或不存在，请重新拉取最新队列",
+                        },
+                    )
+
+                if snap.source != "netease_favorite":
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "code": 422,
+                            "error_code": "QUEUE_SOURCE_MISMATCH",
+                            "error_detail": f"Target queue snapshot source '{snap.source}' does not match requested source 'netease_favorite'",
+                            "message": "队列类型不匹配",
+                        },
+                    )
+
+                matched_track = None
+                matched_index = None
+                for idx, t in enumerate(snap.tracks):
+                    if t.get("song_id") == s_id:
+                        matched_track = t
+                        matched_index = idx
+                        break
+
+                if matched_track is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail={
+                            "code": 404,
+                            "error_code": "TRACK_NOT_IN_QUEUE",
+                            "error_detail": f"Song {s_id} is not a member of queue snapshot ({cmd.params.queue_id}, v{cmd.params.queue_version})",
+                            "message": "指定歌曲不属于该喜欢歌单快照",
+                        },
+                    )
+
+                if cmd.params.queue_index is not None:
+                    q_idx = cmd.params.queue_index
+                    if q_idx < 0 or q_idx >= len(snap.tracks):
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail={
+                                "code": 422,
+                                "error_code": "QUEUE_INDEX_MISMATCH",
+                                "error_detail": f"queue_index {q_idx} out of bounds (queue size: {len(snap.tracks)})",
+                                "message": "队列索引越界",
+                            },
+                        )
+                    if snap.tracks[q_idx].get("song_id") != s_id:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail={
+                                "code": 422,
+                                "error_code": "QUEUE_INDEX_MISMATCH",
+                                "error_detail": f"queue_index {q_idx} track {snap.tracks[q_idx].get('song_id')} does not match requested song {s_id}",
+                                "message": "队列索引与目标歌曲不匹配",
+                            },
+                        )
+                    matched_index = q_idx
+
+                # Register pending association without activating before ACK and without bumping version
+                music_queue_snapshot_manager.register_pending_snapshot(norm_target, cmd.command_id, snap)
+                cmd.params.queue_id = snap.queue_id
+                cmd.params.queue_version = snap.queue_version
+                cmd.params.source = "netease_favorite"
+                cmd.params.queue_index = matched_index
+                cmd.params.track_id = matched_track.get("track_id", f"netease_{s_id}")
+                cmd.params.stream_url = matched_track.get("stream_url", f"/api/v1/music/netease/stream/{s_id}")
+                cmd.params.title = matched_track.get("title")
+                cmd.params.artist = matched_track.get("artist")
+                cmd.params.album = matched_track.get("album")
+                cmd.params.duration_ms = matched_track.get("duration_ms", 0)
+                cmd.params.cover_url = matched_track.get("cover_url")
+
+            # Case B: Explicit single track
+            elif cmd.params.source == "single_track":
+                if s_id is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "code": 422,
+                            "error_code": "INVALID_TRACK_IDENTIFIER",
+                            "error_detail": "Action 'play_track' with source='single_track' requires a valid song_id",
+                            "message": "点播单曲缺少有效的歌曲ID",
+                        },
+                    )
+                detail = await netease_service.get_song_detail(s_id)
+                snap = await music_queue_snapshot_manager.prepare_single_track_queue(
+                    device_id=norm_target,
+                    song_id=s_id,
+                    title=detail.get("name") or cmd.params.title or f"Track {s_id}",
+                    artist=detail.get("artist") or cmd.params.artist or "Unknown Artist",
+                    album=detail.get("album"),
+                    duration_ms=detail.get("duration_ms", 0),
+                    cover_url=detail.get("cover_url"),
+                    command_id=cmd.command_id,
+                    db=db,
+                )
+                cmd.params.queue_id = snap.queue_id
+                cmd.params.queue_version = snap.queue_version
+                cmd.params.source = "single_track"
+                cmd.params.track_id = f"netease_{s_id}"
+                cmd.params.stream_url = f"/api/v1/music/netease/stream/{s_id}"
+                cmd.params.queue_index = 0
+
+            # Case C: Backward-compatible fallback (source not specified)
+            elif s_id is not None:
                 active_q = music_queue_snapshot_manager.get_active_queue(norm_target)
                 matched_track = None
                 matched_index = None
-                if active_q and cmd.params.source != "single_track":
+                if active_q:
                     for idx, t in enumerate(active_q.tracks):
                         if t.get("song_id") == s_id:
                             matched_track = t

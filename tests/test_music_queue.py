@@ -1337,3 +1337,449 @@ def test_cold_pending_single_read_does_not_call_favorite_or_mutate_active(client
 
     # Default GET did NOT activate: active queue is STILL None!
     assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+
+def test_cold_get_play_favorite_pending_failed_and_applied(client, phone_headers, car_headers, db_session):
+    """
+    Requirement:
+    - Cold device (no active queue).
+    - Phone GET /music/queue returns netease_favorite snapshot with activate=False.
+    - Phone play_track with source="netease_favorite", queue_id, queue_version, song_id, queue_index.
+    - Snapshot is registered as pending for command_id; active queue remains None before ACK.
+    - ACK failed discards pending queue and preserves active queue as None.
+    - Resending command and ACK applied promotes snapshot to active queue with applied_mode='list_loop'.
+    """
+    dev_id = settings.DEFAULT_CAR_DEVICE_ID
+    music_queue_snapshot_manager.clear_all()
+    assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+    dummy_songs = _make_dummy_songs(10, start_id=5000)
+    fav_info = {"playlist_id": 112233, "name": "Cold Favorite Playlist", "track_count": 10}
+
+    with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
+         patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": dummy_songs, "has_more": False}):
+
+        # 1. Cold GET queue
+        get_res = client.get("/api/v1/music/queue?offset=0&limit=10", headers=phone_headers)
+        assert get_res.status_code == 200
+        get_data = get_res.json()
+        fav_qid = get_data["queue_id"]
+        fav_qver = get_data["queue_version"]
+        assert fav_qid.startswith("q_fav_")
+        assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+        target_song = dummy_songs[3]
+        target_song_id = target_song["id"]
+
+        # 2. Phone sends play_track for member at index 3
+        cmd1_payload = {
+            "command_id": "cmd_cold_fav_01",
+            "action": "play_track",
+            "params": {
+                "source": "netease_favorite",
+                "queue_id": fav_qid,
+                "queue_version": fav_qver,
+                "song_id": target_song_id,
+                "queue_index": 3,
+            },
+        }
+        r_cmd1 = client.post("/api/v1/music/control/command", json=cmd1_payload, headers=phone_headers)
+        assert r_cmd1.status_code == 200
+        cmd1_data = r_cmd1.json()
+        assert cmd1_data["command_id"] == "cmd_cold_fav_01"
+        assert cmd1_data["params"]["source"] == "netease_favorite"
+        assert cmd1_data["params"]["queue_id"] == fav_qid
+        assert cmd1_data["params"]["queue_version"] == fav_qver
+        assert cmd1_data["params"]["queue_index"] == 3
+        assert cmd1_data["params"]["track_id"] == f"netease_{target_song_id}"
+        assert cmd1_data["params"]["stream_url"] == f"/api/v1/music/netease/stream/{target_song_id}"
+
+        # In-memory active queue is STILL None before ACK
+        assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+        # 3. Car reports ACK failed
+        r_ack_fail = client.post(
+            "/api/v1/music/control/command/cmd_cold_fav_01/ack",
+            json={"status": "failed", "error_code": "PLAYBACK_FAILED"},
+            headers=car_headers,
+        )
+        assert r_ack_fail.status_code == 200
+        # Active queue remains None
+        assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+        # 4. Dispatch new command cmd_cold_fav_02
+        cmd2_payload = {
+            "command_id": "cmd_cold_fav_02",
+            "action": "play_track",
+            "params": {
+                "source": "netease_favorite",
+                "queue_id": fav_qid,
+                "queue_version": fav_qver,
+                "song_id": target_song_id,
+                "queue_index": 3,
+            },
+        }
+        r_cmd2 = client.post("/api/v1/music/control/command", json=cmd2_payload, headers=phone_headers)
+        assert r_cmd2.status_code == 200
+
+        # 5. Car reports ACK applied
+        r_ack_app = client.post(
+            "/api/v1/music/control/command/cmd_cold_fav_02/ack",
+            json={"status": "applied"},
+            headers=car_headers,
+        )
+        assert r_ack_app.status_code == 200
+
+        # Now active queue is promoted
+        active_q = music_queue_snapshot_manager.get_active_queue(dev_id)
+        assert active_q is not None
+        assert active_q.queue_id == fav_qid
+        assert active_q.queue_version == fav_qver
+        assert active_q.source == "netease_favorite"
+
+        db_session.expire_all()
+        status_row = db_session.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == dev_id).first()
+        assert status_row.queue_id == fav_qid
+        assert status_row.queue_version == fav_qver
+        assert status_row.queue_source == "netease_favorite"
+        assert status_row.current_index == 3
+        assert status_row.applied_mode == "list_loop"
+
+
+def test_active_single_switch_to_favorite_member(client, phone_headers, car_headers, db_session):
+    """
+    Requirement:
+    - Active queue is currently single_track (single_loop mode).
+    - Phone requests play_track with source='netease_favorite' for an existing favorite snapshot member.
+    - Active queue remains single_track pending car ACK.
+    - Upon ACK applied:
+      - Active queue is switched to netease_favorite.
+      - applied_mode transitions to 'list_loop'.
+      - current_index reflects the target member's index.
+    """
+    dev_id = settings.DEFAULT_CAR_DEVICE_ID
+    music_queue_snapshot_manager.clear_all()
+
+    # 1. Establish single_track as active queue
+    dummy_single = {"name": "Single Solitary Song", "artist": "Solitary", "album": "Solitary Album", "duration_ms": 180000}
+    with patch.object(netease_service, "get_song_detail", new_callable=AsyncMock, return_value=dummy_single):
+        r_single = client.post(
+            "/api/v1/music/control/command",
+            json={"command_id": "cmd_init_single", "action": "play_track", "params": {"source": "single_track", "song_id": 9999}},
+            headers=phone_headers,
+        )
+        assert r_single.status_code == 200
+        single_qid = r_single.json()["params"]["queue_id"]
+        single_qver = r_single.json()["params"]["queue_version"]
+
+    client.post(
+        "/api/v1/music/control/command/cmd_init_single/ack",
+        json={"status": "applied", "applied_mode": "single_loop"},
+        headers=car_headers,
+    )
+    active_before = music_queue_snapshot_manager.get_active_queue(dev_id)
+    assert active_before.queue_id == single_qid
+    assert active_before.source == "single_track"
+
+    # 2. Browse favorite playlist snapshot
+    dummy_favs = _make_dummy_songs(15, start_id=6000)
+    fav_info = {"playlist_id": 778899, "name": "Switch Fav Playlist", "track_count": 15}
+    with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
+         patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": dummy_favs, "has_more": False}):
+
+        r_fav_get = client.get("/api/v1/music/queue?source=netease_favorite", headers=phone_headers)
+        assert r_fav_get.status_code == 200
+        fav_qid = r_fav_get.json()["queue_id"]
+        fav_qver = r_fav_get.json()["queue_version"]
+
+        # Active queue remains single_track
+        assert music_queue_snapshot_manager.get_active_queue(dev_id).queue_id == single_qid
+
+        # 3. Phone dispatches switch via member playback (index 4 -> song 6004)
+        switch_cmd_id = "cmd_switch_fav_01"
+        r_switch = client.post(
+            "/api/v1/music/control/command",
+            json={
+                "command_id": switch_cmd_id,
+                "action": "play_track",
+                "params": {
+                    "source": "netease_favorite",
+                    "queue_id": fav_qid,
+                    "queue_version": fav_qver,
+                    "song_id": 6004,
+                    "queue_index": 4,
+                },
+            },
+            headers=phone_headers,
+        )
+        assert r_switch.status_code == 200
+
+        # Before ACK, active queue is STILL single_track
+        assert music_queue_snapshot_manager.get_active_queue(dev_id).queue_id == single_qid
+
+        # 4. Car reports ACK applied
+        r_ack = client.post(
+            f"/api/v1/music/control/command/{switch_cmd_id}/ack",
+            json={"status": "applied"},
+            headers=car_headers,
+        )
+        assert r_ack.status_code == 200
+
+        # Now active queue has cleanly transitioned to favorite snapshot
+        active_after = music_queue_snapshot_manager.get_active_queue(dev_id)
+        assert active_after.queue_id == fav_qid
+        assert active_after.queue_version == fav_qver
+        assert active_after.source == "netease_favorite"
+
+        db_session.expire_all()
+        status_row = db_session.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == dev_id).first()
+        assert status_row.queue_id == fav_qid
+        assert status_row.queue_version == fav_qver
+        assert status_row.queue_source == "netease_favorite"
+        assert status_row.current_index == 4
+        assert status_row.applied_mode == "list_loop"
+
+
+def test_play_favorite_member_validation_and_permission_errors(client, phone_headers, admin_headers, db_session):
+    """
+    Requirement:
+    - 409 QUEUE_VERSION_CONFLICT: expired or invalid snapshot.
+    - 422 QUEUE_SOURCE_MISMATCH: snapshot is not netease_favorite.
+    - 404 TRACK_NOT_IN_QUEUE: requested track is not in snapshot.
+    - 422 QUEUE_INDEX_MISMATCH: queue_index does not point to target song or out of bounds.
+    - 403 OWNER_QUEUE_PERMISSION_DENIED: standard user role attempting favorite playback.
+    - All validation errors abort BEFORE command creation (0 commands created, active queue preserved).
+    """
+    dev_id = settings.DEFAULT_CAR_DEVICE_ID
+    music_queue_snapshot_manager.clear_all()
+
+    dummy_songs = _make_dummy_songs(5, start_id=7000)
+    fav_info = {"playlist_id": 998877, "name": "Validation Fav Playlist", "track_count": 5}
+
+    with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
+         patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": dummy_songs, "has_more": False}):
+
+        r_fav = client.get("/api/v1/music/queue", headers=phone_headers)
+        fav_qid = r_fav.json()["queue_id"]
+        fav_qver = r_fav.json()["queue_version"]
+
+        init_cmd_count = db_session.query(MusicCommand).count()
+
+        # 1. 409 QUEUE_VERSION_CONFLICT
+        r_ver_fail = client.post(
+            "/api/v1/music/control/command",
+            json={
+                "command_id": "cmd_err_ver",
+                "action": "play_track",
+                "params": {"source": "netease_favorite", "queue_id": fav_qid, "queue_version": 999999, "song_id": 7000},
+            },
+            headers=phone_headers,
+        )
+        assert r_ver_fail.status_code == 409
+        assert r_ver_fail.json()["detail"]["error_code"] == "QUEUE_VERSION_CONFLICT"
+        assert db_session.query(MusicCommand).count() == init_cmd_count
+
+        # 2. 422 QUEUE_SOURCE_MISMATCH (prepare single_track snapshot then point source=netease_favorite to it)
+        dummy_single = {"name": "Test Song", "artist": "Test Artist"}
+        with patch.object(netease_service, "get_song_detail", new_callable=AsyncMock, return_value=dummy_single):
+            r_single = client.post(
+                "/api/v1/music/control/command",
+                json={"command_id": "cmd_dummy_single", "action": "play_track", "params": {"source": "single_track", "song_id": 8888}},
+                headers=phone_headers,
+            )
+            single_qid = r_single.json()["params"]["queue_id"]
+            single_qver = r_single.json()["params"]["queue_version"]
+
+        r_src_fail = client.post(
+            "/api/v1/music/control/command",
+            json={
+                "command_id": "cmd_err_src",
+                "action": "play_track",
+                "params": {"source": "netease_favorite", "queue_id": single_qid, "queue_version": single_qver, "song_id": 8888},
+            },
+            headers=phone_headers,
+        )
+        assert r_src_fail.status_code == 422
+        assert r_src_fail.json()["detail"]["error_code"] == "QUEUE_SOURCE_MISMATCH"
+
+        # 3. 404 TRACK_NOT_IN_QUEUE
+        r_not_in = client.post(
+            "/api/v1/music/control/command",
+            json={
+                "command_id": "cmd_err_not_in",
+                "action": "play_track",
+                "params": {"source": "netease_favorite", "queue_id": fav_qid, "queue_version": fav_qver, "song_id": 999999},
+            },
+            headers=phone_headers,
+        )
+        assert r_not_in.status_code == 404
+        assert r_not_in.json()["detail"]["error_code"] == "TRACK_NOT_IN_QUEUE"
+
+        # 4. 422 QUEUE_INDEX_MISMATCH (song is 7000 at index 0, but queue_index=2 points to 7002)
+        r_idx_mismatch = client.post(
+            "/api/v1/music/control/command",
+            json={
+                "command_id": "cmd_err_idx",
+                "action": "play_track",
+                "params": {"source": "netease_favorite", "queue_id": fav_qid, "queue_version": fav_qver, "song_id": 7000, "queue_index": 2},
+            },
+            headers=phone_headers,
+        )
+        assert r_idx_mismatch.status_code == 422
+        assert r_idx_mismatch.json()["detail"]["error_code"] == "QUEUE_INDEX_MISMATCH"
+
+        # Out of bounds index
+        r_idx_oob = client.post(
+            "/api/v1/music/control/command",
+            json={
+                "command_id": "cmd_err_oob",
+                "action": "play_track",
+                "params": {"source": "netease_favorite", "queue_id": fav_qid, "queue_version": fav_qver, "song_id": 7000, "queue_index": 99},
+            },
+            headers=phone_headers,
+        )
+        assert r_idx_oob.status_code == 422
+        assert r_idx_oob.json()["detail"]["error_code"] == "QUEUE_INDEX_MISMATCH"
+
+        # 5. 403 OWNER_QUEUE_PERMISSION_DENIED
+        reg_user = {"username": "fav_gate_user", "password": "gate_password_123"}
+        r_u_reg = client.post("/api/v1/auth/register", json=reg_user)
+        u_id = r_u_reg.json()["id"]
+        # Grant vehicle device control
+        client.post(
+            f"/api/v1/auth/users/{u_id}/device-binding",
+            json={"device_id": dev_id, "can_control": True},
+            headers=admin_headers,
+        )
+        r_u_login = client.post("/api/v1/auth/login", json=reg_user)
+        user_headers = {"Authorization": f"Bearer {r_u_login.json()['session_id']}"}
+
+        r_owner_gate = client.post(
+            "/api/v1/music/control/command",
+            json={
+                "command_id": "cmd_err_gate",
+                "action": "play_track",
+                "params": {"source": "netease_favorite", "queue_id": fav_qid, "queue_version": fav_qver, "song_id": 7000},
+            },
+            headers=user_headers,
+        )
+        assert r_owner_gate.status_code == 403
+        assert r_owner_gate.json()["detail"]["error_code"] == "OWNER_QUEUE_PERMISSION_DENIED"
+
+
+def test_play_favorite_member_idempotency_and_ws_parity(client, phone_headers, db_session):
+    """
+    Requirement:
+    - Idempotency: exact same command_id and payload returns 200 with original command.
+      Re-dispatching same command_id with altered parameters returns 409 COMMAND_CONFLICT.
+    - WebSocket Parity:
+      - Valid favorite member play_track over WebSocket receives dispatched ACK with full metadata.
+      - Invalid favorite member play_track over WebSocket receives error ACK with code 404 TRACK_NOT_IN_QUEUE.
+    """
+    dev_id = settings.DEFAULT_CAR_DEVICE_ID
+    music_queue_snapshot_manager.clear_all()
+
+    dummy_songs = _make_dummy_songs(5, start_id=8000)
+    fav_info = {"playlist_id": 554433, "name": "Idem WS Playlist", "track_count": 5}
+
+    with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
+         patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": dummy_songs, "has_more": False}):
+
+        r_fav = client.get("/api/v1/music/queue", headers=phone_headers)
+        fav_qid = r_fav.json()["queue_id"]
+        fav_qver = r_fav.json()["queue_version"]
+
+        # 1. Idempotency test
+        idem_payload = {
+            "command_id": "cmd_idem_fav_01",
+            "action": "play_track",
+            "params": {
+                "source": "netease_favorite",
+                "queue_id": fav_qid,
+                "queue_version": fav_qver,
+                "song_id": 8001,
+                "queue_index": 1,
+            },
+        }
+        res1 = client.post("/api/v1/music/control/command", json=idem_payload, headers=phone_headers)
+        assert res1.status_code == 200
+        cmd1 = res1.json()
+
+        # Repeat identical request
+        res2 = client.post("/api/v1/music/control/command", json=idem_payload, headers=phone_headers)
+        assert res2.status_code == 200
+        cmd2 = res2.json()
+        assert cmd1["command_id"] == cmd2["command_id"]
+        assert cmd1["queued_at"] == cmd2["queued_at"]
+
+        # Conflicting request with same command_id but different song_id
+        conflict_payload = {
+            "command_id": "cmd_idem_fav_01",
+            "action": "play_track",
+            "params": {
+                "source": "netease_favorite",
+                "queue_id": fav_qid,
+                "queue_version": fav_qver,
+                "song_id": 8002,
+                "queue_index": 2,
+            },
+        }
+        res_conflict = client.post("/api/v1/music/control/command", json=conflict_payload, headers=phone_headers)
+        assert res_conflict.status_code == 409
+        assert res_conflict.json()["detail"]["error_code"] == "COMMAND_CONFLICT"
+
+        # 2. WebSocket Parity test
+        with client.websocket_connect(f"/api/v1/ws/music?token={settings.PHONE_TOKEN}&client_type=phone&device_id={dev_id}") as ws:
+            init_msg = ws.receive_json()
+            assert init_msg["type"] == "status_snapshot"
+
+            # A. Invalid track -> 404 TRACK_NOT_IN_QUEUE
+            ws.send_json({
+                "type": "command",
+                "data": {
+                    "command_id": "ws_cmd_fav_not_found",
+                    "action": "play_track",
+                    "params": {
+                        "source": "netease_favorite",
+                        "queue_id": fav_qid,
+                        "queue_version": fav_qver,
+                        "song_id": 999999,
+                    },
+                },
+            })
+            ack_err = ws.receive_json()
+            assert ack_err["type"] == "command_ack"
+            assert ack_err["status"] == "error"
+            assert ack_err["code"] == 404
+            assert ack_err["error"]["error_code"] == "TRACK_NOT_IN_QUEUE"
+
+            # B. Valid favorite member -> 200 dispatched
+            ws.send_json({
+                "type": "command",
+                "data": {
+                    "command_id": "ws_cmd_fav_valid",
+                    "action": "play_track",
+                    "params": {
+                        "source": "netease_favorite",
+                        "queue_id": fav_qid,
+                        "queue_version": fav_qver,
+                        "song_id": 8003,
+                        "queue_index": 3,
+                    },
+                },
+            })
+            ack_ok = ws.receive_json()
+            assert ack_ok["type"] == "command_ack"
+            assert ack_ok["status"] == "dispatched"
+            assert ack_ok["command_id"] == "ws_cmd_fav_valid"
+
+            db_session.expire_all()
+            ws_cmd = db_session.query(MusicCommand).filter(MusicCommand.command_id == "ws_cmd_fav_valid").first()
+            assert ws_cmd is not None
+            cmd_params = json.loads(ws_cmd.params_json)
+            assert cmd_params["source"] == "netease_favorite"
+            assert cmd_params["queue_id"] == fav_qid
+            assert cmd_params["queue_version"] == fav_qver
+            assert cmd_params["queue_index"] == 3
+            assert cmd_params["track_id"] == "netease_8003"
+            assert cmd_params["stream_url"] == "/api/v1/music/netease/stream/8003"
