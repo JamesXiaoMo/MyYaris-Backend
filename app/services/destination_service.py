@@ -237,17 +237,18 @@ async def create_destination_request(
                     parse_request.status = "needs_clarification"
                     parse_request.clarification_question = result.question
                 else:
-                    task = await create_task_for_place(
-                        db=db,
-                        device_id=target_device,
-                        title=cand.title,
-                        address=cand.address,
-                        latitude=cand.latitude,
-                        longitude=cand.longitude,
-                        coord_system="wgs84",
-                        request_id=request_id,
-                    )
-                    parse_request.task_id = task.task_id
+                    if req.auto_create_task:
+                        task = await create_task_for_place(
+                            db=db,
+                            device_id=target_device,
+                            title=cand.title,
+                            address=cand.address,
+                            latitude=cand.latitude,
+                            longitude=cand.longitude,
+                            coord_system="wgs84",
+                            request_id=request_id,
+                        )
+                        parse_request.task_id = task.task_id
                     parse_request.status = "resolved"
             db.commit()
             db.refresh(parse_request)
@@ -283,18 +284,19 @@ async def create_destination_request(
         )
         db.add(cand)
 
-        # Explicit coordinates directly create task
-        task = await create_task_for_place(
-            db=db,
-            device_id=target_device,
-            title=cand.title,
-            address=cand.address,
-            latitude=cand.latitude,
-            longitude=cand.longitude,
-            coord_system=cand.coord_system,
-            request_id=request_id,
-        )
-        parse_request.task_id = task.task_id
+        # Explicit coordinates directly create task only if auto_create_task is True
+        if req.auto_create_task:
+            task = await create_task_for_place(
+                db=db,
+                device_id=target_device,
+                title=cand.title,
+                address=cand.address,
+                latitude=cand.latitude,
+                longitude=cand.longitude,
+                coord_system=cand.coord_system,
+                request_id=request_id,
+            )
+            parse_request.task_id = task.task_id
         parse_request.status = "resolved"
         db.commit()
         db.refresh(parse_request)
@@ -323,12 +325,13 @@ async def create_destination_request(
                 parse_request.status = "needs_clarification"
                 parse_request.clarification_question = result.question
             else:
-                task = await create_task_for_place(
-                    db=db, device_id=target_device, title=cand.title,
-                    address=cand.address, latitude=cand.latitude,
-                    longitude=cand.longitude, coord_system="wgs84", request_id=request_id,
-                )
-                parse_request.task_id = task.task_id
+                if req.auto_create_task:
+                    task = await create_task_for_place(
+                        db=db, device_id=target_device, title=cand.title,
+                        address=cand.address, latitude=cand.latitude,
+                        longitude=cand.longitude, coord_system="wgs84", request_id=request_id,
+                    )
+                    parse_request.task_id = task.task_id
                 parse_request.status = "resolved"
         db.commit()
         db.refresh(parse_request)

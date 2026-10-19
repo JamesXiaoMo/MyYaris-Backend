@@ -82,12 +82,15 @@ async def confirm_destination(
 from typing import Optional
 from pydantic import BaseModel, Field
 
+from app.schemas.common import Coordinate
+
 api_v1_router = APIRouter(prefix="/api/v1", tags=["Navigation V1 Standard"])
 
 
 class DestinationResolveRequest(BaseModel):
     raw_input: str
     source: Optional[str] = "ios_share"
+    reference_coordinate: Optional[Coordinate] = None
 
 
 class DestinationResolveResponse(BaseModel):
@@ -97,6 +100,10 @@ class DestinationResolveResponse(BaseModel):
     latitude: float
     longitude: float
     confidence: float = 1.0
+    status: Optional[str] = "resolved"
+    message: Optional[str] = None
+    clarification_question: Optional[str] = None
+    needs_confirmation: bool = False
 
 
 class TaskDestinationRequest(BaseModel):
@@ -111,38 +118,48 @@ async def resolve_destination_v1(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_phone_or_admin),
 ):
-    if body.raw_input.startswith("http://") or body.raw_input.startswith("https://"):
+    raw_text = (body.raw_input or "").strip()
+    if raw_text.startswith("http://") or raw_text.startswith("https://"):
         create_req = DestinationCreateRequest(
             input_type=DestinationInputType.SHARE_LINK,
-            url=body.raw_input,
+            url=raw_text,
+            reference_coordinate=body.reference_coordinate,
             auto_create_task=False,
         )
     else:
         create_req = DestinationCreateRequest(
             input_type=DestinationInputType.AUTO,
-            text=body.raw_input,
+            text=raw_text,
+            reference_coordinate=body.reference_coordinate,
             auto_create_task=False,
         )
     query_resp = await create_destination_request(db, create_req, caller_id=user.identity)
 
     if query_resp.candidates:
         c = query_resp.candidates[0]
+        is_clarify = (query_resp.status == "needs_clarification")
         return DestinationResolveResponse(
             code=200,
             destination_id=query_resp.request_id,
             name=c.title,
             latitude=c.latitude,
             longitude=c.longitude,
-            confidence=0.98,
+            confidence=0.98 if not is_clarify else 0.85,
+            status=query_resp.status,
+            message=query_resp.message,
+            clarification_question=query_resp.clarification_question,
+            needs_confirmation=is_clarify,
         )
     else:
-        return DestinationResolveResponse(
-            code=200,
-            destination_id=query_resp.request_id,
-            name=body.raw_input,
-            latitude=0.0,
-            longitude=0.0,
-            confidence=0.5,
+        # Never fill (0.0, 0.0) as default/missing coordinates.
+        error_detail = (
+            query_resp.clarification_question
+            or query_resp.error_message
+            or f"无法识别或解析目的地: {body.raw_input}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=error_detail,
         )
 
 

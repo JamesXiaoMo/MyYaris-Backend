@@ -145,13 +145,32 @@ def test_delete_favorite(client: TestClient, phone_headers: dict):
 
 
 def test_coordinate_and_address_validation_strict(client: TestClient, phone_headers: dict):
-    # 1. Empty address
+    # 1. Empty address accepted and normalized to ""
     r1 = client.post("/api/v1/favorites", json={"address": "", "latitude": 39.9, "longitude": 116.4}, headers=phone_headers)
-    assert r1.status_code == 422
+    assert r1.status_code == 201
+    assert r1.json()["address"] == ""
 
-    # 2. Whitespace-only address
+    # 2. Whitespace-only address normalized to ""
     r2 = client.post("/api/v1/favorites", json={"address": "   \n\t  ", "latitude": 39.9, "longitude": 116.4}, headers=phone_headers)
-    assert r2.status_code == 422
+    assert r2.status_code == 201
+    assert r2.json()["address"] == ""
+
+    # 2b. Address omitted or null normalizes to ""
+    r2b = client.post("/api/v1/favorites", json={"latitude": 39.9, "longitude": 116.4}, headers=phone_headers)
+    assert r2b.status_code == 201
+    assert r2b.json()["address"] == ""
+    assert r2b.json()["name"] is None
+
+    r2c = client.post("/api/v1/favorites", json={"address": None, "name": "   ", "latitude": 39.9, "longitude": 116.4}, headers=phone_headers)
+    assert r2c.status_code == 201
+    assert r2c.json()["address"] == ""
+    assert r2c.json()["name"] is None
+
+    # 2d. Invalid address types or length > 512 strictly rejected (422)
+    r_bad_type = client.post("/api/v1/favorites", json={"address": 12345, "latitude": 39.9, "longitude": 116.4}, headers=phone_headers)
+    assert r_bad_type.status_code == 422
+    r_too_long = client.post("/api/v1/favorites", json={"address": "A" * 513, "latitude": 39.9, "longitude": 116.4}, headers=phone_headers)
+    assert r_too_long.status_code == 422
 
     # 3. Latitude out of range (> 90.0 or < -90.0)
     r3 = client.post("/api/v1/favorites", json={"address": "地址", "latitude": 90.1, "longitude": 116.4}, headers=phone_headers)
@@ -707,5 +726,86 @@ def test_pagination_tiebreaker_conflicting_filters_and_repeated_delete(
         headers=phone_headers,
     ).json()
     assert patch_sentinel["folder_id"] is None
+
+
+def test_optional_address_crud_and_no_task_dispatch(client: TestClient, phone_headers: dict):
+    # 1. Verify initial tasks count
+    tasks_before = client.get("/tasks", headers=phone_headers).json()
+    count_before = len(tasks_before) if isinstance(tasks_before, list) else 0
+
+    # 2. Create with omitted address
+    r1 = client.post(
+        "/api/v1/favorites",
+        json={"name": "无地址点", "latitude": 34.123, "longitude": 133.456},
+        headers=phone_headers,
+    )
+    assert r1.status_code == 201
+    fav1 = r1.json()
+    assert fav1["address"] == ""
+    assert fav1["name"] == "无地址点"
+
+    # 3. Create with explicit null address and empty name
+    r2 = client.post(
+        "/api/v1/favorites",
+        json={"name": "   ", "address": None, "latitude": 35.0, "longitude": 135.0},
+        headers=phone_headers,
+    )
+    assert r2.status_code == 201
+    fav2 = r2.json()
+    assert fav2["name"] is None
+    assert fav2["address"] == ""
+
+    # 4. Create with address and verify PATCH semantics
+    r3 = client.post(
+        "/api/v1/favorites",
+        json={"name": "待修改地址点", "address": "原始详细地址", "latitude": 35.1, "longitude": 135.1},
+        headers=phone_headers,
+    )
+    assert r3.status_code == 201
+    fav3_id = r3.json()["id"]
+    assert r3.json()["address"] == "原始详细地址"
+
+    # 4a. PATCH without address field keeps existing address
+    p_keep = client.patch(
+        f"/api/v1/favorites/{fav3_id}",
+        json={"name": "新名称"},
+        headers=phone_headers,
+    )
+    assert p_keep.status_code == 200
+    assert p_keep.json()["name"] == "新名称"
+    assert p_keep.json()["address"] == "原始详细地址"
+
+    # 4b. PATCH with whitespace address clears to ""
+    p_clear_ws = client.patch(
+        f"/api/v1/favorites/{fav3_id}",
+        json={"address": "   \t  "},
+        headers=phone_headers,
+    )
+    assert p_clear_ws.status_code == 200
+    assert p_clear_ws.json()["address"] == ""
+
+    # 4c. PATCH with null address clears to ""
+    p_clear_null = client.patch(
+        f"/api/v1/favorites/{fav3_id}",
+        json={"address": None},
+        headers=phone_headers,
+    )
+    assert p_clear_null.status_code == 200
+    assert p_clear_null.json()["address"] == ""
+
+    # 5. Search favorites
+    search_resp = client.get("/api/v1/favorites?query=无地址点", headers=phone_headers)
+    assert search_resp.status_code == 200
+    search_data = search_resp.json()
+    items = search_data.get("items", search_data)
+    matching = [x for x in items if x["id"] == fav1["id"]]
+    assert len(matching) == 1
+    assert matching[0]["address"] == ""
+
+    # 6. Verify zero task side effects
+    tasks_after = client.get("/tasks", headers=phone_headers).json()
+    count_after = len(tasks_after) if isinstance(tasks_after, list) else 0
+    assert count_after == count_before
+
 
 

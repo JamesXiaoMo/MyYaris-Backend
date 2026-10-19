@@ -79,6 +79,63 @@ def test_resolve_share_link_no_eager_task(client: TestClient, phone_headers: dic
     assert query_resp.json()["task_id"] is None
 
 
+def test_resolve_plus_code_flows_and_protections(client: TestClient, phone_headers: dict):
+    from openlocationcode import openlocationcode as olc
+
+    full_code = olc.encode(35.681234, 139.767123)
+    area = olc.decode(full_code)
+
+    # 1. Full Plus Code resolves offline without eager task
+    r_full = client.post(
+        "/api/v1/destinations/resolve",
+        json={"raw_input": full_code, "source": "ios_share"},
+        headers=phone_headers,
+    )
+    assert r_full.status_code == 200
+    data_full = r_full.json()
+    assert abs(data_full["latitude"] - area.latitudeCenter) < 1e-4
+    assert abs(data_full["longitude"] - area.longitudeCenter) < 1e-4
+    assert data_full["status"] == "resolved"
+    # Verify no task created
+    q_full = client.get(f"/destinations/{data_full['destination_id']}", headers=phone_headers)
+    assert q_full.json()["task_id"] is None
+
+    # 2. Short Plus Code with reference_coordinate resolves correctly
+    short_code = olc.shorten(full_code, 35.68, 139.77)
+    r_short_ref = client.post(
+        "/api/v1/destinations/resolve",
+        json={
+            "raw_input": short_code,
+            "source": "ios_share",
+            "reference_coordinate": {"latitude": 35.68, "longitude": 139.77},
+        },
+        headers=phone_headers,
+    )
+    assert r_short_ref.status_code == 200
+    data_short = r_short_ref.json()
+    assert abs(data_short["latitude"] - area.latitudeCenter) < 1e-4
+    assert abs(data_short["longitude"] - area.longitudeCenter) < 1e-4
+
+    # 3. Short Plus Code without reference_coordinate cannot be resolved: 422 rejected, never dummy (0,0)
+    r_short_noref = client.post(
+        "/api/v1/destinations/resolve",
+        json={"raw_input": short_code, "source": "ios_share"},
+        headers=phone_headers,
+    )
+    assert r_short_noref.status_code == 422
+    assert "短 Plus Code" in r_short_noref.json()["detail"]
+
+    # 4. Explicit (0.0, 0.0) coordinates are legitimate and accepted
+    r_zero = client.post(
+        "/api/v1/destinations/resolve",
+        json={"raw_input": "0.0, 0.0", "source": "ios_share"},
+        headers=phone_headers,
+    )
+    assert r_zero.status_code == 200
+    assert r_zero.json()["latitude"] == 0.0
+    assert r_zero.json()["longitude"] == 0.0
+
+
 def test_legacy_destinations_still_auto_creates_task(client: TestClient, phone_headers: dict):
     # Legacy POST /destinations (used by Siri Shortcuts) must still auto-create task
     resp = client.post(

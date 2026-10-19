@@ -87,11 +87,15 @@
 - **请求体**：
   ```json
   {
-    "raw_input": "35.6812, 139.7671",  // 支持: 纯坐标、Google Maps 分享短链、地名关键词
-    "source": "ios_share"              // "ios_share" | "car_ui" | "voice"
+    "raw_input": "8Q7XMPR3+PP",        // 支持: 纯坐标、Google Maps 分享短链、Plus Code、地名关键词
+    "source": "ios_share",              // "ios_share" | "car_ui" | "voice"
+    "reference_coordinate": {          // 可选，辅助解析短 Plus Code（如 "MPR3+PP"）避免歧义
+      "latitude": 35.6812,
+      "longitude": 139.7671
+    }
   }
   ```
-- **核心逻辑**：纯坐标与有效地图图钉直接解析为 WGS84 经纬度；**此步骤绝对不创建任务（No Eager Task Creation）**。
+- **核心逻辑**：纯坐标、Plus Code 与有效地图图钉直接解析为 WGS84 经纬度；**此步骤绝对不创建任务（No Eager Task Creation，auto_create_task=False 严格生效）**。短 Plus Code 缺参考坐标时抛出 422 异常，杜绝 `(0.0, 0.0)` 伪装。
 - **响应示例 (200 OK)**：
   ```json
   {
@@ -100,7 +104,11 @@
     "name": "秋叶原电车站",
     "latitude": 35.698383,
     "longitude": 139.773072,
-    "confidence": 0.98
+    "confidence": 0.98,
+    "status": "resolved",
+    "message": null,
+    "clarification_question": null,
+    "needs_confirmation": false
   }
   ```
 
@@ -350,10 +358,10 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   - `folder_id=fld_xxx`：仅返回指定文件夹下的收藏；
   - `uncategorized=true` 或 `folder_id=uncategorized`：仅返回未分类（`folder_id IS NULL`）收藏；
 - **新建收藏**：`POST /api/v1/favorites`
-  - Body：`{"name": "公司", "address": "详细地址", "latitude": 39.9567, "longitude": 116.3212, "coord_system": "wgs84", "folder_id": "fld_xxx"}`（`folder_id` 可选）
+  - Body：`{"name": "公司", "address": "详细地址", "latitude": 39.9567, "longitude": 116.3212, "coord_system": "wgs84", "folder_id": "fld_xxx"}`（`address` 可选，缺省/null/空白默认转为 `""`；`name` 与 `address` 均可为空；`folder_id` 可选）
   - 返回：`201 Created`
 - **详情查询**：`GET /api/v1/favorites/{favorite_id}`
-- **修改编辑与移动归类**：`PATCH /api/v1/favorites/{favorite_id}`（同时支持 `PUT`；不传 `folder_id` 保持原归属，传 `"fld_xxx"` 移动至目标文件夹，传 `null` 或 `""` 移回未分类）
+- **修改编辑与移动归类**：`PATCH /api/v1/favorites/{favorite_id}`（同时支持 `PUT`；不传 `address` 保持原值，传 `""`/`null`/空白清除为空串；不传 `folder_id` 保持原归属，传 `"fld_xxx"` 移动至目标文件夹，传 `null` 或 `""` 移回未分类）
 - **删除项**：`DELETE /api/v1/favorites/{favorite_id}`
 
 

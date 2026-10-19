@@ -42,7 +42,7 @@ class FavoriteFolderListResponse(BaseModel):
 
 class FavoriteBase(BaseModel):
     name: Optional[str] = Field(None, max_length=128, description="Optional custom name or label")
-    address: str = Field(..., max_length=512, description="Address text")
+    address: Optional[str] = Field(default="", max_length=512, description="Optional address text (defaults to empty string)")
     latitude: float = Field(..., description="Latitude [-90.0, 90.0]")
     longitude: float = Field(..., description="Longitude [-180.0, 180.0]")
     coord_system: Optional[str] = Field("wgs84", max_length=32, description="Coordinate system")
@@ -56,19 +56,28 @@ class FavoriteBase(BaseModel):
         stripped = v.strip()
         return stripped if stripped else None
 
-    @field_validator("address")
+    @field_validator("address", mode="before")
     @classmethod
-    def validate_address(cls, v: str) -> str:
-        if not isinstance(v, str) or not v.strip():
-            raise ValueError("Address cannot be empty or whitespace only.")
-        return v.strip()
+    def validate_address(cls, v: Optional[str]) -> str:
+        if v is None:
+            return ""
+        if not isinstance(v, str):
+            raise ValueError("Address must be a string or null.")
+        stripped = v.strip()
+        if len(stripped) > 512:
+            raise ValueError("Address must be at most 512 characters.")
+        return stripped
 
-    @field_validator("name")
+    @field_validator("name", mode="before")
     @classmethod
     def validate_name(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return None
+        if not isinstance(v, str):
+            raise ValueError("Name must be a string or null.")
         stripped = v.strip()
+        if len(stripped) > 128:
+            raise ValueError("Name must be at most 128 characters.")
         return stripped if stripped else None
 
     @field_validator("latitude")
@@ -120,21 +129,28 @@ class FavoriteUpdateRequest(BaseModel):
         stripped = v.strip()
         return stripped if stripped else None
 
-    @field_validator("address")
+    @field_validator("address", mode="before")
     @classmethod
     def validate_address(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
-            return None
-        if not isinstance(v, str) or not v.strip():
-            raise ValueError("Address cannot be empty or whitespace only.")
-        return v.strip()
+            return ""
+        if not isinstance(v, str):
+            raise ValueError("Address must be a string or null.")
+        stripped = v.strip()
+        if len(stripped) > 512:
+            raise ValueError("Address must be at most 512 characters.")
+        return stripped
 
-    @field_validator("name")
+    @field_validator("name", mode="before")
     @classmethod
     def validate_name(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return None
+        if not isinstance(v, str):
+            raise ValueError("Name must be a string or null.")
         stripped = v.strip()
+        if len(stripped) > 128:
+            raise ValueError("Name must be at most 128 characters.")
         return stripped if stripped else None
 
     @field_validator("latitude")

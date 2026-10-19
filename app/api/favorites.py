@@ -104,7 +104,7 @@ def _to_favorite_response(row: Favorite) -> FavoriteResponse:
         folder_id=folder_id,
         folder_name=folder_name,
         name=row.name,
-        address=row.address,
+        address=row.address or "",
         latitude=row.latitude,
         longitude=row.longitude,
         coord_system=row.coord_system,
@@ -493,8 +493,8 @@ def update_favorite(
 
     if "name" in update_data:
         row.name = fav_in.name
-    if "address" in update_data and fav_in.address is not None:
-        row.address = fav_in.address
+    if "address" in update_data:
+        row.address = fav_in.address if fav_in.address is not None else ""
     if "latitude" in update_data and fav_in.latitude is not None:
         row.latitude = fav_in.latitude
     if "longitude" in update_data and fav_in.longitude is not None:
