@@ -215,10 +215,19 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   - `seek`（进度跳转，`position_ms`，TTL 默认 20s）
   - `set_volume`（软件音量 `volume: 0.0~1.0`，TTL 默认 20s）
   - `set_loop`（兼容映射）、`set_shuffle`（兼容映射）
-- **幂等与冲突规则**：
-  - 相同 `command_id` + 相同 payload -> 返回 200 OK 既有记录（不重发）；
-  - 相同 `command_id` + 不同 payload 或不同设备 -> 返回 **409 Conflict** (`COMMAND_CONFLICT`)；
-  - 携带 `expected_queue_id` 或 `expected_queue_version` 时与服务端当前不符 -> 返回 **409 Conflict** (`QUEUE_PRECONDITION_FAILED`)。
+- **Seek 进度参数归一化与严格校验**：
+  - 统一支持 `seek_position_ms`、`seek_ms`、`position_ms`；
+  - 若同时传入不同数值导致冲突 -> 返回 **HTTP 422 Unprocessable Entity** (`SEEK_PARAMETER_CONFLICT`)；
+  - 若 `action == "seek"` 且所有 seek 参数均为空 -> 返回 **HTTP 422** (`SEEK_PARAMETER_REQUIRED`)；
+  - 若传入负数 -> 返回 **HTTP 422** (`INVALID_SEEK_POSITION`)；
+  - 校验通过后统一归一化为 `seek_position_ms`，同时兼容填充 `seek_ms` 与 `position_ms`。
+- **单指令原子状态机流转 (Atomic Single-Command Protocol)**：
+  - 手机发送 `play_track` / `set_playback_mode` / `switch_queue` / `resume` 时，服务端内存准备队列快照并在指令参数中注入 `queue_id`、`queue_version`，同时仅更新数据库中的期望模式 `requested_mode`；
+  - **绝不立即更新 `applied_mode` 与 `queue_source`**；只有在车机端真正执行成功并通过 `/ack` 或 `/status` 上报 `status == "applied"` 时，数据库中的 `applied_mode` 与 `queue_source` 方正式提交生效；执行失败则保持既有模式。
+- **幂等性与冲突规则**：
+  - **幂等校验优先原则**：相同 `command_id` 重放时，优先进行入参比对与设备匹配。比对时自动忽略服务端注入生成的队列元数据（`queue_id`, `queue_version`, `source` 等）；匹配成功直接返回 HTTP 200 既有记录，不受车机动态能力掉落或队列版本变更干扰；
+  - 相同 `command_id` + 不同 payload 或不同设备 -> 返回 **HTTP 409 Conflict** (`COMMAND_CONFLICT`)；
+  - 携带 `expected_queue_id` 或 `expected_queue_version` 前置断言与服务端当前不符时 -> 返回 **HTTP 409 Conflict** (`QUEUE_PRECONDITION_FAILED`)。
 
 ### 5.3 车机长轮询备用拉取 (`/api/v1/music/control/command/next`)
 - **方法 & 路径**：`GET /api/v1/music/control/command/next`
@@ -374,10 +383,18 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   - **零副作用保障**：纯只读拉取，不触发点赞/取消红心，不派发播控或导航指令，不改变全局账号授权数据，不自动预探测、预下载或预缓存全量 700+ 音频；
 - `GET /api/v1/music/netease/song_url?song_id=...`：解析音频直链
 - `GET /api/v1/music/netease/lyric?song_id=...`：获取逐字歌词
+- `GET /api/v1/music/queue`：获取全量播放队列不可变快照分页音轨元数据
+  - **权限约束**：严格要求 **Owner 或绑定车机**（`require_owner_or_car`）。Admin 或过渡期 Legacy Phone Token 可访问；车机硬件（`role == "car"`）仅可访问与自身绑定设备完全一致的队列；普通注册用户（`role == "user"`，即使具备车辆硬件控制权限 `has_device_control == True`）**一律返回 HTTP 403 Forbidden**，防止泄露车主私密收藏；未鉴权返回 HTTP 401；
+  - **纯读幂等无副作用**：Query 传入 `?source=...` 仅作为条件过滤查询，绝对不激活或更改服务端当前播放队列；
+  - **不可变快照分页规则**：首页（`offset=0`）返回最新快照及确定的 `queue_id`、`queue_version`；后续分页（`offset>0`）必须带上此版本号，若发生版本变更直接返回 **HTTP 409 Conflict** (`QUEUE_VERSION_CONFLICT`)，由客户端丢弃脏分页并从第 0 页重新拉取；
+  - **全局单调版本**：`queue_version` 采用高精度毫秒单调递增水位，在服务重启或内存清空后依然单调递增，永不碰撞；
+  - **全量歌单覆盖**：`netease_favorite` 在初始化时完整遍历 `has_more` 自动完成多页拉取与去重，杜绝截断前 100 首；若歌单为空返回 **HTTP 409 Conflict** (`EMPTY_PLAYLIST`)。
 - `POST /api/v1/music/netease/intelligence`：基于目标歌曲生成心动智能推荐队列
+  - **权限与安全约束**：同样严格要求 `require_owner_or_car`（普通注册用户无论有无设备控制权均拒绝 403；车机硬件仅限自身设备）；开启严密的 CSRF 双重 Cookie 校验；
   - **请求体 (`NeteaseIntelligenceRequest`)**：`{"request_id": "...", "seed_song_id": 1901371647, "playlist_id": 987654321, "batch_index": 0, "count": 30}`
   - **首批种子资格校验 (`batch_index == 0`)**：`seed_song_id` 必须属于当前 Owner 已验证的喜欢歌单，否则返回 **HTTP 422 Unprocessable Entity** (`INVALID_SEED_SONG`)；
   - **动态续批与幂等防重 (`batch_index > 0`)**：续批种子必须为前序批次末尾歌曲或当前播放曲目，携带 `request_id` 幂等去重；单次心动会话续批上限 5 次（总曲目 150 首）；
+  - **不可变快照追加**：续批时对既有音轨浅拷贝后追加新音轨并递增生成新 `QueueSnapshot`，历史版本快照在内存中完全保持只读不变；
   - **真实心动模式保障**：必须来自上游 `/playmode/intelligence/list` 真实推荐流；
   - **严禁伪装**：上游未登录/凭证失效返回 **HTTP 409 Conflict** (`INTELLIGENCE_AUTH_INVALID`)，上游服务异常返回 **HTTP 502 Bad Gateway** (`INTELLIGENCE_UPSTREAM_FAILED`)；曲目耗尽且续批失败返回 **HTTP 503** (`INTELLIGENCE_QUEUE_EXHAUSTED`)；断然禁止使用 `simi_fallback` 相似曲或空列表假冒成功；
   - **无害容错**：失败时车机保留原播放状态与原队列，绝不中断当前音频，绝不自动重新登录，绝不调用 `like/unlike` 接口。

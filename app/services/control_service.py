@@ -427,6 +427,9 @@ class QueueSnapshot:
         self.updated_at = utc_now()
 
 
+_GLOBAL_VERSION_WATERMARK = 0
+
+
 class MusicQueueSnapshotManager:
     """
     Manages in-memory versioned immutable queue snapshots per vehicle device.
@@ -437,7 +440,8 @@ class MusicQueueSnapshotManager:
     def __init__(self):
         self._active_queues: Dict[str, QueueSnapshot] = {}
         self._snapshots: Dict[Tuple[str, str, int], QueueSnapshot] = {}
-        self._replenish_cache: Dict[str, QueueSnapshot] = {}
+        self._replenish_cache: Dict[Tuple[str, str], QueueSnapshot] = {}
+        self._last_version: Dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     def clear_all(self):
@@ -445,7 +449,25 @@ class MusicQueueSnapshotManager:
         self._active_queues.clear()
         self._snapshots.clear()
         self._replenish_cache.clear()
+        self._last_version.clear()
         logger.info("Cleared all music queue snapshots and caches.")
+
+    def get_next_queue_version(self, device_id: str) -> int:
+        global _GLOBAL_VERSION_WATERMARK
+        norm_dev = resolve_car_device_id(device_id)
+        current = max(self._last_version.get(norm_dev, 0), _GLOBAL_VERSION_WATERMARK)
+        base_time = int(time.time() * 1000)
+        nxt = max(current + 1, base_time)
+        self._last_version[norm_dev] = nxt
+        _GLOBAL_VERSION_WATERMARK = nxt
+        return nxt
+
+    def sync_device_queue_version(self, device_id: str, version: int):
+        global _GLOBAL_VERSION_WATERMARK
+        if version and version > 0:
+            norm_dev = resolve_car_device_id(device_id)
+            self._last_version[norm_dev] = max(self._last_version.get(norm_dev, 0), version)
+            _GLOBAL_VERSION_WATERMARK = max(_GLOBAL_VERSION_WATERMARK, version)
 
     def get_active_queue(self, device_id: str) -> Optional[QueueSnapshot]:
         norm_dev = resolve_car_device_id(device_id)
@@ -455,10 +477,12 @@ class MusicQueueSnapshotManager:
         norm_dev = resolve_car_device_id(device_id)
         self._active_queues[norm_dev] = snapshot
         self._snapshots[(norm_dev, snapshot.queue_id, snapshot.queue_version)] = snapshot
+        self.sync_device_queue_version(norm_dev, snapshot.queue_version)
 
     async def init_favorite_queue(self, device_id: str, force_refresh: bool = False) -> QueueSnapshot:
         """
         Initializes or refreshes the full favorite playlist queue for device_id.
+        Paginates exhaustively until all tracks are loaded, deduplicates, and guards queue readiness.
         """
         norm_dev = resolve_car_device_id(device_id)
         fav_info = await netease_service.get_favorite_playlist_info(force_refresh=force_refresh)
@@ -476,12 +500,43 @@ class MusicQueueSnapshotManager:
                 },
             )
 
-        # Pull tracks for favorite playlist
-        tracks_data = await netease_service.get_favorite_playlist_tracks(offset=0, limit=min(1000, max(100, track_count)))
-        songs = tracks_data.get("songs", [])
+        # Full pagination loop with deduplication
+        all_songs = []
+        seen_ids = set()
+        curr_offset = 0
+        page_limit = 100
+        has_more = True
+        while has_more:
+            tracks_data = await netease_service.get_favorite_playlist_tracks(offset=curr_offset, limit=page_limit)
+            page_songs = tracks_data.get("songs", [])
+            if not page_songs:
+                break
+            for s in page_songs:
+                s_id = s["id"]
+                if s_id not in seen_ids:
+                    seen_ids.add(s_id)
+                    all_songs.append(s)
+            has_more = tracks_data.get("has_more", False)
+            curr_offset += len(page_songs)
+            if len(all_songs) >= track_count:
+                break
+
+        if len(all_songs) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "EMPTY_PLAYLIST",
+                    "error_detail": "No tracks could be retrieved for favorite playlist",
+                    "message": "喜欢歌单曲目为空",
+                },
+            )
+
+        is_complete = (len(all_songs) >= track_count)
+        queue_state = "ready" if is_complete else "partial"
 
         formatted_tracks = []
-        for idx, s in enumerate(songs):
+        for idx, s in enumerate(all_songs):
             s_id = s["id"]
             formatted_tracks.append({
                 "track_id": f"netease_{s_id}",
@@ -500,7 +555,7 @@ class MusicQueueSnapshotManager:
         owner_uid = fav_info.get("user_id") or "owner"
         opaque_hash = hashlib.sha256(f"{owner_uid}:{pid}".encode("utf-8")).hexdigest()[:12]
         queue_id = f"q_fav_{opaque_hash}"
-        version = 100
+        version = self.get_next_queue_version(norm_dev)
 
         snapshot = QueueSnapshot(
             queue_id=queue_id,
@@ -508,8 +563,8 @@ class MusicQueueSnapshotManager:
             source="netease_favorite",
             name=fav_info.get("name") or "我喜欢的音乐",
             total=len(formatted_tracks),
-            is_complete=True,
-            queue_state="ready",
+            is_complete=is_complete,
+            queue_state=queue_state,
             tracks=formatted_tracks,
             device_id=norm_dev,
         )
@@ -531,17 +586,22 @@ class MusicQueueSnapshotManager:
         Creates a new intelligence queue for device_id from initial seed.
         """
         norm_dev = resolve_car_device_id(device_id)
-        if request_id and request_id in self._replenish_cache:
-            return self._replenish_cache[request_id]
+        cache_key = (norm_dev, request_id) if request_id else None
+        if cache_key and cache_key in self._replenish_cache:
+            return self._replenish_cache[cache_key]
 
         now_ts = int(time.time() * 1000)
         opaque_hash = hashlib.sha256(f"{seed_song_id}:{now_ts}".encode("utf-8")).hexdigest()[:12]
         queue_id = f"q_intel_{opaque_hash}"
-        version = 100
+        version = self.get_next_queue_version(norm_dev)
 
+        seen_ids = set()
         formatted_tracks = []
         for idx, s in enumerate(songs):
             s_id = s["id"]
+            if s_id in seen_ids:
+                continue
+            seen_ids.add(s_id)
             formatted_tracks.append({
                 "track_id": f"netease_{s_id}",
                 "song_id": s_id,
@@ -553,7 +613,7 @@ class MusicQueueSnapshotManager:
                 "stream_url": f"/api/v1/music/netease/stream/{s_id}",
                 "fee": s.get("fee", 0),
                 "playable": None,
-                "queue_index": idx,
+                "queue_index": len(formatted_tracks),
             })
 
         snapshot = QueueSnapshot(
@@ -573,8 +633,8 @@ class MusicQueueSnapshotManager:
         async with self._lock:
             self._active_queues[norm_dev] = snapshot
             self._snapshots[(norm_dev, queue_id, version)] = snapshot
-            if request_id:
-                self._replenish_cache[request_id] = snapshot
+            if cache_key:
+                self._replenish_cache[cache_key] = snapshot
 
         return snapshot
 
@@ -586,11 +646,13 @@ class MusicQueueSnapshotManager:
     ) -> QueueSnapshot:
         """
         Appends a replenishment batch of intelligence tracks to active queue.
-        Ensures existing track indices remain completely stable and increments queue_version.
+        Ensures immutable snapshot: creates a new snapshot with monotonic version,
+        leaving previous snapshots completely unchanged.
         """
         norm_dev = resolve_car_device_id(device_id)
-        if request_id and request_id in self._replenish_cache:
-            return self._replenish_cache[request_id]
+        cache_key = (norm_dev, request_id) if request_id else None
+        if cache_key and cache_key in self._replenish_cache:
+            return self._replenish_cache[cache_key]
 
         active = self._active_queues.get(norm_dev)
         if not active or active.source != "netease_intelligence":
@@ -616,10 +678,20 @@ class MusicQueueSnapshotManager:
             )
 
         async with self._lock:
-            old_total = len(active.tracks)
-            for i, s in enumerate(songs):
+            if cache_key and cache_key in self._replenish_cache:
+                return self._replenish_cache[cache_key]
+
+            # IMMUTABLE SNAPSHOT: shallow copy tracks so old snapshot tracks list is not mutated
+            new_tracks = list(active.tracks)
+            existing_song_ids = {t["song_id"] for t in new_tracks}
+            old_total = len(new_tracks)
+            added_count = 0
+            for s in songs:
                 s_id = s["id"]
-                active.tracks.append({
+                if s_id in existing_song_ids:
+                    continue
+                existing_song_ids.add(s_id)
+                new_tracks.append({
                     "track_id": f"netease_{s_id}",
                     "song_id": s_id,
                     "title": s["title"],
@@ -630,19 +702,31 @@ class MusicQueueSnapshotManager:
                     "stream_url": f"/api/v1/music/netease/stream/{s_id}",
                     "fee": s.get("fee", 0),
                     "playable": None,
-                    "queue_index": old_total + i,
+                    "queue_index": old_total + added_count,
                 })
+                added_count += 1
 
-            active.queue_version += 1
-            active.total = len(active.tracks)
-            active.batch_count += 1
-            active.updated_at = utc_now()
+            new_version = self.get_next_queue_version(norm_dev)
+            new_snapshot = QueueSnapshot(
+                queue_id=active.queue_id,
+                queue_version=new_version,
+                source="netease_intelligence",
+                name=active.name,
+                total=len(new_tracks),
+                is_complete=False,
+                queue_state="ready",
+                tracks=new_tracks,
+                device_id=norm_dev,
+                seed_song_id=active.seed_song_id,
+                batch_count=active.batch_count + 1,
+            )
 
-            self._snapshots[(norm_dev, active.queue_id, active.queue_version)] = active
-            if request_id:
-                self._replenish_cache[request_id] = active
+            self._active_queues[norm_dev] = new_snapshot
+            self._snapshots[(norm_dev, active.queue_id, new_version)] = new_snapshot
+            if cache_key:
+                self._replenish_cache[cache_key] = new_snapshot
 
-        return active
+        return new_snapshot
 
     async def create_single_track_queue(
         self,
@@ -661,7 +745,7 @@ class MusicQueueSnapshotManager:
         now_ts = int(time.time() * 1000)
         opaque_hash = hashlib.sha256(f"{song_id}:{now_ts}".encode("utf-8")).hexdigest()[:12]
         queue_id = f"q_single_{opaque_hash}"
-        version = 100
+        version = self.get_next_queue_version(norm_dev)
 
         tracks = [{
             "track_id": f"netease_{song_id}",
@@ -953,10 +1037,27 @@ def record_command_ack(
         status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == cmd.device_id).first()
         if status_row:
             status_row.last_applied_command_id = command_id
+            cmd_params = json.loads(cmd.params_json) if cmd.params_json else {}
             if applied_mode:
                 status_row.applied_mode = applied_mode
+            elif cmd.action == "set_playback_mode" and cmd_params.get("mode"):
+                status_row.applied_mode = cmd_params["mode"]
+
+            if cmd.action == "switch_queue" and cmd_params.get("source"):
+                status_row.queue_source = cmd_params["source"]
+            elif cmd.action == "set_playback_mode" and cmd_params.get("mode") == "intelligence":
+                status_row.queue_source = "netease_intelligence"
+            elif cmd.action == "set_playback_mode" and cmd_params.get("mode") in ("list_loop", "shuffle"):
+                status_row.queue_source = "netease_favorite"
+            elif cmd.action == "play_track" and cmd_params.get("song_id"):
+                status_row.queue_source = "single_track"
+
+            if cmd_params.get("queue_id"):
+                status_row.queue_id = cmd_params["queue_id"]
             if queue_version is not None:
                 status_row.queue_version = queue_version
+            elif cmd_params.get("queue_version") is not None:
+                status_row.queue_version = cmd_params["queue_version"]
             if current_index is not None:
                 status_row.current_index = current_index
             status_row.updated_at = utc_now()
@@ -1033,7 +1134,8 @@ def save_or_update_car_status(
 
     now = utc_now()
     if not status_row:
-        caps_str = json.dumps(report.capabilities) if report.capabilities is not None else json.dumps(["queue_v2"])
+        # Default capabilities must be empty list so legacy car units are not falsely upgraded
+        caps_str = json.dumps(report.capabilities) if report.capabilities is not None else json.dumps([])
         status_row = CarDeviceStatus(
             device_id=dev_id,
             playback_state=report.playback_state,
@@ -1041,13 +1143,13 @@ def save_or_update_car_status(
             position_ms=report.position_ms,
             duration_ms=report.duration_ms or 0,
             software_volume=report.software_volume if report.software_volume is not None else 1.0,
-            loop_mode=report.loop_mode or "all",
+            loop_mode=report.loop_mode,
             shuffle_enabled=bool(report.shuffle),
-            applied_mode=report.applied_mode or "list_loop",
-            requested_mode=report.requested_mode or "list_loop",
+            applied_mode=report.applied_mode,
+            requested_mode=report.requested_mode,
             queue_id=report.queue_id,
-            queue_version=report.queue_version if report.queue_version is not None else 1,
-            queue_source=report.queue_source or "netease_favorite",
+            queue_version=report.queue_version,
+            queue_source=report.queue_source,
             current_index=report.current_index or 0,
             consecutive_failures=report.consecutive_failures or 0,
             error_code=report.error_code,

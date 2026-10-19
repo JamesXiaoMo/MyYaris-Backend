@@ -319,6 +319,41 @@ class NeteaseService:
 
         return {"song_id": song_id, "url": None, "br": 0, "size_bytes": 0, "type": "mp3"}
 
+    async def get_song_detail(self, song_id: int) -> Dict[str, Any]:
+        """Fetch metadata for a single song from upstream /song/detail."""
+        url = f"{self.base_url}/song/detail"
+        params = self._with_cookie_param({"ids": song_id})
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    songs = data.get("songs", [])
+                    if songs:
+                        s = songs[0]
+                        ar_names = [ar.get("name", "") for ar in s.get("ar", []) if ar.get("name")]
+                        al = s.get("al") or {}
+                        return {
+                            "id": song_id,
+                            "name": s.get("name") or f"Track {song_id}",
+                            "artist": " / ".join(ar_names) or "Unknown Artist",
+                            "album": al.get("name"),
+                            "duration_ms": s.get("dt", 0),
+                            "cover_url": al.get("picUrl"),
+                            "fee": s.get("fee", 0),
+                        }
+        except Exception as e:
+            logger.warning(f"Error fetching song detail for {song_id}: {e}")
+        return {
+            "id": song_id,
+            "name": f"Track {song_id}",
+            "artist": "Unknown Artist",
+            "album": None,
+            "duration_ms": 0,
+            "cover_url": None,
+            "fee": 0,
+        }
+
     async def is_song_in_favorite_playlist(self, song_id: int) -> bool:
         """
         Verifies whether a song belongs to the current verified owner's favorite playlist.

@@ -284,6 +284,22 @@ def require_admin_or_legacy_phone(user: AuthenticatedUser = Depends(get_current_
     )
 
 
+def require_owner_or_car(user: AuthenticatedUser = Depends(get_current_user)) -> AuthenticatedUser:
+    """
+    Guards global Owner music resources (queue metadata, intelligence generation, audio streams).
+    - Admin (owner): permitted.
+    - Legacy phone token (owner phone): permitted.
+    - Car device ('car'): permitted (bound-device validation checked against target device).
+    - Registered standard user ('user'): strictly forbidden (403), regardless of has_device_control.
+    """
+    if user.role == "admin" or (user.is_legacy_token and user.role == "phone") or user.role == "car":
+        return user
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access forbidden: Administrator privileges required to access owner music resources.",
+    )
+
+
 def require_user_or_phone_or_admin(user: AuthenticatedUser = Depends(get_current_user)) -> AuthenticatedUser:
     """
     Guards user features like favorites.

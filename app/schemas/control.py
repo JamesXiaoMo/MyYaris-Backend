@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict, Optional, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class MusicCommandParams(BaseModel):
@@ -19,6 +19,7 @@ class MusicCommandParams(BaseModel):
     shuffle: Optional[bool] = None
     volume: Optional[float] = None
     mode: Optional[str] = None  # list_loop | shuffle | intelligence | single_loop
+    seed_song_id: Optional[int] = None
     seed_track_id: Optional[str] = None
     expected_queue_id: Optional[str] = None
     expected_queue_version: Optional[int] = None
@@ -27,6 +28,34 @@ class MusicCommandParams(BaseModel):
     queue_index: Optional[int] = None
     start_index: Optional[int] = None
     start_track_id: Optional[str] = None
+    keep_playback_state: Optional[bool] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_and_validate_seek(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        seek_vals = {}
+        for key in ("seek_ms", "seek_position_ms", "position_ms"):
+            val = data.get(key)
+            if val is not None:
+                try:
+                    seek_vals[key] = int(val)
+                except (ValueError, TypeError):
+                    pass
+        if len(seek_vals) > 1:
+            unique_vals = set(seek_vals.values())
+            if len(unique_vals) == 1:
+                unified = next(iter(unique_vals))
+                data["seek_ms"] = unified
+                data["seek_position_ms"] = unified
+                data["position_ms"] = unified
+        elif len(seek_vals) == 1:
+            unified = next(iter(seek_vals.values()))
+            data["seek_ms"] = unified
+            data["seek_position_ms"] = unified
+            data["position_ms"] = unified
+        return data
 
 
 class MusicCommandRequest(BaseModel):

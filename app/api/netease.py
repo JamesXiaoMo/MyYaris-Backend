@@ -22,7 +22,10 @@ from app.api.auth import (
     get_current_user,
     require_admin,
     require_admin_or_legacy_phone,
+    require_owner_or_car,
+    verify_csrf,
 )
+from app.services.device_service import is_same_device, resolve_car_device_id
 from app.config import settings
 from app.repositories.database import SessionLocal, get_db
 from app.repositories.models import utc_now
@@ -182,16 +185,27 @@ async def generate_intelligence_queue(
     req: NeteaseIntelligenceRequest,
     request: Request,
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_owner_or_car),
 ):
+    verify_csrf(request, user)
     """
     Generate authentic intelligence mode (心动模式) continuous playback queue from upstream.
     Initial seed song (batch_index == 0) must belong to the owner's favorite playlist.
     Replenishment (batch_index > 0) appends to the active queue with stable indices.
     """
+    target_device = resolve_car_device_id(req.device_id, user.device_id)
+
+    # Device ownership validation for car clients
+    if user.role == "car":
+        if not user.device_id or not is_same_device(user.device_id, target_device):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Car token cannot access music queue of other devices.",
+            )
+
     batch_idx = req.batch_index or 0
 
-    # 1. Initial seed qualification check (batch_index == 0)
+    # 1. Seed qualification check
     if batch_idx == 0:
         try:
             is_in_fav = await netease_service.is_song_in_favorite_playlist(req.seed_song_id)
@@ -227,6 +241,30 @@ async def generate_intelligence_queue(
                     "message": "上游网易云服务请求异常",
                 },
             )
+    else:
+        # Replenishment seed song must belong to active intelligence queue
+        active_q = music_queue_snapshot_manager.get_active_queue(target_device)
+        if not active_q or active_q.source != "netease_intelligence":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "QUEUE_NOT_READY",
+                    "error_detail": "No active intelligence queue found for replenishment",
+                    "message": "当前未处于心动模式队列，无法续批",
+                },
+            )
+        valid_seed_ids = {t["song_id"] for t in active_q.tracks}
+        if req.seed_song_id not in valid_seed_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": 422,
+                    "error_code": "INVALID_SEED_SONG",
+                    "error_detail": "Replenishment seed song must belong to active intelligence queue",
+                    "message": "续批种子歌曲必须来自当前心动模式队列",
+                },
+            )
 
     # 2. Query upstream intelligence API
     try:
@@ -259,7 +297,6 @@ async def generate_intelligence_queue(
         )
 
     # 3. Update device queue snapshot
-    target_device = user.device_id or settings.DEFAULT_CAR_DEVICE_ID
     if batch_idx == 0:
         snapshot = await music_queue_snapshot_manager.create_intelligence_queue(
             device_id=target_device,

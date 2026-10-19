@@ -19,14 +19,16 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import (
     get_current_user,
+    require_admin_or_legacy_phone,
     require_car_or_admin,
+    require_owner_or_car,
     require_phone_or_admin,
     verify_csrf,
     verify_token_string,
 )
 from app.config import settings
 from app.repositories.database import get_db
-from app.repositories.models import utc_now
+from app.repositories.models import MusicCommand, utc_now
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.control import (
     CarStatusReportRequest,
@@ -34,6 +36,7 @@ from app.schemas.control import (
     MusicCommandAckRequest,
     MusicCommandAckResponse,
     MusicCommandDetailResponse,
+    MusicCommandParams,
     MusicCommandRequest,
     MusicCommandResponse,
 )
@@ -54,6 +57,7 @@ from app.services.control_service import (
     NeteaseUpstreamError,
 )
 from app.services.device_service import is_same_device, resolve_car_device_id
+from app.services.netease_service import netease_service
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +100,105 @@ async def send_music_command(
 
     target_device = resolve_car_device_id(cmd.device_id)
 
-    # Capability gate check for new queue V2 actions
+    # 1. Idempotency & conflict check BEFORE evaluating mutable capability or preconditions!
+    if cmd.command_id:
+        existing = db.query(MusicCommand).filter(MusicCommand.command_id == cmd.command_id).first()
+        if existing:
+            if not is_same_device(existing.device_id, target_device):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": 409,
+                        "error_code": "COMMAND_CONFLICT",
+                        "error_detail": f"Command ID '{cmd.command_id}' already exists for another device '{existing.device_id}'.",
+                        "message": "指令ID冲突：相同指令ID已绑定不同设备",
+                    },
+                )
+            existing_params = json.loads(existing.params_json) if existing.params_json else {}
+            incoming_params = cmd.params.model_dump(exclude_unset=True) if cmd.params else {}
+
+            BACKEND_INJECTED_KEYS = {
+                "queue_id", "queue_version", "source", "stream_url", "track_id",
+                "title", "artist", "album", "duration_ms", "cover_url",
+                "seek_ms", "position_ms", "seek_position_ms",
+            }
+
+            conflict = False
+            if existing.action != cmd.action:
+                conflict = True
+            else:
+                for k, v in incoming_params.items():
+                    if k in ("seek_ms", "position_ms", "seek_position_ms"):
+                        if existing_params.get(k) != v and existing_params.get("seek_position_ms") != v:
+                            conflict = True
+                            break
+                    elif existing_params.get(k) != v:
+                        conflict = True
+                        break
+                if not conflict:
+                    for k, v in existing_params.items():
+                        if k not in incoming_params and k not in BACKEND_INJECTED_KEYS:
+                            conflict = True
+                            break
+
+            if conflict:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": 409,
+                        "error_code": "COMMAND_CONFLICT",
+                        "error_detail": f"Command ID '{cmd.command_id}' already exists with different action or parameters.",
+                        "message": "指令ID冲突：相同指令ID已存在且携带不同参数",
+                    },
+                )
+            # Replay of identical existing command: return 200 OK immediately
+            return music_command_to_response(existing, dispatched_to_ws=(existing.dispatched_channel == "ws"))
+
+    # 2. Seek parameter validation & conflict rejection
+    seek_vals = []
+    if cmd.params:
+        for k in ("seek_position_ms", "seek_ms", "position_ms"):
+            v = getattr(cmd.params, k, None)
+            if v is not None:
+                seek_vals.append(v)
+    if len(set(seek_vals)) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": 422,
+                "error_code": "SEEK_PARAMETER_CONFLICT",
+                "error_detail": "Conflicting seek positions provided in seek_ms, seek_position_ms, and position_ms",
+                "message": "跳转进度参数冲突",
+            },
+        )
+    if cmd.action == "seek":
+        if not seek_vals:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": 422,
+                    "error_code": "SEEK_PARAMETER_REQUIRED",
+                    "error_detail": "Action 'seek' requires a valid seek_position_ms / seek_ms / position_ms parameter",
+                    "message": "跳转操作缺少有效的时间进度参数",
+                },
+            )
+        pos = seek_vals[0]
+        if pos < 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": 422,
+                    "error_code": "INVALID_SEEK_POSITION",
+                    "error_detail": f"Negative seek position {pos} is invalid",
+                    "message": "跳转进度不能为负数",
+                },
+            )
+        if cmd.params:
+            cmd.params.seek_position_ms = pos
+            cmd.params.seek_ms = pos
+            cmd.params.position_ms = pos
+
+    # 3. Capability gate check for new queue V2 actions
     if cmd.action in ("set_playback_mode", "switch_queue"):
         car_status = get_car_status_by_id(db, target_device)
         caps = []
@@ -116,7 +218,7 @@ async def send_music_command(
                 },
             )
 
-    # Precondition assertion on expected_queue_id and expected_queue_version
+    # 4. Precondition assertion on expected_queue_id and expected_queue_version
     if cmd.params:
         active_q = music_queue_snapshot_manager.get_active_queue(target_device)
         if cmd.params.expected_queue_id:
@@ -142,7 +244,136 @@ async def send_music_command(
                     },
                 )
 
-    # 1. Idempotency & conflict check with SQLite persistence
+    if cmd.params is None:
+        cmd.params = MusicCommandParams()
+
+    car_status_row = get_car_status_by_id(db, target_device)
+
+    # 5. Backend prepares queue snapshot (Atomic Single-Command Protocol)
+    try:
+        if cmd.action == "set_playback_mode":
+            target_mode = cmd.params.mode
+            if target_mode == "intelligence":
+                seed_id = cmd.params.seed_song_id
+                if not seed_id and car_status_row and car_status_row.current_track_id:
+                    if car_status_row.current_track_id.startswith("netease_"):
+                        try:
+                            seed_id = int(car_status_row.current_track_id[len("netease_"):])
+                        except ValueError:
+                            pass
+                if not seed_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "code": 422,
+                            "error_code": "INVALID_SEED_SONG",
+                            "error_detail": "Missing seed_song_id to generate intelligence mode",
+                            "message": "切换心动模式需要指定种子歌曲",
+                        },
+                    )
+                is_in_fav = await netease_service.is_song_in_favorite_playlist(seed_id)
+                if not is_in_fav:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "code": 422,
+                            "error_code": "INVALID_SEED_SONG",
+                            "error_detail": "Initial intelligence seed song must belong to owner favorite playlist",
+                            "message": "心动模式初始种子曲目必须属于我喜欢的音乐",
+                        },
+                    )
+                _, songs = await netease_service.get_intelligence(seed_song_id=seed_id, count=30)
+                snap = await music_queue_snapshot_manager.create_intelligence_queue(
+                    device_id=target_device,
+                    seed_song_id=seed_id,
+                    songs=songs,
+                )
+                cmd.params.queue_id = snap.queue_id
+                cmd.params.queue_version = snap.queue_version
+                cmd.params.source = "netease_intelligence"
+                cmd.params.seed_song_id = seed_id
+            elif target_mode in ("list_loop", "shuffle"):
+                snap = await music_queue_snapshot_manager.init_favorite_queue(target_device)
+                cmd.params.queue_id = snap.queue_id
+                cmd.params.queue_version = snap.queue_version
+                cmd.params.source = "netease_favorite"
+
+        elif cmd.action == "switch_queue":
+            target_src = cmd.params.source
+            if target_src == "netease_favorite":
+                snap = await music_queue_snapshot_manager.init_favorite_queue(target_device)
+                cmd.params.queue_id = snap.queue_id
+                cmd.params.queue_version = snap.queue_version
+            elif target_src == "single_track" and cmd.params.song_id:
+                s_id = int(cmd.params.song_id)
+                detail = await netease_service.get_song_detail(s_id)
+                snap = await music_queue_snapshot_manager.create_single_track_queue(
+                    device_id=target_device,
+                    song_id=s_id,
+                    title=detail.get("name") or cmd.params.title or f"Track {s_id}",
+                    artist=detail.get("artist") or cmd.params.artist or "Unknown Artist",
+                    album=detail.get("album"),
+                    duration_ms=detail.get("duration_ms", 0),
+                    cover_url=detail.get("cover_url"),
+                )
+                cmd.params.queue_id = snap.queue_id
+                cmd.params.queue_version = snap.queue_version
+                cmd.params.track_id = f"netease_{s_id}"
+                cmd.params.stream_url = f"/api/v1/music/netease/stream/{s_id}"
+
+        elif cmd.action == "play_track" and cmd.params.song_id:
+            s_id = int(cmd.params.song_id)
+            detail = await netease_service.get_song_detail(s_id)
+            snap = await music_queue_snapshot_manager.create_single_track_queue(
+                device_id=target_device,
+                song_id=s_id,
+                title=detail.get("name") or cmd.params.title or f"Track {s_id}",
+                artist=detail.get("artist") or cmd.params.artist or "Unknown Artist",
+                album=detail.get("album"),
+                duration_ms=detail.get("duration_ms", 0),
+                cover_url=detail.get("cover_url"),
+            )
+            cmd.params.queue_id = snap.queue_id
+            cmd.params.queue_version = snap.queue_version
+            cmd.params.source = "single_track"
+            cmd.params.track_id = f"netease_{s_id}"
+            cmd.params.stream_url = f"/api/v1/music/netease/stream/{s_id}"
+
+        elif cmd.action == "resume":
+            active_q = music_queue_snapshot_manager.get_active_queue(target_device)
+            if not active_q:
+                try:
+                    snap = await music_queue_snapshot_manager.init_favorite_queue(target_device)
+                    cmd.params.queue_id = snap.queue_id
+                    cmd.params.queue_version = snap.queue_version
+                    cmd.params.source = "netease_favorite"
+                except Exception as e:
+                    logger.debug(f"Resume without active queue: best-effort favorite init skipped ({e})")
+
+    except HTTPException:
+        raise
+    except PermissionError as pe:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": 409,
+                "error_code": "INTELLIGENCE_AUTH_INVALID",
+                "error_detail": str(pe),
+                "message": "网易云登录凭证失效或未登录，无法生成播放队列",
+            },
+        )
+    except NeteaseUpstreamError as nue:
+        raise HTTPException(
+            status_code=nue.status_code,
+            detail={
+                "code": nue.status_code,
+                "error_code": "INTELLIGENCE_UPSTREAM_FAILED",
+                "error_detail": nue.message,
+                "message": "上游网易云服务请求异常",
+            },
+        )
+
+    # 6. Idempotency & conflict check with SQLite persistence
     cmd_row, is_new = create_or_get_music_command(
         db=db,
         cmd_req=cmd,
@@ -150,18 +381,13 @@ async def send_music_command(
         sender_role=user.role,
     )
 
-    # Update requested_mode or queue_source if applicable
+    # 7. Update requested_mode only; applied_mode and queue_source MUST await car ACK!
     if is_new and cmd.params:
-        car_status_row = get_car_status_by_id(db, target_device)
         if car_status_row:
             if cmd.action == "set_playback_mode" and cmd.params.mode:
                 car_status_row.requested_mode = cmd.params.mode
                 db.commit()
-            elif cmd.action == "switch_queue" and cmd.params.source:
-                car_status_row.queue_source = cmd.params.source
-                db.commit()
 
-    # If this command ID was already processed, return existing record
     if not is_new:
         return music_command_to_response(cmd_row, dispatched_to_ws=(cmd_row.dispatched_channel == "ws"))
 
@@ -375,7 +601,7 @@ async def get_music_queue(
     offset: int = Query(0, ge=0, description="Track offset"),
     limit: int = Query(50, ge=1, le=100, description="Page limit"),
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(require_owner_or_car),
 ):
     """
     Pure read-only endpoint for music queue metadata and paginated tracks.
@@ -384,17 +610,13 @@ async def get_music_queue(
     """
     target_device = resolve_car_device_id(device_id, user.device_id)
 
-    # Account/device isolation
-    if user.role == "car" and user.device_id and not is_same_device(user.device_id, target_device):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Forbidden: Car token cannot access music queue of other devices.",
-        )
-    if user.role == "user" and not user.has_device_control:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden: User account lacks vehicle device control permission.",
-        )
+    # Device ownership validation for car clients
+    if user.role == "car":
+        if not user.device_id or not is_same_device(user.device_id, target_device):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Car token cannot access music queue of other devices.",
+            )
 
     try:
         return await music_queue_snapshot_manager.get_queue_page(

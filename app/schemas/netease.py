@@ -68,6 +68,7 @@ class MusicQueueResponse(BaseModel):
 
 
 class NeteaseIntelligenceRequest(BaseModel):
+    device_id: Optional[str] = Field(None, description="Target vehicle device ID")
     request_id: Optional[str] = Field(None, description="Client idempotent request ID")
     seed_song_id: int = Field(..., description="Seed song ID to generate recommendations from")
     playlist_id: Optional[int] = Field(None, description="Owner favorite playlist ID")
