@@ -171,6 +171,14 @@ class MusicCommand(Base):
     error_detail = Column(Text, nullable=True)
 
 
+class QueueVersionSequence(Base):
+    __tablename__ = "queue_version_sequences"
+
+    device_id = Column(String(64), primary_key=True, index=True)
+    last_allocated_version = Column(Integer, default=0, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class FavoriteFolder(Base):
     __tablename__ = "favorite_folders"
     __table_args__ = (

@@ -1,6 +1,7 @@
 import logging
 from sqlalchemy import text
 from app.repositories.database import Base
+import app.repositories.models  # noqa: F401 - ensure all models are registered on Base.metadata
 
 logger = logging.getLogger(__name__)
 

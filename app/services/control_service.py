@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.repositories.models import CarDeviceStatus, MusicCommand, utc_now
+from app.repositories.models import CarDeviceStatus, MusicCommand, QueueVersionSequence, utc_now
 from app.schemas.control import (
     CarStatusReportRequest,
     CarStatusResponse,
@@ -455,8 +455,9 @@ class MusicQueueSnapshotManager:
     def get_next_queue_version(self, device_id: str, db: Optional[Session] = None) -> int:
         """
         Generates the next monotonically increasing queue version for device_id.
-        Persists to SQLite CarDeviceStatus table to guarantee strictly monotonic non-colliding
-        versions across process restarts, memory clears, and system clock rollbacks.
+        Persists to independent SQLite QueueVersionSequence table to guarantee strictly monotonic
+        non-colliding versions across process restarts, memory clears, and system clock rollbacks,
+        without mutating CarDeviceStatus.queue_version.
         """
         norm_dev = resolve_car_device_id(device_id)
         close_db = False
@@ -465,21 +466,20 @@ class MusicQueueSnapshotManager:
             db = SessionLocal()
             close_db = True
         try:
-            status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == norm_dev).first()
-            if not status_row:
-                status_row = CarDeviceStatus(
+            seq_row = db.query(QueueVersionSequence).filter(QueueVersionSequence.device_id == norm_dev).first()
+            if not seq_row:
+                seq_row = QueueVersionSequence(
                     device_id=norm_dev,
-                    queue_version=0,
-                    playback_state="stopped",
+                    last_allocated_version=0,
                 )
-                db.add(status_row)
-            current_db = status_row.queue_version or 0
+                db.add(seq_row)
+            current_db = seq_row.last_allocated_version or 0
             in_mem_last = self._last_version.get(norm_dev, 0)
             baseline = max(current_db, in_mem_last)
             epoch_ms = int(time.time() * 1000)
             # Clock rollback protection: if epoch_ms <= baseline, guarantee baseline + 1
             nxt = max(baseline + 1, epoch_ms)
-            status_row.queue_version = nxt
+            seq_row.last_allocated_version = nxt
             db.commit()
             self._last_version[norm_dev] = nxt
             return nxt
@@ -488,6 +488,10 @@ class MusicQueueSnapshotManager:
                 db.close()
 
     def sync_device_queue_version(self, device_id: str, version: int, db: Optional[Session] = None):
+        """
+        Syncs in-memory and sequence table watermark for queue version.
+        Does NOT mutate CarDeviceStatus.queue_version (CarDeviceStatus only updates on applied ACK).
+        """
         if version and version > 0:
             norm_dev = resolve_car_device_id(device_id)
             self._last_version[norm_dev] = max(self._last_version.get(norm_dev, 0), version)
@@ -497,9 +501,13 @@ class MusicQueueSnapshotManager:
                 db = SessionLocal()
                 close_db = True
             try:
-                status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == norm_dev).first()
-                if status_row and (status_row.queue_version or 0) < version:
-                    status_row.queue_version = version
+                seq_row = db.query(QueueVersionSequence).filter(QueueVersionSequence.device_id == norm_dev).first()
+                if not seq_row:
+                    seq_row = QueueVersionSequence(device_id=norm_dev, last_allocated_version=version)
+                    db.add(seq_row)
+                    db.commit()
+                elif (seq_row.last_allocated_version or 0) < version:
+                    seq_row.last_allocated_version = version
                     db.commit()
             finally:
                 if close_db:
@@ -543,6 +551,14 @@ class MusicQueueSnapshotManager:
                 return None
             self._active_queues[norm_dev] = snapshot
             self.sync_device_queue_version(norm_dev, snapshot.queue_version, db=db)
+            if db:
+                status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == norm_dev).first()
+                if status_row:
+                    status_row.queue_id = snapshot.queue_id
+                    status_row.queue_version = snapshot.queue_version
+                    if snapshot.source:
+                        status_row.queue_source = snapshot.source
+                    status_row.updated_at = utc_now()
             logger.info(
                 f"Promoted pending queue '{snapshot.queue_id}' (v{snapshot.queue_version}) to active queue for device '{norm_dev}'"
             )
@@ -950,33 +966,39 @@ class MusicQueueSnapshotManager:
         queue_version: Optional[int] = None,
         offset: int = 0,
         limit: int = 50,
+        db: Optional[Session] = None,
     ) -> MusicQueueResponse:
         """
         Pure read-only query for queue metadata and paginated tracks.
         Querying with ?source=... NEVER switches the active queue.
         Validates snapshot immutability: returns 409 QUEUE_VERSION_CONFLICT on version mismatch.
+        Side-effect free: default GET on cold device does NOT activate any queue into _active_queues.
+        Checks snapshot/pending cache first before falling back to NetEase favorite generation.
         """
         norm_dev = resolve_car_device_id(device_id)
         active = self._active_queues.get(norm_dev)
-        if active is None:
-            active = await self.init_favorite_queue(norm_dev)
+        target = None
 
-        target = active
+        # 1. Explicit snapshot requested with (queue_id, queue_version): check cache FIRST
         if queue_id and queue_version is not None:
             cached = self._snapshots.get((norm_dev, queue_id, queue_version))
+            if not cached:
+                for snap in self._pending_queues.values():
+                    if snap.device_id == norm_dev and snap.queue_id == queue_id and snap.queue_version == queue_version:
+                        cached = snap
+                        break
             if cached:
                 target = cached
-            elif queue_id == active.queue_id:
-                if queue_version != active.queue_version:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail={
-                            "code": 409,
-                            "error_code": "QUEUE_VERSION_CONFLICT",
-                            "error_detail": f"Requested queue version {queue_version} does not match current snapshot version {active.queue_version}.",
-                            "message": "播放队列版本已变更，请从第一页重新拉取。",
-                        },
-                    )
+            elif active and queue_id == active.queue_id and queue_version != active.queue_version:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": 409,
+                        "error_code": "QUEUE_VERSION_CONFLICT",
+                        "error_detail": f"Requested queue version {queue_version} does not match current snapshot version {active.queue_version}.",
+                        "message": "播放队列版本已变更，请从第一页重新拉取。",
+                    },
+                )
             else:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -987,26 +1009,59 @@ class MusicQueueSnapshotManager:
                         "message": "播放队列版本已变更，请从第一页重新拉取。",
                     },
                 )
-        elif queue_version is not None and queue_version != active.queue_version:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": 409,
-                    "error_code": "QUEUE_VERSION_CONFLICT",
-                    "error_detail": f"Requested queue version {queue_version} does not match current snapshot version {active.queue_version}.",
-                    "message": "播放队列版本已变更，请从第一页重新拉取。",
-                },
-            )
-        elif offset > 0 and queue_id is not None and queue_id != active.queue_id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": 409,
-                    "error_code": "QUEUE_VERSION_CONFLICT",
-                    "error_detail": f"Requested queue_id {queue_id} does not match active queue {active.queue_id}.",
-                    "message": "播放队列已变更，请重新获取最新队列。",
-                },
-            )
+
+        # 2. Paging with queue_id but without queue_version
+        elif queue_id is not None:
+            if active and active.queue_id == queue_id:
+                target = active
+            else:
+                candidates = [s for (d, q_id, _), s in self._snapshots.items() if d == norm_dev and q_id == queue_id]
+                if not candidates:
+                    for snap in self._pending_queues.values():
+                        if snap.device_id == norm_dev and snap.queue_id == queue_id:
+                            candidates.append(snap)
+                if candidates:
+                    target = max(candidates, key=lambda s: s.queue_version)
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": 409,
+                            "error_code": "QUEUE_VERSION_CONFLICT",
+                            "error_detail": f"Requested queue_id {queue_id} not found.",
+                            "message": "播放队列不存在或已过期，请重新获取最新队列。",
+                        },
+                    )
+
+        # 3. Generic query without queue_id (e.g. GET /api/v1/music/queue)
+        else:
+            if active is not None:
+                if queue_version is not None and queue_version != active.queue_version:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": 409,
+                            "error_code": "QUEUE_VERSION_CONFLICT",
+                            "error_detail": f"Requested queue version {queue_version} does not match current snapshot version {active.queue_version}.",
+                            "message": "播放队列版本已变更，请从第一页重新拉取。",
+                        },
+                    )
+                target = active
+            else:
+                # Cold device: prepare favorite queue view without activating (activate=False)
+                # Caches snapshot in _snapshots, but leaves _active_queues intact/None!
+                fav_snap = await self.prepare_favorite_queue(norm_dev, db=db)
+                if queue_version is not None and queue_version != fav_snap.queue_version:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": 409,
+                            "error_code": "QUEUE_VERSION_CONFLICT",
+                            "error_detail": f"Requested queue version {queue_version} does not match snapshot version {fav_snap.queue_version}.",
+                            "message": "播放队列版本已变更，请从第一页重新拉取。",
+                        },
+                    )
+                target = fav_snap
 
         limit_bounded = max(1, min(100, limit))
         total = target.total
@@ -1198,6 +1253,12 @@ def record_command_ack(
 
         # Update CarDeviceStatus with execution confirmation
         status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == cmd.device_id).first()
+        if not status_row:
+            status_row = CarDeviceStatus(
+                device_id=cmd.device_id,
+                playback_state="stopped",
+            )
+            db.add(status_row)
         if status_row:
             status_row.last_applied_command_id = command_id
             cmd_params = json.loads(cmd.params_json) if cmd.params_json else {}

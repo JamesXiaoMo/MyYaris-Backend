@@ -1,10 +1,11 @@
+import asyncio
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.config import settings
-from app.repositories.models import CarDeviceStatus, MusicCommand, User, utc_now
+from app.repositories.models import CarDeviceStatus, MusicCommand, QueueVersionSequence, User, utc_now
 from app.services.control_service import (
     music_queue_snapshot_manager,
     command_queue_manager,
@@ -88,9 +89,9 @@ def test_get_queue_pure_read_and_immutable_snapshot(client, phone_headers):
         probe_resp = client.get("/api/v1/music/queue?source=netease_intelligence&offset=0&limit=10", headers=phone_headers)
         assert probe_resp.status_code == 200
         assert probe_resp.json()["source"] == "netease_favorite"
+        # Pure read: GET queue does NOT mutate or activate active queue!
         active_q = music_queue_snapshot_manager.get_active_queue(settings.DEFAULT_CAR_DEVICE_ID)
-        assert active_q is not None
-        assert active_q.source == "netease_favorite"
+        assert active_q is None
 
         # 3. Valid pagination with bound snapshot (queue_id, queue_version)
         p2_resp = client.get(
@@ -154,8 +155,8 @@ def test_device_isolation_and_logout_clears_queue(client, phone_headers, car_hea
     }
     with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
          patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": dummy_songs}):
-        q_resp = client.get("/api/v1/music/queue", headers=phone_headers)
-        assert q_resp.status_code == 200
+        # Explicitly activate favorite queue to test active queue invalidation
+        asyncio.run(music_queue_snapshot_manager.init_favorite_queue(settings.DEFAULT_CAR_DEVICE_ID, activate=True))
         assert music_queue_snapshot_manager.get_active_queue(settings.DEFAULT_CAR_DEVICE_ID) is not None
 
         # 3. Simulate account logout/cookie clear
@@ -261,9 +262,9 @@ def test_command_idempotency_and_precondition_assertion(client, phone_headers, d
     }
     with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
          patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": _make_dummy_songs(20)}):
-        q_resp = client.get("/api/v1/music/queue", headers=phone_headers)
-        active_qid = q_resp.json()["queue_id"]
-        active_qver = q_resp.json()["queue_version"]
+        active_snap = asyncio.run(music_queue_snapshot_manager.init_favorite_queue(settings.DEFAULT_CAR_DEVICE_ID, activate=True))
+        active_qid = active_snap.queue_id
+        active_qver = active_snap.queue_version
 
     # 2. Precondition mismatch on expected_queue_version -> 409 QUEUE_PRECONDITION_FAILED
     cmd_fail_ver = {
@@ -979,9 +980,7 @@ def test_play_track_favorite_preservation_vs_single_track(client, phone_headers,
     fav_info = {"playlist_id": 555, "track_count": 3, "name": "Favs"}
     with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
          patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": fav_songs, "has_more": False}):
-        r_init = client.get("/api/v1/music/queue", headers=phone_headers)
-        assert r_init.status_code == 200
-        active_q = music_queue_snapshot_manager.get_active_queue(dev_id)
+        active_q = asyncio.run(music_queue_snapshot_manager.init_favorite_queue(dev_id, activate=True))
         assert active_q is not None
         orig_qid = active_q.queue_id
         orig_qver = active_q.queue_version
@@ -1058,9 +1057,8 @@ def test_pending_queue_state_machine_and_late_ack_guard(client, phone_headers, c
     fav_info = {"playlist_id": 11, "track_count": 1, "name": "Favs"}
     with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
          patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": fav_songs, "has_more": False}):
-        client.get("/api/v1/music/queue", headers=phone_headers)
+        active_init = asyncio.run(music_queue_snapshot_manager.init_favorite_queue(dev_id, activate=True))
 
-    active_init = music_queue_snapshot_manager.get_active_queue(dev_id)
     assert active_init is not None
     init_qid = active_init.queue_id
 
@@ -1159,3 +1157,183 @@ def test_websocket_valid_status_keys_update(client, db_session):
     assert updated.status_seq == 105
     assert updated.playback_state == "playing"
     assert updated.position_ms == 12000
+
+
+def test_prepare_and_failed_does_not_mutate_actual_status_queue_version(client, phone_headers, car_headers, db_session):
+    """
+    Requirement 1:
+    - QueueVersionSequence independently allocates versions without mutating CarDeviceStatus.queue_version.
+    - During prepare, failed, or expired command stages, actual status in DB, HTTP /status,
+      and WS status_snapshot maintain unchanged applied queue_id and queue_version.
+    - Only upon 'applied' ACK does CarDeviceStatus update to the new queue_id and queue_version.
+    """
+    dev_id = settings.DEFAULT_CAR_DEVICE_ID
+    music_queue_snapshot_manager.clear_all()
+    command_queue_manager.clear_all()
+
+    # 1. Establish initial status in DB: queue_id = q_fav_initial, queue_version = 10
+    status_row = db_session.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == dev_id).first()
+    if not status_row:
+        status_row = CarDeviceStatus(
+            device_id=dev_id,
+            playback_state="stopped",
+            queue_id="q_fav_initial",
+            queue_version=10,
+            queue_source="netease_favorite",
+            applied_mode="list_loop",
+        )
+        db_session.add(status_row)
+    else:
+        status_row.queue_id = "q_fav_initial"
+        status_row.queue_version = 10
+        status_row.queue_source = "netease_favorite"
+        status_row.applied_mode = "list_loop"
+    db_session.commit()
+
+    # Verify initial status via HTTP
+    resp_init = client.get("/api/v1/music/control/status", headers=phone_headers)
+    assert resp_init.status_code == 200
+    assert resp_init.json()["queue_id"] == "q_fav_initial"
+    assert resp_init.json()["queue_version"] == 10
+
+    # Verify initial status via WS snapshot
+    with client.websocket_connect(f"/api/v1/ws/music?token={settings.CAR_TOKEN}&client_type=car&device_id={dev_id}") as ws:
+        init_ws = ws.receive_json()
+        assert init_ws["type"] == "status_snapshot"
+        assert init_ws["data"]["queue_id"] == "q_fav_initial"
+        assert init_ws["data"]["queue_version"] == 10
+
+    # 2. Prepare a single-track play command (generates new snapshot with version > 10)
+    dummy_d = {"id": 888, "name": "Song 888", "artist": "Artist 888", "duration_ms": 180000}
+    with patch.object(netease_service, "get_song_detail", new_callable=AsyncMock, return_value=dummy_d):
+        cmd_resp = client.post(
+            "/api/v1/music/control/command",
+            json={"command_id": "cmd_seq_test_001", "action": "play_track", "params": {"song_id": 888}},
+            headers=phone_headers,
+        )
+        assert cmd_resp.status_code == 200
+        cmd_params = cmd_resp.json()["params"]
+        prepared_qid = cmd_params["queue_id"]
+        prepared_qver = cmd_params["queue_version"]
+        assert prepared_qid.startswith("q_single_")
+        assert prepared_qver > 10
+
+    # 3. Before vehicle ACK: DB CarDeviceStatus, HTTP status, and WS snapshot MUST remain unchanged!
+    db_session.expire_all()
+    cur_status = db_session.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == dev_id).first()
+    assert cur_status.queue_id == "q_fav_initial"
+    assert cur_status.queue_version == 10
+
+    resp_after_prep = client.get("/api/v1/music/control/status", headers=phone_headers)
+    assert resp_after_prep.status_code == 200
+    assert resp_after_prep.json()["queue_id"] == "q_fav_initial"
+    assert resp_after_prep.json()["queue_version"] == 10
+
+    with client.websocket_connect(f"/api/v1/ws/music?token={settings.CAR_TOKEN}&client_type=car&device_id={dev_id}") as ws:
+        snap_ws = ws.receive_json()
+        assert snap_ws["type"] == "status_snapshot"
+        assert snap_ws["data"]["queue_id"] == "q_fav_initial"
+        assert snap_ws["data"]["queue_version"] == 10
+
+    # 4. Vehicle reports command failed -> status still unchanged!
+    client.post(
+        "/api/v1/music/control/command/cmd_seq_test_001/ack",
+        json={"status": "failed", "error_code": "NETWORK_TIMEOUT"},
+        headers=car_headers,
+    )
+    db_session.expire_all()
+    cur_status_failed = db_session.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == dev_id).first()
+    assert cur_status_failed.queue_id == "q_fav_initial"
+    assert cur_status_failed.queue_version == 10
+
+    resp_failed = client.get("/api/v1/music/control/status", headers=phone_headers)
+    assert resp_failed.json()["queue_id"] == "q_fav_initial"
+    assert resp_failed.json()["queue_version"] == 10
+
+    # 5. Send command 2 and car ACK applied -> only now does status mutate to applied!
+    with patch.object(netease_service, "get_song_detail", new_callable=AsyncMock, return_value=dummy_d):
+        cmd2_resp = client.post(
+            "/api/v1/music/control/command",
+            json={"command_id": "cmd_seq_test_002", "action": "play_track", "params": {"song_id": 888}},
+            headers=phone_headers,
+        )
+        assert cmd2_resp.status_code == 200
+        cmd2_params = cmd2_resp.json()["params"]
+        cmd2_qid = cmd2_params["queue_id"]
+        cmd2_qver = cmd2_params["queue_version"]
+
+    client.post(
+        "/api/v1/music/control/command/cmd_seq_test_002/ack",
+        json={"status": "applied", "applied_mode": "single_loop"},
+        headers=car_headers,
+    )
+
+    db_session.expire_all()
+    applied_status = db_session.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == dev_id).first()
+    assert applied_status.queue_id == cmd2_qid
+    assert applied_status.queue_version == cmd2_qver
+    assert applied_status.applied_mode == "single_loop"
+
+    resp_applied = client.get("/api/v1/music/control/status", headers=phone_headers)
+    assert resp_applied.json()["queue_id"] == cmd2_qid
+    assert resp_applied.json()["queue_version"] == cmd2_qver
+
+
+def test_cold_pending_single_read_does_not_call_favorite_or_mutate_active(client, phone_headers):
+    """
+    Requirement 2:
+    - Pure read-only and snapshot cache order:
+      Reading an explicit (queue_id, queue_version) for a cold device hits snapshot cache directly,
+      without calling NetEase favorite playlist or mutating active queue.
+    - Generic GET /api/v1/music/queue on cold device returns favorite view with activate=False
+      without populating _active_queues.
+    """
+    dev_id = settings.DEFAULT_CAR_DEVICE_ID
+    music_queue_snapshot_manager.clear_all()
+    assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+    # 1. Prepare a single-track pending queue
+    snap = asyncio.run(
+        music_queue_snapshot_manager.prepare_single_track_queue(
+            device_id=dev_id,
+            song_id=7777,
+            title="Cold Isolated Track",
+            artist="Isolated Artist",
+            command_id="cmd_cold_read_001",
+        )
+    )
+    assert snap.queue_id.startswith("q_single_")
+    assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+    # 2. Query explicit snapshot while mocking NetEase favorite to raise an error
+    # If get_queue_page tried to init favorite playlist, this test would fail!
+    with patch.object(netease_service, "get_favorite_playlist_info", side_effect=PermissionError("Should not call favorite!")):
+        resp = client.get(
+            f"/api/v1/music/queue?queue_id={snap.queue_id}&queue_version={snap.queue_version}",
+            headers=phone_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["queue_id"] == snap.queue_id
+        assert data["queue_version"] == snap.queue_version
+        assert data["source"] == "single_track"
+        assert len(data["tracks"]) == 1
+        assert data["tracks"][0]["song_id"] == 7777
+        assert data["tracks"][0]["title"] == "Cold Isolated Track"
+
+    # Active queue remains None after reading explicit snapshot
+    assert music_queue_snapshot_manager.get_active_queue(dev_id) is None
+
+    # 3. Default GET /api/v1/music/queue on cold device returns favorite view but does NOT activate
+    dummy_favs = [{"id": 501, "name": "Fav Track 501", "artist": "Artist 501"}]
+    fav_info = {"playlist_id": 9999, "track_count": 1, "name": "我喜欢的音乐"}
+    with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value=fav_info), \
+         patch.object(netease_service, "get_favorite_playlist_tracks", new_callable=AsyncMock, return_value={"songs": dummy_favs, "has_more": False}):
+        resp_generic = client.get("/api/v1/music/queue", headers=phone_headers)
+        assert resp_generic.status_code == 200
+        gen_data = resp_generic.json()
+        assert gen_data["source"] == "netease_favorite"
+        assert gen_data["total"] == 1
+
+    # Default GET did NOT activate: active queue is STILL None!
+    assert music_queue_snapshot_manager.get_active_queue(dev_id) is None

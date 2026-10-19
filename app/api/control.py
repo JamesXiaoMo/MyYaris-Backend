@@ -738,6 +738,7 @@ async def get_music_queue(
             queue_version=queue_version,
             offset=offset,
             limit=limit,
+            db=db,
         )
     except HTTPException:
         raise
