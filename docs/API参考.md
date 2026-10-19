@@ -206,11 +206,14 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   }
   ```
 - **支持动作清单 (`action`)**：
-  - `play_track`（切歌播放）、`pause`（暂停）、`resume`（继续）、`stop`（停止）
-  - `next`（下一首）、`prev`（上一首）
+  - `play_track`（指定曲目播放，支持 `track_id`, `queue_id`, `queue_index`, `stream_url` 等）
+  - `set_playback_mode`（显式切换播放模式：`mode="list_loop"` | `"shuffle"` | `"intelligence"` | `"single_loop"`, 可带 `seed_track_id`）
+  - `switch_queue`（显式切换播放队列源：`source="netease_favorite"` | `"netease_intelligence"` | `"single_track"`, 可带 `start_index`, `start_track_id`）
+  - `pause`（暂停）、`resume`（继续）、`stop`（停止）
+  - `next`（下一首，车机自主维持全量循环）、`prev`（上一首）
   - `seek`（进度跳转，`position_ms`，TTL 默认 20s）
   - `set_volume`（软件音量 `volume: 0.0~1.0`，TTL 默认 20s）
-  - `set_loop`（`mode: "all"|"one"|"off"`）、`set_shuffle`（`shuffle: true|false`）
+  - `set_loop`（兼容映射）、`set_shuffle`（兼容映射）
 - **幂等与冲突规则**：
   - 相同 `command_id` + 相同 payload -> 返回 200 OK 既有记录（不重发）；
   - 相同 `command_id` + 不同 payload 或不同设备 -> 返回 **409 Conflict**。
@@ -230,6 +233,9 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   ```json
   {
     "status": "applied",     // "received" | "applied" | "failed"
+    "applied_mode": "list_loop",
+    "queue_version": 102,
+    "current_index": 45,
     "error_code": null,      // 失败时填写，如 "TRACK_DECODE_ERROR"
     "error_detail": null
   }
@@ -245,7 +251,22 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 
 ### 5.6 车机播放状态上报与查询
 - **车机上报状态**：`POST /api/v1/music/control/status`（上报后实时通过 WebSocket 广播给手机）
+  - 关键状态字段：`device_id`, `playback_state` (`playing`|`paused`|`stopped`), `applied_mode`, `requested_mode`, `queue_id`, `queue_version`, `queue_source`, `current_index`, `current_track_id`, `position_ms`, `duration_ms`, `software_volume`, `consecutive_failures`, `error_code`, `error_detail`, `capabilities`
 - **查询当前快照**：`GET /api/v1/music/control/status?device_id=car_p3pro`
+
+### 5.7 全量播放队列元数据与分页 (`GET /api/v1/music/queue`)
+- **方法 & 路径**：`GET /api/v1/music/queue`
+- **鉴权**：`phone` / `car` / `admin`
+- **Query 参数**：
+  - `device_id`: 车机标识（默认 `car_p3pro`）
+  - `source`: `"netease_favorite"` (默认喜欢歌单) | `"netease_intelligence"` | `"single_track"`
+  - `offset`: 分页偏移量 (默认 0)
+  - `limit`: 每页大小 (默认 50，最大 100)
+- **响应结构**：返回 `queue_id`, `queue_version`, `source`, `playlist_id`, `total` (全量曲目数), `is_complete`, `offset`, `limit`, `has_more`, `tracks` 列表。
+- **契约核心保障**：
+  - 列表循环与随机播放必须覆盖 `total` 全量喜欢曲目；
+  - 媒体直链按需拉取，严禁批量预拉取全歌单直链以防 CDN 临时 URL 过期失效；
+  - 详见专篇：`docs/音乐播放队列与状态同步契约.md`。
 
 ---
 
@@ -342,6 +363,9 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 - `GET /api/v1/music/netease/song_url?song_id=...`：解析音频直链
 - `GET /api/v1/music/netease/lyric?song_id=...`：获取逐字歌词
 - `POST /api/v1/music/netease/intelligence`：基于目标歌曲生成心动智能推荐队列
+  - **真实心动模式保障**：必须来自上游 `/playmode/intelligence/list` 真实推荐流；
+  - **严禁伪装**：上游未登录/凭证失效返回 **HTTP 409 Conflict**，上游服务异常返回 **HTTP 502 Bad Gateway**；断然禁止使用 `simi_fallback` 相似曲或空列表假冒成功；
+  - **无害容错**：失败时车机保留原播放状态与原队列，绝不中断当前音频，绝不自动重新登录，绝不调用 `like/unlike` 接口。
 
 ### 8.3 边播边存智能缓存代理 (`/api/v1/music/netease/stream/{song_id}`)
 - **方法 & 路径**：`GET, HEAD /api/v1/music/netease/stream/{song_id}`
