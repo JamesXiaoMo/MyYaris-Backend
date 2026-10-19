@@ -104,12 +104,14 @@ class NeteaseService:
         self._cached_cookie_signature: Optional[str] = None
         self._cached_fav_timestamp: float = 0.0
         self._fav_cache_ttl_seconds: float = 300.0  # 5 minutes TTL
+        self._cached_favorite_track_ids: Optional[set] = None
 
     def invalidate_favorite_cache(self):
         """Invalidates cached favorite playlist metadata upon session changes or manual refresh."""
         self._cached_favorite_playlist = None
         self._cached_cookie_signature = None
         self._cached_fav_timestamp = 0.0
+        self._cached_favorite_track_ids = None
 
     def _with_cookie_param(self, params: Optional[dict] = None) -> dict:
         p = dict(params or {})
@@ -317,68 +319,97 @@ class NeteaseService:
 
         return {"song_id": song_id, "url": None, "br": 0, "size_bytes": 0, "type": "mp3"}
 
+    async def is_song_in_favorite_playlist(self, song_id: int) -> bool:
+        """
+        Verifies whether a song belongs to the current verified owner's favorite playlist.
+        Fetches track IDs via upstream /playlist/detail.
+        """
+        if self._cached_favorite_track_ids is not None:
+            return song_id in self._cached_favorite_track_ids
+
+        fav_info = await self.get_favorite_playlist_info()
+        pid = fav_info["playlist_id"]
+        detail = await self.get_playlist_detail(pid)
+        track_ids = set()
+        for item in detail.get("trackIds", []):
+            if isinstance(item, dict) and "id" in item:
+                track_ids.add(item["id"])
+            elif isinstance(item, int):
+                track_ids.add(item)
+        if not track_ids and detail.get("tracks"):
+            for t in detail.get("tracks", []):
+                if isinstance(t, dict) and "id" in t:
+                    track_ids.add(t["id"])
+        self._cached_favorite_track_ids = track_ids
+        return song_id in track_ids
+
     async def get_intelligence(self, seed_song_id: int, playlist_id: Optional[int] = None, count: int = 30) -> Tuple[str, List[Dict[str, Any]]]:
         """
-        Generate intelligence (心动模式) recommended playlist.
-        Falls back to simi/song if login credentials are not present (code 301).
+        Generate authentic intelligence (心动模式) recommended playlist from upstream /playmode/intelligence/list.
+        Strictly forbids fallback to simi/song or empty lists pretending success.
+        Raises PermissionError if login credentials are missing or expired (code 301/401).
+        Raises NeteaseUpstreamError if upstream fails or times out.
         """
+        cookie = self.cookie_store.load()
+        if not cookie:
+            raise PermissionError("Netease Cloud Music account is not logged in on backend.")
+
         url_intel = f"{self.base_url}/playmode/intelligence/list"
         params = self._with_cookie_param({"id": seed_song_id, "pid": playlist_id or ""})
 
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(url_intel, params=params)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("code") == 200 and data.get("data"):
-                        raw_list = data["data"]
-                        parsed = []
-                        for item in raw_list[:count]:
-                            s = item.get("songInfo") or item
-                            s_id = s.get("id")
-                            if not s_id:
-                                continue
-                            ar_names = [ar.get("name", "") for ar in s.get("ar", []) if ar.get("name")]
-                            parsed.append({
-                                "id": s_id,
-                                "title": s.get("name", "Unknown Title"),
-                                "artist": " / ".join(ar_names) or "Unknown Artist",
-                                "album": (s.get("al") or {}).get("name"),
-                                "duration_ms": s.get("dt", 0),
-                                "cover_url": (s.get("al") or {}).get("picUrl"),
-                            })
-                        if parsed:
-                            return "intelligence", parsed
+                if resp.status_code != 200:
+                    raise NeteaseUpstreamError(
+                        f"Upstream intelligence returned HTTP {resp.status_code}",
+                        status_code=502,
+                    )
+                data = resp.json()
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout calling Netease intelligence for song {seed_song_id}: {e}")
+            raise NeteaseUpstreamError("Upstream Netease intelligence query timed out", status_code=504)
+        except httpx.RequestError as e:
+            logger.error(f"Network error calling Netease intelligence for song {seed_song_id}: {e}")
+            raise NeteaseUpstreamError(f"Upstream Netease intelligence connection failed: {e}", status_code=502)
+        except (PermissionError, NeteaseUpstreamError):
+            raise
         except Exception as e:
-            logger.info(f"Intelligence API attempt exception: {e}")
+            logger.error(f"Error calling Netease intelligence for song {seed_song_id}: {e}")
+            raise NeteaseUpstreamError(f"Failed to query upstream Netease intelligence: {e}", status_code=502)
 
-        # Fallback to simi/song
-        url_simi = f"{self.base_url}/simi/song"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url_simi, params={"id": seed_song_id})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    raw_songs = data.get("songs", [])
-                    parsed = []
-                    for s in raw_songs[:count]:
-                        s_id = s.get("id")
-                        if not s_id:
-                            continue
-                        artists = [a.get("name", "") for a in s.get("artists", []) if a.get("name")]
-                        parsed.append({
-                            "id": s_id,
-                            "title": s.get("name", "Unknown Title"),
-                            "artist": " / ".join(artists) or "Unknown Artist",
-                            "album": (s.get("album") or {}).get("name"),
-                            "duration_ms": s.get("duration", 0),
-                            "cover_url": (s.get("album") or {}).get("picUrl"),
-                        })
-                    return "simi_fallback", parsed
-        except Exception as e:
-            logger.error(f"Simi song fallback error: {e}")
+        code = data.get("code")
+        if code in (301, 401) or "need login" in str(data.get("message", "")).lower():
+            raise PermissionError("Netease session credentials expired or invalid")
+        if code is not None and code != 200:
+            raise NeteaseUpstreamError(
+                f"Upstream intelligence returned code {code}: {data.get('message')}",
+                status_code=502,
+            )
 
-        return "empty", []
+        raw_list = data.get("data") or []
+        parsed = []
+        for item in raw_list[:count]:
+            s = item.get("songInfo") or item
+            s_id = s.get("id")
+            if not s_id:
+                continue
+            ar_names = [ar.get("name", "") for ar in s.get("ar", []) if ar.get("name")]
+            parsed.append({
+                "id": s_id,
+                "title": s.get("name", "Unknown Title"),
+                "artist": " / ".join(ar_names) or "Unknown Artist",
+                "album": (s.get("al") or {}).get("name"),
+                "duration_ms": s.get("dt", 0),
+                "cover_url": (s.get("al") or {}).get("picUrl"),
+                "fee": s.get("fee", 0),
+                "playable": None,  # Rule 3: null when unverified
+            })
+
+        if not parsed:
+            raise NeteaseUpstreamError("No tracks returned from upstream intelligence API", status_code=503)
+
+        return "intelligence", parsed
 
     async def get_lyric(self, song_id: int) -> Dict[str, Any]:
         url = f"{self.base_url}/lyric"

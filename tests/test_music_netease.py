@@ -118,7 +118,9 @@ def test_netease_intelligence_endpoint(client, phone_headers):
         ],
     }
 
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+    with patch.object(netease_service.cookie_store, "load", return_value="dummy_cookie=1"), \
+         patch.object(netease_service, "is_song_in_favorite_playlist", new_callable=AsyncMock, return_value=True), \
+         patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = mock_intel_data

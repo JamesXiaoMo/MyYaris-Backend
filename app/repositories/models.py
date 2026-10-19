@@ -136,6 +136,18 @@ class CarDeviceStatus(Base):
     software_volume = Column(Float, default=1.0, nullable=False)
     loop_mode = Column(String(16), default="all", nullable=False)  # all | one | off
     shuffle_enabled = Column(Boolean, default=False, nullable=False)
+    applied_mode = Column(String(32), default="list_loop", nullable=True)  # list_loop | shuffle | intelligence | single_loop
+    requested_mode = Column(String(32), default="list_loop", nullable=True)
+    queue_id = Column(String(64), nullable=True)
+    queue_version = Column(Integer, default=1, nullable=True)
+    queue_source = Column(String(32), default="netease_favorite", nullable=True)
+    current_index = Column(Integer, default=0, nullable=True)
+    consecutive_failures = Column(Integer, default=0, nullable=True)
+    error_code = Column(String(64), nullable=True)
+    error_detail = Column(Text, nullable=True)
+    capabilities_json = Column(Text, nullable=True)
+    status_seq = Column(Integer, default=0, nullable=False)
+    last_applied_command_id = Column(String(64), nullable=True)
     last_heartbeat_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 

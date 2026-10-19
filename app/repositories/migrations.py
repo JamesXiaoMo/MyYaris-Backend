@@ -126,6 +126,36 @@ def run_db_migrations(engine) -> None:
             )
             conn.commit()
 
+            # 4. Check and migrate SQLite columns for 'car_device_status' table
+            car_status_check = conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='car_device_status'")
+            ).fetchone()
+
+            if car_status_check:
+                car_cols = [
+                    row[1]
+                    for row in conn.execute(text("PRAGMA table_info(car_device_status)")).fetchall()
+                ]
+                new_columns = [
+                    ("applied_mode", "VARCHAR(32) DEFAULT 'list_loop'"),
+                    ("requested_mode", "VARCHAR(32) DEFAULT 'list_loop'"),
+                    ("queue_id", "VARCHAR(64)"),
+                    ("queue_version", "INTEGER DEFAULT 1"),
+                    ("queue_source", "VARCHAR(32) DEFAULT 'netease_favorite'"),
+                    ("current_index", "INTEGER DEFAULT 0"),
+                    ("consecutive_failures", "INTEGER DEFAULT 0"),
+                    ("error_code", "VARCHAR(64)"),
+                    ("error_detail", "TEXT"),
+                    ("capabilities_json", "TEXT"),
+                    ("status_seq", "INTEGER DEFAULT 0"),
+                    ("last_applied_command_id", "VARCHAR(64)"),
+                ]
+                for col_name, col_def in new_columns:
+                    if col_name not in car_cols:
+                        logger.info(f"Migrating car_device_status table: Adding {col_name} column")
+                        conn.execute(text(f"ALTER TABLE car_device_status ADD COLUMN {col_name} {col_def}"))
+                        conn.commit()
+
             logger.info("Database schema migration completed successfully.")
         except Exception as e:
             logger.error(f"Error during schema migration: {e}", exc_info=True)

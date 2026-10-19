@@ -1,8 +1,10 @@
 import asyncio
 import collections
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 from fastapi import HTTPException, WebSocket, status
@@ -20,7 +22,9 @@ from app.schemas.control import (
     MusicCommandRequest,
     MusicCommandResponse,
 )
+from app.schemas.netease import MusicQueueResponse, NeteaseQueueTrackItem
 from app.services.device_service import is_same_device, resolve_car_device_id
+from app.services.netease_service import netease_service, NeteaseUpstreamError
 
 logger = logging.getLogger(__name__)
 
@@ -393,9 +397,398 @@ class MusicCommandQueueManager:
             return cmd
 
 
+class QueueSnapshot:
+    def __init__(
+        self,
+        queue_id: str,
+        queue_version: int,
+        source: str,
+        name: str,
+        total: int,
+        is_complete: bool,
+        queue_state: str,
+        tracks: List[Dict[str, Any]],
+        device_id: str,
+        seed_song_id: Optional[int] = None,
+        batch_count: int = 1,
+    ):
+        self.queue_id = queue_id
+        self.queue_version = queue_version
+        self.source = source
+        self.name = name
+        self.total = total
+        self.is_complete = is_complete
+        self.queue_state = queue_state
+        self.tracks = tracks
+        self.device_id = device_id
+        self.seed_song_id = seed_song_id
+        self.batch_count = batch_count
+        self.created_at = utc_now()
+        self.updated_at = utc_now()
+
+
+class MusicQueueSnapshotManager:
+    """
+    Manages in-memory versioned immutable queue snapshots per vehicle device.
+    Supports pure read-only pagination, version conflict detection (409),
+    authentic intelligence queue generation and appending, and cache invalidation on logout.
+    """
+
+    def __init__(self):
+        self._active_queues: Dict[str, QueueSnapshot] = {}
+        self._snapshots: Dict[Tuple[str, str, int], QueueSnapshot] = {}
+        self._replenish_cache: Dict[str, QueueSnapshot] = {}
+        self._lock = asyncio.Lock()
+
+    def clear_all(self):
+        """Clears all in-memory queue snapshots and replenishment caches."""
+        self._active_queues.clear()
+        self._snapshots.clear()
+        self._replenish_cache.clear()
+        logger.info("Cleared all music queue snapshots and caches.")
+
+    def get_active_queue(self, device_id: str) -> Optional[QueueSnapshot]:
+        norm_dev = resolve_car_device_id(device_id)
+        return self._active_queues.get(norm_dev)
+
+    def set_active_queue(self, device_id: str, snapshot: QueueSnapshot):
+        norm_dev = resolve_car_device_id(device_id)
+        self._active_queues[norm_dev] = snapshot
+        self._snapshots[(norm_dev, snapshot.queue_id, snapshot.queue_version)] = snapshot
+
+    async def init_favorite_queue(self, device_id: str, force_refresh: bool = False) -> QueueSnapshot:
+        """
+        Initializes or refreshes the full favorite playlist queue for device_id.
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        fav_info = await netease_service.get_favorite_playlist_info(force_refresh=force_refresh)
+        pid = fav_info["playlist_id"]
+        track_count = fav_info["track_count"]
+
+        if track_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "EMPTY_PLAYLIST",
+                    "error_detail": "Owner favorite playlist is empty (track_count == 0)",
+                    "message": "当前登录账号喜欢歌单为空，无法生成播放队列",
+                },
+            )
+
+        # Pull tracks for favorite playlist
+        tracks_data = await netease_service.get_favorite_playlist_tracks(offset=0, limit=min(1000, max(100, track_count)))
+        songs = tracks_data.get("songs", [])
+
+        formatted_tracks = []
+        for idx, s in enumerate(songs):
+            s_id = s["id"]
+            formatted_tracks.append({
+                "track_id": f"netease_{s_id}",
+                "song_id": s_id,
+                "title": s["title"],
+                "artist": s["artist"],
+                "album": s.get("album"),
+                "duration_ms": s.get("duration_ms", 0),
+                "cover_url": s.get("cover_url"),
+                "stream_url": f"/api/v1/music/netease/stream/{s_id}",
+                "fee": s.get("fee", 0),
+                "playable": None,  # Rule 3: null when unverified
+                "queue_index": idx,
+            })
+
+        owner_uid = fav_info.get("user_id") or "owner"
+        opaque_hash = hashlib.sha256(f"{owner_uid}:{pid}".encode("utf-8")).hexdigest()[:12]
+        queue_id = f"q_fav_{opaque_hash}"
+        version = 100
+
+        snapshot = QueueSnapshot(
+            queue_id=queue_id,
+            queue_version=version,
+            source="netease_favorite",
+            name=fav_info.get("name") or "我喜欢的音乐",
+            total=len(formatted_tracks),
+            is_complete=True,
+            queue_state="ready",
+            tracks=formatted_tracks,
+            device_id=norm_dev,
+        )
+
+        async with self._lock:
+            self._active_queues[norm_dev] = snapshot
+            self._snapshots[(norm_dev, queue_id, version)] = snapshot
+
+        return snapshot
+
+    async def create_intelligence_queue(
+        self,
+        device_id: str,
+        seed_song_id: int,
+        songs: List[Dict[str, Any]],
+        request_id: Optional[str] = None,
+    ) -> QueueSnapshot:
+        """
+        Creates a new intelligence queue for device_id from initial seed.
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        if request_id and request_id in self._replenish_cache:
+            return self._replenish_cache[request_id]
+
+        now_ts = int(time.time() * 1000)
+        opaque_hash = hashlib.sha256(f"{seed_song_id}:{now_ts}".encode("utf-8")).hexdigest()[:12]
+        queue_id = f"q_intel_{opaque_hash}"
+        version = 100
+
+        formatted_tracks = []
+        for idx, s in enumerate(songs):
+            s_id = s["id"]
+            formatted_tracks.append({
+                "track_id": f"netease_{s_id}",
+                "song_id": s_id,
+                "title": s["title"],
+                "artist": s["artist"],
+                "album": s.get("album"),
+                "duration_ms": s.get("duration_ms", 0),
+                "cover_url": s.get("cover_url"),
+                "stream_url": f"/api/v1/music/netease/stream/{s_id}",
+                "fee": s.get("fee", 0),
+                "playable": None,
+                "queue_index": idx,
+            })
+
+        snapshot = QueueSnapshot(
+            queue_id=queue_id,
+            queue_version=version,
+            source="netease_intelligence",
+            name="心动模式推荐",
+            total=len(formatted_tracks),
+            is_complete=False,
+            queue_state="ready",
+            tracks=formatted_tracks,
+            device_id=norm_dev,
+            seed_song_id=seed_song_id,
+            batch_count=1,
+        )
+
+        async with self._lock:
+            self._active_queues[norm_dev] = snapshot
+            self._snapshots[(norm_dev, queue_id, version)] = snapshot
+            if request_id:
+                self._replenish_cache[request_id] = snapshot
+
+        return snapshot
+
+    async def append_intelligence_tracks(
+        self,
+        device_id: str,
+        songs: List[Dict[str, Any]],
+        request_id: Optional[str] = None,
+    ) -> QueueSnapshot:
+        """
+        Appends a replenishment batch of intelligence tracks to active queue.
+        Ensures existing track indices remain completely stable and increments queue_version.
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        if request_id and request_id in self._replenish_cache:
+            return self._replenish_cache[request_id]
+
+        active = self._active_queues.get(norm_dev)
+        if not active or active.source != "netease_intelligence":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "QUEUE_NOT_READY",
+                    "error_detail": "Active queue is not an intelligence queue",
+                    "message": "当前播放队列不是心动模式队列，无法续批",
+                },
+            )
+
+        if active.batch_count >= 5 or len(active.tracks) >= 150:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": 503,
+                    "error_code": "INTELLIGENCE_QUEUE_EXHAUSTED",
+                    "error_detail": "Intelligence replenishment batch limit reached (max 5 batches / 150 songs)",
+                    "message": "心动模式推荐曲目已达上限",
+                },
+            )
+
+        async with self._lock:
+            old_total = len(active.tracks)
+            for i, s in enumerate(songs):
+                s_id = s["id"]
+                active.tracks.append({
+                    "track_id": f"netease_{s_id}",
+                    "song_id": s_id,
+                    "title": s["title"],
+                    "artist": s["artist"],
+                    "album": s.get("album"),
+                    "duration_ms": s.get("duration_ms", 0),
+                    "cover_url": s.get("cover_url"),
+                    "stream_url": f"/api/v1/music/netease/stream/{s_id}",
+                    "fee": s.get("fee", 0),
+                    "playable": None,
+                    "queue_index": old_total + i,
+                })
+
+            active.queue_version += 1
+            active.total = len(active.tracks)
+            active.batch_count += 1
+            active.updated_at = utc_now()
+
+            self._snapshots[(norm_dev, active.queue_id, active.queue_version)] = active
+            if request_id:
+                self._replenish_cache[request_id] = active
+
+        return active
+
+    async def create_single_track_queue(
+        self,
+        device_id: str,
+        song_id: int,
+        title: str,
+        artist: str,
+        album: Optional[str] = None,
+        duration_ms: int = 0,
+        cover_url: Optional[str] = None,
+    ) -> QueueSnapshot:
+        """
+        Creates an explicit temporary single-track queue (source="single_track").
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        now_ts = int(time.time() * 1000)
+        opaque_hash = hashlib.sha256(f"{song_id}:{now_ts}".encode("utf-8")).hexdigest()[:12]
+        queue_id = f"q_single_{opaque_hash}"
+        version = 100
+
+        tracks = [{
+            "track_id": f"netease_{song_id}",
+            "song_id": song_id,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "duration_ms": duration_ms,
+            "cover_url": cover_url,
+            "stream_url": f"/api/v1/music/netease/stream/{song_id}",
+            "fee": 0,
+            "playable": None,
+            "queue_index": 0,
+        }]
+
+        snapshot = QueueSnapshot(
+            queue_id=queue_id,
+            queue_version=version,
+            source="single_track",
+            name=f"单曲: {title}",
+            total=1,
+            is_complete=True,
+            queue_state="ready",
+            tracks=tracks,
+            device_id=norm_dev,
+        )
+
+        async with self._lock:
+            self._active_queues[norm_dev] = snapshot
+            self._snapshots[(norm_dev, queue_id, version)] = snapshot
+
+        return snapshot
+
+    async def get_queue_page(
+        self,
+        device_id: str,
+        source: Optional[str] = None,
+        queue_id: Optional[str] = None,
+        queue_version: Optional[int] = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> MusicQueueResponse:
+        """
+        Pure read-only query for queue metadata and paginated tracks.
+        Querying with ?source=... NEVER switches the active queue.
+        Validates snapshot immutability: returns 409 QUEUE_VERSION_CONFLICT on version mismatch.
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        active = self._active_queues.get(norm_dev)
+        if active is None:
+            active = await self.init_favorite_queue(norm_dev)
+
+        target = active
+        if queue_id and queue_version is not None:
+            cached = self._snapshots.get((norm_dev, queue_id, queue_version))
+            if cached:
+                target = cached
+            elif queue_id == active.queue_id:
+                if queue_version != active.queue_version:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": 409,
+                            "error_code": "QUEUE_VERSION_CONFLICT",
+                            "error_detail": f"Requested queue version {queue_version} does not match current snapshot version {active.queue_version}.",
+                            "message": "播放队列版本已变更，请从第一页重新拉取。",
+                        },
+                    )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": 409,
+                        "error_code": "QUEUE_VERSION_CONFLICT",
+                        "error_detail": f"Requested queue snapshot ({queue_id}, v{queue_version}) not found.",
+                        "message": "播放队列版本已变更，请从第一页重新拉取。",
+                    },
+                )
+        elif queue_version is not None and queue_version != active.queue_version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "QUEUE_VERSION_CONFLICT",
+                    "error_detail": f"Requested queue version {queue_version} does not match current snapshot version {active.queue_version}.",
+                    "message": "播放队列版本已变更，请从第一页重新拉取。",
+                },
+            )
+        elif offset > 0 and queue_id is not None and queue_id != active.queue_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "QUEUE_VERSION_CONFLICT",
+                    "error_detail": f"Requested queue_id {queue_id} does not match active queue {active.queue_id}.",
+                    "message": "播放队列已变更，请重新获取最新队列。",
+                },
+            )
+
+        limit_bounded = max(1, min(100, limit))
+        total = target.total
+        tracks_slice = target.tracks[offset : offset + limit_bounded]
+        has_more = (offset + len(tracks_slice)) < total
+
+        items = [NeteaseQueueTrackItem(**t) for t in tracks_slice]
+
+        return MusicQueueResponse(
+            code=200,
+            queue_id=target.queue_id,
+            queue_version=target.queue_version,
+            source=target.source,
+            name=target.name,
+            total=total,
+            is_complete=target.is_complete,
+            queue_state=target.queue_state,
+            offset=offset,
+            limit=limit_bounded,
+            has_more=has_more,
+            tracks=items,
+        )
+
+
 # Global singletons
 ws_manager = WebSocketConnectionManager()
 command_queue_manager = MusicCommandQueueManager()
+music_queue_snapshot_manager = MusicQueueSnapshotManager()
+netease_service.cookie_store.on_change_callbacks.append(music_queue_snapshot_manager.clear_all)
 
 
 # --- Database Operations for Command Lifecycle ---
@@ -420,14 +813,24 @@ def create_or_get_music_command(
         if not is_same_device(existing.device_id, norm_dev):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Command ID '{cmd_id}' already exists for another device '{existing.device_id}'.",
+                detail={
+                    "code": 409,
+                    "error_code": "COMMAND_CONFLICT",
+                    "error_detail": f"Command ID '{cmd_id}' already exists for another device '{existing.device_id}'.",
+                    "message": "指令ID冲突：相同指令ID已绑定不同设备",
+                },
             )
         # Check payload mismatch
         existing_params = json.loads(existing.params_json) if existing.params_json else {}
         if existing.action != cmd_req.action or existing_params != incoming_params:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Command ID '{cmd_id}' already exists with different action or parameters.",
+                detail={
+                    "code": 409,
+                    "error_code": "COMMAND_CONFLICT",
+                    "error_detail": f"Command ID '{cmd_id}' already exists with different action or parameters.",
+                    "message": "指令ID冲突：相同指令ID已存在且携带不同参数",
+                },
             )
         return existing, False
 
@@ -466,13 +869,23 @@ def create_or_get_music_command(
             if not is_same_device(existing.device_id, norm_dev):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Command ID '{cmd_id}' already exists for another device '{existing.device_id}'.",
+                    detail={
+                        "code": 409,
+                        "error_code": "COMMAND_CONFLICT",
+                        "error_detail": f"Command ID '{cmd_id}' already exists for another device '{existing.device_id}'.",
+                        "message": "指令ID冲突：相同指令ID已绑定不同设备",
+                    },
                 )
             existing_params = json.loads(existing.params_json) if existing.params_json else {}
             if existing.action != cmd_req.action or existing_params != incoming_params:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Command ID '{cmd_id}' already exists with different action or parameters.",
+                    detail={
+                        "code": 409,
+                        "error_code": "COMMAND_CONFLICT",
+                        "error_detail": f"Command ID '{cmd_id}' already exists with different action or parameters.",
+                        "message": "指令ID冲突：相同指令ID已存在且携带不同参数",
+                    },
                 )
             return existing, False
         raise
@@ -505,6 +918,9 @@ def record_command_ack(
     car_device_id: str,
     error_code: Optional[str] = None,
     error_detail: Optional[str] = None,
+    applied_mode: Optional[str] = None,
+    queue_version: Optional[int] = None,
+    current_index: Optional[int] = None,
 ) -> Optional[MusicCommand]:
     """
     Records vehicle acknowledgement of command execution.
@@ -532,6 +948,18 @@ def record_command_ack(
     if norm_status in ("applied", "executed", "ok", "success"):
         cmd.status = "applied"
         command_queue_manager.mark_acknowledged(command_id)
+
+        # Update CarDeviceStatus with execution confirmation
+        status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == cmd.device_id).first()
+        if status_row:
+            status_row.last_applied_command_id = command_id
+            if applied_mode:
+                status_row.applied_mode = applied_mode
+            if queue_version is not None:
+                status_row.queue_version = queue_version
+            if current_index is not None:
+                status_row.current_index = current_index
+            status_row.updated_at = utc_now()
     elif norm_status in ("failed", "error"):
         cmd.status = "failed"
         cmd.error_code = error_code
@@ -605,6 +1033,7 @@ def save_or_update_car_status(
 
     now = utc_now()
     if not status_row:
+        caps_str = json.dumps(report.capabilities) if report.capabilities is not None else json.dumps(["queue_v2"])
         status_row = CarDeviceStatus(
             device_id=dev_id,
             playback_state=report.playback_state,
@@ -614,11 +1043,35 @@ def save_or_update_car_status(
             software_volume=report.software_volume if report.software_volume is not None else 1.0,
             loop_mode=report.loop_mode or "all",
             shuffle_enabled=bool(report.shuffle),
+            applied_mode=report.applied_mode or "list_loop",
+            requested_mode=report.requested_mode or "list_loop",
+            queue_id=report.queue_id,
+            queue_version=report.queue_version if report.queue_version is not None else 1,
+            queue_source=report.queue_source or "netease_favorite",
+            current_index=report.current_index or 0,
+            consecutive_failures=report.consecutive_failures or 0,
+            error_code=report.error_code,
+            error_detail=report.error_detail,
+            capabilities_json=caps_str,
+            status_seq=report.status_seq or 0,
+            last_applied_command_id=report.last_applied_command_id,
             last_heartbeat_at=now,
             updated_at=now,
         )
         db.add(status_row)
     else:
+        # Monotonic status sequence protection: reject out-of-order older status snapshots
+        if report.status_seq is not None and status_row.status_seq is not None:
+            if report.status_seq < status_row.status_seq:
+                logger.warning(
+                    f"Ignored out-of-order status report for device {dev_id}: "
+                    f"report.status_seq ({report.status_seq}) < current ({status_row.status_seq})"
+                )
+                return status_row
+
+        if report.status_seq is not None:
+            status_row.status_seq = report.status_seq
+
         status_row.playback_state = report.playback_state
         if report.current_track_id is not None:
             status_row.current_track_id = report.current_track_id
@@ -631,6 +1084,27 @@ def save_or_update_car_status(
             status_row.loop_mode = report.loop_mode
         if report.shuffle is not None:
             status_row.shuffle_enabled = bool(report.shuffle)
+        if report.applied_mode is not None:
+            status_row.applied_mode = report.applied_mode
+        if report.requested_mode is not None:
+            status_row.requested_mode = report.requested_mode
+        if report.queue_id is not None:
+            status_row.queue_id = report.queue_id
+        if report.queue_version is not None:
+            status_row.queue_version = report.queue_version
+        if report.queue_source is not None:
+            status_row.queue_source = report.queue_source
+        if report.current_index is not None:
+            status_row.current_index = report.current_index
+        if report.consecutive_failures is not None:
+            status_row.consecutive_failures = report.consecutive_failures
+        status_row.error_code = report.error_code
+        status_row.error_detail = report.error_detail
+        if report.capabilities is not None:
+            status_row.capabilities_json = json.dumps(report.capabilities)
+        if report.last_applied_command_id is not None:
+            status_row.last_applied_command_id = report.last_applied_command_id
+
         status_row.last_heartbeat_at = now
         status_row.updated_at = now
 
@@ -645,6 +1119,12 @@ def get_car_status_by_id(db: Session, device_id: Optional[str] = None) -> Option
 
 
 def car_status_to_response(row: CarDeviceStatus) -> CarStatusResponse:
+    caps = []
+    if row.capabilities_json:
+        try:
+            caps = json.loads(row.capabilities_json)
+        except Exception:
+            caps = []
     return CarStatusResponse(
         device_id=row.device_id,
         playback_state=row.playback_state,
@@ -654,6 +1134,18 @@ def car_status_to_response(row: CarDeviceStatus) -> CarStatusResponse:
         software_volume=row.software_volume,
         loop_mode=row.loop_mode,
         shuffle_enabled=row.shuffle_enabled,
+        applied_mode=row.applied_mode or "list_loop",
+        requested_mode=row.requested_mode or "list_loop",
+        queue_id=row.queue_id,
+        queue_version=row.queue_version if row.queue_version is not None else 1,
+        queue_source=row.queue_source or "netease_favorite",
+        current_index=row.current_index or 0,
+        consecutive_failures=row.consecutive_failures or 0,
+        error_code=row.error_code,
+        error_detail=row.error_detail,
+        capabilities=caps,
+        status_seq=row.status_seq or 0,
+        last_applied_command_id=row.last_applied_command_id,
         last_heartbeat_at=row.last_heartbeat_at.isoformat(),
         updated_at=row.updated_at.isoformat() if row.updated_at else row.last_heartbeat_at.isoformat(),
     )

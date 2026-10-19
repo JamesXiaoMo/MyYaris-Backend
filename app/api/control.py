@@ -37,6 +37,7 @@ from app.schemas.control import (
     MusicCommandRequest,
     MusicCommandResponse,
 )
+from app.schemas.netease import MusicQueueResponse
 from app.services.control_service import (
     car_status_to_response,
     command_queue_manager,
@@ -45,10 +46,12 @@ from app.services.control_service import (
     get_music_command_by_id,
     music_command_to_detail,
     music_command_to_response,
+    music_queue_snapshot_manager,
     record_command_ack,
     record_command_sent,
     save_or_update_car_status,
     ws_manager,
+    NeteaseUpstreamError,
 )
 from app.services.device_service import is_same_device, resolve_car_device_id
 
@@ -67,6 +70,8 @@ VALID_ACTIONS = {
     "set_loop",
     "set_shuffle",
     "set_volume",
+    "set_playback_mode",
+    "switch_queue",
 }
 
 
@@ -91,6 +96,52 @@ async def send_music_command(
 
     target_device = resolve_car_device_id(cmd.device_id)
 
+    # Capability gate check for new queue V2 actions
+    if cmd.action in ("set_playback_mode", "switch_queue"):
+        car_status = get_car_status_by_id(db, target_device)
+        caps = []
+        if car_status and car_status.capabilities_json:
+            try:
+                caps = json.loads(car_status.capabilities_json)
+            except Exception:
+                caps = []
+        if "queue_v2" not in caps:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": 422,
+                    "error_code": "CAPABILITY_NOT_SUPPORTED",
+                    "error_detail": f"Target car device '{target_device}' does not support queue_v2 capabilities.",
+                    "message": "车机版本过低，不支持新版播放队列与心动模式",
+                },
+            )
+
+    # Precondition assertion on expected_queue_id and expected_queue_version
+    if cmd.params:
+        active_q = music_queue_snapshot_manager.get_active_queue(target_device)
+        if cmd.params.expected_queue_id:
+            if not active_q or active_q.queue_id != cmd.params.expected_queue_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": 409,
+                        "error_code": "QUEUE_PRECONDITION_FAILED",
+                        "error_detail": f"expected_queue_id '{cmd.params.expected_queue_id}' does not match active queue '{active_q.queue_id if active_q else None}'",
+                        "message": "播放队列前置条件不匹配",
+                    },
+                )
+        if cmd.params.expected_queue_version is not None:
+            if not active_q or active_q.queue_version != cmd.params.expected_queue_version:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": 409,
+                        "error_code": "QUEUE_PRECONDITION_FAILED",
+                        "error_detail": f"expected_queue_version {cmd.params.expected_queue_version} does not match active queue version {active_q.queue_version if active_q else None}",
+                        "message": "播放队列版本前置条件不匹配",
+                    },
+                )
+
     # 1. Idempotency & conflict check with SQLite persistence
     cmd_row, is_new = create_or_get_music_command(
         db=db,
@@ -98,6 +149,17 @@ async def send_music_command(
         target_device=target_device,
         sender_role=user.role,
     )
+
+    # Update requested_mode or queue_source if applicable
+    if is_new and cmd.params:
+        car_status_row = get_car_status_by_id(db, target_device)
+        if car_status_row:
+            if cmd.action == "set_playback_mode" and cmd.params.mode:
+                car_status_row.requested_mode = cmd.params.mode
+                db.commit()
+            elif cmd.action == "switch_queue" and cmd.params.source:
+                car_status_row.queue_source = cmd.params.source
+                db.commit()
 
     # If this command ID was already processed, return existing record
     if not is_new:
@@ -177,6 +239,9 @@ async def acknowledge_music_command(
         car_device_id=car_device,
         error_code=ack.error_code,
         error_detail=ack.error_detail,
+        applied_mode=ack.applied_mode,
+        queue_version=ack.queue_version,
+        current_index=ack.current_index,
     )
     if not cmd:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Command not found.")
@@ -186,6 +251,9 @@ async def acknowledge_music_command(
         "command_id": cmd.command_id,
         "status": cmd.status,
         "action": cmd.action,
+        "applied_mode": ack.applied_mode,
+        "queue_version": ack.queue_version,
+        "current_index": ack.current_index,
         "error_code": cmd.error_code,
         "error_detail": cmd.error_detail,
     }, device_id=cmd.device_id)
@@ -296,6 +364,69 @@ def get_car_playback_status(
         )
 
     return car_status_to_response(status_row)
+
+
+@router.get("/music/queue", response_model=MusicQueueResponse)
+async def get_music_queue(
+    device_id: Optional[str] = Query(None, description="Target vehicle device ID"),
+    source: Optional[str] = Query(None, description="Source filter (netease_favorite, etc.)"),
+    queue_id: Optional[str] = Query(None, description="Queue ID for version snapshot check"),
+    queue_version: Optional[int] = Query(None, description="Queue version for version snapshot check"),
+    offset: int = Query(0, ge=0, description="Track offset"),
+    limit: int = Query(50, ge=1, le=100, description="Page limit"),
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Pure read-only endpoint for music queue metadata and paginated tracks.
+    Querying with ?source=... NEVER switches the active playback queue.
+    Enforces immutable versioned snapshots. Version mismatch returns 409 QUEUE_VERSION_CONFLICT.
+    """
+    target_device = resolve_car_device_id(device_id, user.device_id)
+
+    # Account/device isolation
+    if user.role == "car" and user.device_id and not is_same_device(user.device_id, target_device):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Car token cannot access music queue of other devices.",
+        )
+    if user.role == "user" and not user.has_device_control:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: User account lacks vehicle device control permission.",
+        )
+
+    try:
+        return await music_queue_snapshot_manager.get_queue_page(
+            device_id=target_device,
+            source=source,
+            queue_id=queue_id,
+            queue_version=queue_version,
+            offset=offset,
+            limit=limit,
+        )
+    except HTTPException:
+        raise
+    except PermissionError as pe:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": 409,
+                "error_code": "INTELLIGENCE_AUTH_INVALID",
+                "error_detail": str(pe),
+                "message": "网易云登录凭证失效或未登录，无法拉取播放队列",
+            },
+        )
+    except NeteaseUpstreamError as nue:
+        raise HTTPException(
+            status_code=nue.status_code,
+            detail={
+                "code": nue.status_code,
+                "error_code": "INTELLIGENCE_UPSTREAM_FAILED",
+                "error_detail": nue.message,
+                "message": "上游网易云服务请求异常",
+            },
+        )
 
 
 @router.websocket("/ws/music")

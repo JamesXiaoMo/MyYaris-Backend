@@ -38,16 +38,51 @@ class NeteaseSearchResponse(BaseModel):
     songs: List[NeteaseSongItem] = []
 
 
+class NeteaseQueueTrackItem(BaseModel):
+    track_id: str = Field(..., description="Fixed unified format: netease_<song_id>")
+    song_id: int = Field(..., description="Netease song ID")
+    title: str = Field(..., description="Cleaned song title")
+    artist: str = Field(..., description="Artist name joined with ' / '")
+    album: Optional[str] = Field(None, description="Album name")
+    duration_ms: int = Field(0, description="Duration in milliseconds")
+    cover_url: Optional[str] = Field(None, description="Cover image URL")
+    stream_url: str = Field(..., description="Relative path /api/v1/music/netease/stream/{song_id} or trusted HTTPS")
+    fee: int = Field(0, description="0=free, 1=vip, 4=album, 8=pay")
+    playable: Optional[bool] = Field(None, description="null when unverified, never default True")
+    queue_index: int = Field(..., description="Absolute sequential index in queue")
+
+
+class MusicQueueResponse(BaseModel):
+    code: int = 200
+    queue_id: str
+    queue_version: int
+    source: str
+    name: str
+    total: int
+    is_complete: bool
+    queue_state: str = "ready"
+    offset: int
+    limit: int
+    has_more: bool
+    tracks: List[NeteaseQueueTrackItem] = Field(default_factory=list)
+
+
 class NeteaseIntelligenceRequest(BaseModel):
+    request_id: Optional[str] = Field(None, description="Client idempotent request ID")
     seed_song_id: int = Field(..., description="Seed song ID to generate recommendations from")
-    playlist_id: Optional[int] = Field(None, description="Optional playlist ID")
+    playlist_id: Optional[int] = Field(None, description="Owner favorite playlist ID")
+    batch_index: Optional[int] = Field(0, ge=0, description="Batch index (0 for initial, >0 for replenishment)")
     count: Optional[int] = Field(30, ge=1, le=100, description="Number of songs to recommend")
 
 
 class NeteaseIntelligenceResponse(BaseModel):
     code: int = 200
-    mode: str = Field("intelligence", description="intelligence or simi_fallback")
+    mode: str = Field("intelligence", description="Must be authentic intelligence")
     songs: List[NeteaseSongItem] = []
+    tracks: List[NeteaseQueueTrackItem] = []
+    queue_id: Optional[str] = None
+    queue_version: Optional[int] = None
+    batch_index: int = 0
 
 
 class NeteaseSongUrlResponse(BaseModel):

@@ -38,10 +38,12 @@ from app.schemas.netease import (
     NeteaseQRCheckResponse,
     NeteaseQRCreateResponse,
     NeteaseQRKeyResponse,
+    NeteaseQueueTrackItem,
     NeteaseSearchResponse,
     NeteaseSongItem,
     NeteaseSongUrlResponse,
 )
+from app.services.control_service import music_queue_snapshot_manager
 from app.services.media_service import (
     RangeNotSatisfiableError,
     file_chunk_generator,
@@ -183,21 +185,100 @@ async def generate_intelligence_queue(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     """
-    Generate intelligence mode (心动模式) continuous playback queue.
-    Automatically falls back to similar songs if account login is not yet configured.
+    Generate authentic intelligence mode (心动模式) continuous playback queue from upstream.
+    Initial seed song (batch_index == 0) must belong to the owner's favorite playlist.
+    Replenishment (batch_index > 0) appends to the active queue with stable indices.
     """
-    mode, songs = await netease_service.get_intelligence(
-        seed_song_id=req.seed_song_id,
-        playlist_id=req.playlist_id,
-        count=req.count or 30,
-    )
-    base_url = str(request.base_url).rstrip("/")
+    batch_idx = req.batch_index or 0
+
+    # 1. Initial seed qualification check (batch_index == 0)
+    if batch_idx == 0:
+        try:
+            is_in_fav = await netease_service.is_song_in_favorite_playlist(req.seed_song_id)
+            if not is_in_fav:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "code": 422,
+                        "error_code": "INVALID_SEED_SONG",
+                        "error_detail": "Initial intelligence seed song must belong to owner favorite playlist",
+                        "message": "心动模式初始种子曲目必须属于我喜欢的音乐",
+                    },
+                )
+        except HTTPException:
+            raise
+        except PermissionError as pe:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "INTELLIGENCE_AUTH_INVALID",
+                    "error_detail": str(pe),
+                    "message": "网易云登录凭证失效，心动模式不可用",
+                },
+            )
+        except NeteaseUpstreamError as nue:
+            raise HTTPException(
+                status_code=nue.status_code,
+                detail={
+                    "code": nue.status_code,
+                    "error_code": "INTELLIGENCE_UPSTREAM_FAILED",
+                    "error_detail": nue.message,
+                    "message": "上游网易云服务请求异常",
+                },
+            )
+
+    # 2. Query upstream intelligence API
+    try:
+        mode, songs = await netease_service.get_intelligence(
+            seed_song_id=req.seed_song_id,
+            playlist_id=req.playlist_id,
+            count=req.count or 30,
+        )
+    except PermissionError as pe:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": 409,
+                "error_code": "INTELLIGENCE_AUTH_INVALID",
+                "error_detail": str(pe),
+                "message": "网易云登录凭证失效，心动模式不可用",
+            },
+        )
+    except NeteaseUpstreamError as nue:
+        err_code = "INTELLIGENCE_QUEUE_EXHAUSTED" if nue.status_code == 503 else "INTELLIGENCE_UPSTREAM_FAILED"
+        msg = "心动模式推荐曲目已达上限" if nue.status_code == 503 else "上游网易云服务请求异常"
+        raise HTTPException(
+            status_code=nue.status_code,
+            detail={
+                "code": nue.status_code,
+                "error_code": err_code,
+                "error_detail": nue.message,
+                "message": msg,
+            },
+        )
+
+    # 3. Update device queue snapshot
+    target_device = user.device_id or settings.DEFAULT_CAR_DEVICE_ID
+    if batch_idx == 0:
+        snapshot = await music_queue_snapshot_manager.create_intelligence_queue(
+            device_id=target_device,
+            seed_song_id=req.seed_song_id,
+            songs=songs,
+            request_id=req.request_id,
+        )
+    else:
+        snapshot = await music_queue_snapshot_manager.append_intelligence_tracks(
+            device_id=target_device,
+            songs=songs,
+            request_id=req.request_id,
+        )
 
     items = []
     for s in songs:
         s_id = s["id"]
         cached = cache_manager.get_cached_track(db, s_id) is not None
-        stream_url = f"{base_url}/api/v1/music/netease/stream/{s_id}"
+        stream_url = f"/api/v1/music/netease/stream/{s_id}"
         items.append(
             NeteaseSongItem(
                 id=s_id,
@@ -208,13 +289,21 @@ async def generate_intelligence_queue(
                 cover_url=s.get("cover_url"),
                 cached=cached,
                 stream_url=stream_url,
+                fee=s.get("fee", 0),
+                playable=None,
             )
         )
 
+    track_items = [NeteaseQueueTrackItem(**t) for t in snapshot.tracks]
+
     return NeteaseIntelligenceResponse(
         code=200,
-        mode=mode,
+        mode="intelligence",
         songs=items,
+        tracks=track_items,
+        queue_id=snapshot.queue_id,
+        queue_version=snapshot.queue_version,
+        batch_index=batch_idx,
     )
 
 
