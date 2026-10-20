@@ -133,7 +133,7 @@ class CarStatusReportRequest(BaseModel):
     capabilities: Optional[list[str]] = None
     status_seq: Optional[int] = None
     last_applied_command_id: Optional[str] = None
-    updated_at: Optional[int] = Field(None, description="Client unix timestamp in ms")
+    updated_at: Optional[Union[int, str]] = Field(None, description="Client unix timestamp in ms or ISO string")
 
 
 class CarStatusResponse(BaseModel):
