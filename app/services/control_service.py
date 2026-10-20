@@ -24,7 +24,8 @@ from app.schemas.control import (
 )
 from app.schemas.netease import MusicQueueResponse, NeteaseQueueTrackItem
 from app.services.device_service import is_same_device, resolve_car_device_id
-from app.services.netease_service import netease_service, NeteaseUpstreamError
+from app.services.favorite_catalog import FavoriteRevisionGone
+from app.services.netease_service import netease_service, NeteaseUpstreamError, favorite_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +424,8 @@ class QueueSnapshot:
         self.device_id = device_id
         self.seed_song_id = seed_song_id
         self.batch_count = batch_count
+        # Favorite catalog revision this immutable snapshot was built from (None otherwise).
+        self.catalog_revision: Optional[int] = None
         self.created_at = utc_now()
         self.updated_at = utc_now()
 
@@ -654,26 +657,61 @@ class MusicQueueSnapshotManager:
                 },
             )
 
-        # Full pagination loop with deduplication
+        # Full pagination loop with deduplication. Pages come from the catalog's pinned
+        # revision (memory slices), so the loop is cheap and can never mix revisions.
         all_songs = []
         seen_ids = set()
-        curr_offset = 0
         page_limit = 100
-        has_more = True
-        while has_more:
-            tracks_data = await netease_service.get_favorite_playlist_tracks(offset=curr_offset, limit=page_limit)
-            page_songs = tracks_data.get("songs", [])
-            if not page_songs:
+        pinned_revision: Optional[int] = None
+        authoritative_total = track_count
+        for attempt in range(2):
+            all_songs = []
+            seen_ids = set()
+            curr_offset = 0
+            has_more = True
+            restart = False
+            while has_more:
+                kwargs = {"revision": pinned_revision} if pinned_revision is not None else {}
+                try:
+                    tracks_data = await netease_service.get_favorite_playlist_tracks(
+                        offset=curr_offset, limit=page_limit, **kwargs
+                    )
+                except FavoriteRevisionGone:
+                    if attempt == 0:
+                        pinned_revision = None
+                        restart = True
+                        break
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": 409,
+                            "error_code": "QUEUE_VERSION_CONFLICT",
+                            "error_detail": "Favorite catalog revision changed while building the queue",
+                            "message": "喜欢歌单同步版本已变更，请重试。",
+                        },
+                    )
+                if pinned_revision is None and tracks_data.get("revision") is not None:
+                    pinned_revision = tracks_data["revision"]
+                if "total" in tracks_data:
+                    authoritative_total = tracks_data["total"]
+                page_songs = tracks_data.get("songs", [])
+                if not page_songs:
+                    break
+                for s in page_songs:
+                    s_id = s["id"]
+                    if s_id not in seen_ids:
+                        seen_ids.add(s_id)
+                        all_songs.append(s)
+                curr_offset += len(page_songs)
+                if "has_more" in tracks_data:
+                    has_more = bool(tracks_data["has_more"])
+                else:
+                    has_more = curr_offset < authoritative_total
+                if len(all_songs) >= authoritative_total:
+                    break
+            if not restart:
                 break
-            for s in page_songs:
-                s_id = s["id"]
-                if s_id not in seen_ids:
-                    seen_ids.add(s_id)
-                    all_songs.append(s)
-            curr_offset += len(page_songs)
-            has_more = curr_offset < track_count
-            if len(all_songs) >= track_count:
-                break
+        track_count = authoritative_total
 
         if len(all_songs) == 0:
             raise HTTPException(
@@ -722,6 +760,7 @@ class MusicQueueSnapshotManager:
             tracks=formatted_tracks,
             device_id=norm_dev,
         )
+        snapshot.catalog_revision = pinned_revision
 
         async with self._lock:
             self._snapshots[(norm_dev, queue_id, version)] = snapshot
@@ -730,8 +769,34 @@ class MusicQueueSnapshotManager:
             if activate:
                 self._active_queues[norm_dev] = snapshot
                 self.sync_device_queue_version(norm_dev, version, db=db)
+            self._prune_favorite_snapshots(norm_dev)
 
         return snapshot
+
+    _FAVORITE_SNAPSHOTS_KEPT = 6
+
+    @staticmethod
+    def _catalog_newer_than(snap: "QueueSnapshot") -> bool:
+        """True when the favorite catalog already published a revision this snapshot predates.
+
+        Used for explicit ``source=netease_favorite`` reads (the phone resolving a tapped song) so that
+        explicit playback uses the new list; the currently playing active queue itself is never mutated.
+        """
+        newest = favorite_catalog.peek()
+        return snap.catalog_revision is not None and newest is not None and newest.revision != snap.catalog_revision
+
+    def _prune_favorite_snapshots(self, norm_dev: str) -> None:
+        """Bound memory: keep the newest favorite snapshots plus the active and any pending ones."""
+        favs = sorted(
+            (k for k, snap in self._snapshots.items() if k[0] == norm_dev and snap.source == "netease_favorite"),
+            key=lambda k: k[2],
+            reverse=True,
+        )
+        protected = {id(self._active_queues.get(norm_dev))}
+        protected.update(id(p) for p in self._pending_queues.values())
+        for key in favs[self._FAVORITE_SNAPSHOTS_KEPT :]:
+            if id(self._snapshots[key]) not in protected:
+                del self._snapshots[key]
 
     async def prepare_favorite_queue(
         self,
@@ -1098,7 +1163,14 @@ class MusicQueueSnapshotManager:
 
         # 3. Generic query without queue_id (e.g. GET /api/v1/music/queue)
         else:
-            if active is not None and (not source or active.source == source):
+            favorite_superseded = (
+                source == "netease_favorite"
+                and active is not None
+                and active.source == "netease_favorite"
+                and queue_version is None
+                and self._catalog_newer_than(active)
+            )
+            if active is not None and (not source or active.source == source) and not favorite_superseded:
                 if queue_version is not None and queue_version != active.queue_version:
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
@@ -1119,8 +1191,20 @@ class MusicQueueSnapshotManager:
             else:
                 # Cold device or pure read query for a different source (without activating)
                 fav_candidates = [s for (d, _, _), s in self._snapshots.items() if d == norm_dev and s.source == "netease_favorite"]
-                if fav_candidates and queue_version is None:
-                    fav_snap = max(fav_candidates, key=lambda s: s.queue_version)
+                latest_fav = max(fav_candidates, key=lambda s: s.queue_version) if fav_candidates else None
+                if latest_fav is not None and queue_version is None:
+                    # Reuse the in-memory snapshot unless the catalog already published a newer
+                    # revision (stale-while-revalidate: kick the background check when due).
+                    favorite_catalog.refresh_in_background()
+                    newest = favorite_catalog.peek()
+                    if (
+                        newest is not None
+                        and latest_fav.catalog_revision is not None
+                        and newest.revision != latest_fav.catalog_revision
+                    ):
+                        fav_snap = await self.prepare_favorite_queue(norm_dev, db=db)
+                    else:
+                        fav_snap = latest_fav
                 else:
                     fav_snap = await self.prepare_favorite_queue(norm_dev, db=db)
                 if queue_version is not None and queue_version != fav_snap.queue_version:

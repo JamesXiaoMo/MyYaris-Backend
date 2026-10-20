@@ -487,24 +487,33 @@ def test_favorite_playlist_success_pagination_and_special_type_identification(cl
         ],
     }
 
-    mock_tracks_data = {
+    song_objs = [
+        {
+            "id": 123456,
+            "name": "测试歌曲A",
+            "ar": [{"id": 1, "name": "歌手A"}],
+            "al": {"id": 10, "name": "专辑A", "picUrl": "https://p1.music.126.net/a.jpg"},
+            "dt": 180000,
+        },
+        {
+            "id": 654321,
+            "name": "测试歌曲B",
+            "ar": [{"id": 2, "name": "歌手B"}],
+            "al": {"id": 20, "name": "专辑B", "picUrl": "https://p1.music.126.net/b.jpg"},
+            "dt": 210000,
+        },
+    ]
+    # One /playlist/detail call carries ordered ids, metadata and privileges (real upstream shape).
+    mock_detail_data = {
         "code": 200,
-        "songs": [
-            {
-                "id": 123456,
-                "name": "测试歌曲A",
-                "ar": [{"id": 1, "name": "歌手A"}],
-                "al": {"id": 10, "name": "专辑A", "picUrl": "https://p1.music.126.net/a.jpg"},
-                "dt": 180000,
-            },
-            {
-                "id": 654321,
-                "name": "测试歌曲B",
-                "ar": [{"id": 2, "name": "歌手B"}],
-                "al": {"id": 20, "name": "专辑B", "picUrl": "https://p1.music.126.net/b.jpg"},
-                "dt": 210000,
-            },
-        ],
+        "playlist": {
+            "id": 777777,
+            "name": "My Favorite Music",
+            "coverImgUrl": "https://p1.music.126.net/fav_cover.jpg",
+            "trackCount": 2,
+            "trackIds": [{"id": 123456}, {"id": 654321}],
+            "tracks": song_objs,
+        },
         "privileges": [
             {"id": 123456, "st": 0, "fee": 0},
             {"id": 654321, "st": -200, "fee": 1},  # Unavailable / grayed out copyright
@@ -520,8 +529,8 @@ def test_favorite_playlist_success_pagination_and_special_type_identification(cl
                     m.status_code = 200
                     if "/user/playlist" in url:
                         m.json.return_value = mock_playlists_data
-                    elif "/playlist/track/all" in url:
-                        m.json.return_value = mock_tracks_data
+                    elif "/playlist/detail" in url:
+                        m.json.return_value = mock_detail_data
                     else:
                         m.json.return_value = {"code": 200}
                     return m
@@ -534,10 +543,12 @@ def test_favorite_playlist_success_pagination_and_special_type_identification(cl
                 assert data["code"] == 200
                 assert data["playlist_id"] == 777777  # Matched specialType == 5, not the other two!
                 assert data["name"] == "My Favorite Music"
-                assert data["total"] == 45
+                # Total is the catalog's own consistent count (never a stale trackCount hint).
+                assert data["total"] == 2
                 assert data["offset"] == 0
                 assert data["limit"] == 30
-                assert data["has_more"] is True
+                assert data["has_more"] is False
+                assert data["revision"] and data["etag"] and data["owner_key"] and data["stale"] is False
                 assert len(data["songs"]) == 2
                 assert len(data["tracks"]) == 2
 
@@ -559,6 +570,16 @@ def test_favorite_playlist_success_pagination_and_special_type_identification(cl
                 assert song_b["id"] == 654321
                 assert song_b["playable"] is False
                 assert song_b["fee"] == 1
+
+                # Second page request inside the TTL window: pure catalog read, zero upstream calls.
+                calls_before = mock_get.call_count
+                again = client.get(
+                    f"/api/v1/music/netease/playlist/favorite?offset=1&limit=1&revision={data['revision']}",
+                    headers=admin_headers,
+                )
+                assert again.status_code == 200
+                assert [x["id"] for x in again.json()["songs"]] == [654321]
+                assert mock_get.call_count == calls_before
 
 
 def test_favorite_playlist_out_of_range_offset_returns_empty_page(client, admin_headers):
@@ -586,7 +607,24 @@ def test_favorite_playlist_out_of_range_offset_returns_empty_page(client, admin_
                 def fake_get(url, **kwargs):
                     m = MagicMock()
                     m.status_code = 200
-                    m.json.return_value = mock_playlists_data
+                    if "/playlist/detail" in url:
+                        songs = [
+                            {"id": 500 + i, "name": f"S{i}", "ar": [], "al": {}, "dt": 1000}
+                            for i in range(10)
+                        ]
+                        m.json.return_value = {
+                            "code": 200,
+                            "playlist": {
+                                "id": 777777,
+                                "name": "我喜欢的音乐",
+                                "trackCount": 10,
+                                "trackIds": [{"id": s["id"]} for s in songs],
+                                "tracks": songs,
+                            },
+                            "privileges": [{"id": s["id"], "st": 0, "fee": 0} for s in songs],
+                        }
+                    else:
+                        m.json.return_value = mock_playlists_data
                     return m
 
                 mock_get.side_effect = fake_get
@@ -688,9 +726,14 @@ def test_favorite_playlist_missing_creator_supplemented_by_detail_success(client
             "coverImgUrl": "https://example.com/cover.jpg",
         },
     }
-    mock_tracks_data = {
-        "code": 200,
-        "songs": [{"id": 101, "name": "Song 1", "ar": [], "al": {}, "dt": 120000}],
+    mock_detail_data = {
+        **mock_detail_data,
+        "playlist": {
+            **mock_detail_data["playlist"],
+            "trackCount": 1,
+            "trackIds": [{"id": 101}],
+            "tracks": [{"id": 101, "name": "Song 1", "ar": [], "al": {}, "dt": 120000}],
+        },
         "privileges": [{"id": 101, "st": 0, "fee": 0}],
     }
 
@@ -705,8 +748,6 @@ def test_favorite_playlist_missing_creator_supplemented_by_detail_success(client
                         m.json.return_value = mock_playlists_data
                     elif "/playlist/detail" in url:
                         m.json.return_value = mock_detail_data
-                    elif "/playlist/track/all" in url:
-                        m.json.return_value = mock_tracks_data
                     else:
                         m.json.return_value = {"code": 200}
                     return m
@@ -717,7 +758,7 @@ def test_favorite_playlist_missing_creator_supplemented_by_detail_success(client
                 assert resp.status_code == 200
                 data = resp.json()
                 assert data["playlist_id"] == 998877
-                assert data["total"] == 15
+                assert data["total"] == 1
                 assert len(data["songs"]) == 1
 
 

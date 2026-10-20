@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     MEDIA_CACHE_MAX_BYTES: int = 50 * 1024 * 1024 * 1024  # 50 GB
     NETEASE_API_BASE_URL: str = "http://127.0.0.1:3001"
 
+    # Owner favorite playlist metadata catalog (bounded, persistent, white-listed metadata only)
+    NETEASE_FAV_CHECK_TTL_SECONDS: float = 60.0  # no upstream call at all inside this window
+    NETEASE_FAV_FULL_RECHECK_SECONDS: float = 6 * 3600.0  # bounded re-verify of title/cover/permission edits
+    NETEASE_FAV_FORCE_MIN_INTERVAL_SECONDS: float = 15.0  # manual refresh spam guard
+    NETEASE_FAV_MAX_TRACKS: int = 5000
+    NETEASE_FAV_MAX_FILE_BYTES: int = 8 * 1024 * 1024
+
     # Task & Polling policies
     TASK_DEFAULT_EXPIRY_MINUTES: int = 60
     ACK_TIMEOUT_SECONDS: int = 30

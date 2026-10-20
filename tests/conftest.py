@@ -79,3 +79,14 @@ def car_headers():
 @pytest.fixture
 def admin_headers():
     return {"Authorization": f"Bearer {settings.ADMIN_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_favorite_catalog():
+    """The favorite catalog is a process singleton with an on-disk file: isolate every test."""
+    from app.services.netease_service import favorite_catalog
+
+    favorite_catalog.clear()
+    favorite_catalog._last_force_outcome = None
+    yield
+    favorite_catalog.clear()

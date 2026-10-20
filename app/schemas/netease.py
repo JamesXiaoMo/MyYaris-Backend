@@ -30,6 +30,38 @@ class NeteaseFavoritePlaylistResponse(BaseModel):
     has_more: bool = Field(..., description="Whether subsequent tracks exist")
     songs: List[NeteaseSongItem] = Field(default_factory=list, description="List of track items on this page")
     tracks: List[NeteaseSongItem] = Field(default_factory=list, description="Alias for songs compatible with client models")
+    # Catalog metadata (additive; older clients ignore these).
+    revision: Optional[int] = Field(None, description="Immutable catalog revision; pass back as ?revision= to pin paging")
+    etag: Optional[str] = Field(None, description="Content digest of this revision")
+    owner_key: Optional[str] = Field(None, description="Opaque verified NetEase Owner scope key (not the NetEase uid)")
+    synced_at: Optional[str] = Field(None, description="UTC time this revision's content last changed")
+    checked_at: Optional[str] = Field(None, description="UTC time the catalog was last verified against upstream")
+    stale: bool = Field(False, description="True when upstream was unreachable and the last verified Owner catalog is served")
+    stale_reason: Optional[str] = None
+
+
+class NeteaseFavoriteSyncRequest(BaseModel):
+    known_revision: Optional[int] = Field(None, description="Revision the client already holds")
+    force: bool = Field(False, description="Manual refresh: bypass TTL and re-fetch the ordered detail once")
+
+
+class NeteaseFavoriteSyncResponse(BaseModel):
+    code: int = 200
+    status: str = Field(..., description="initialized | updated | unchanged (what this check did on the server)")
+    changed: bool = Field(..., description="revision differs from known_revision (client must re-pull pages)")
+    revision: int
+    etag: str
+    owner_key: str
+    playlist_id: int
+    name: str
+    total: int
+    added: int = 0
+    removed: int = 0
+    reordered: bool = False
+    updated: int = 0
+    synced_at: str
+    checked_at: str
+    mode: str = Field(..., description="ttl | gate | full: how much upstream work this check needed")
 
 
 class NeteaseSearchResponse(BaseModel):

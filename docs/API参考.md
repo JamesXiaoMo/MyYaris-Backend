@@ -378,9 +378,19 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
     - 若上游 `/user/playlist` 列表条目缺失 `creator` 属性，后端**严禁静默接纳**，自动穿透调用 `/playlist/detail` 获取全量歌单元数据补全所有者验证；若补全后仍缺失或所有者不一致则断然剔除；
     - 绝不依赖硬编码 Playlist ID，绝不依赖歌单中文名模糊匹配，严禁返回其他账号私人歌单；
   - **分页与排序**：支持 `offset`（ge=0）与 `limit`（ge=1, le=100，默认 30），保持上游原生返回顺序；offset 越界或空歌单返回合法空页 (`songs: []`, `has_more: false`)；
+  - **元数据目录（持久缓存）**：分页读取后端有界持久目录（只含白名单曲目元数据/顺序/revision/时间，不含音频、CDN/stream 临时地址、Cookie、Token），不再每页访问上游；`total` 为目录自身曲目数（不再采用与真实列表可能不一致的上游 `trackCount` 提示）；响应新增可选字段 `revision`、`etag`、`owner_key`（不透明 Owner 作用域键，非网易云 uid）、`synced_at`、`checked_at`、`stale`、`stale_reason`，旧客户端可忽略，仍同时提供 `songs`/`tracks`；
+  - **revision 固定分页**：首页响应的 `revision` 在后续请求以 `?revision=R` 传回，则整个分页读取同一不可变版本；该版本已不再保留（仅保留最近 3 个）或已属于其他 Owner 时返回 **HTTP 409** `FAVORITE_REVISION_CONFLICT`（`detail.current_revision`），客户端须从首页重取；
+  - **离线与鉴权区分**：上游超时/不可达时，仅对**已知为同一 Owner** 的最近一次已校验目录返回 `stale=true`（`stale_reason=upstream_unavailable`），无目录则 502/504；会话缺失/失效/Owner 无法证明（含上游 `/login/status` 明确返回无会话）一律 409，绝不以旧缓存冒充；
   - **音轨与权限元数据**：返回标准化 `NeteaseSongItem`（包含 `id`, `song_id`, `title`, `artist`, `album`, `duration_ms`, `cover_url`, `cached`, `stream_url`, `fee`, `playable`, `source: "netease"`），兼容现有 Stage 1 播放模型（同时提供 `songs` 与 `tracks` 字段便于客户端直接调用 `playTrack`）；
   - **上游错误透传**：上游 5xx 返回 **HTTP 502 Bad Gateway**，超时返回 **HTTP 504 Gateway Timeout**，严禁吞咽异常掩盖为空列表；
   - **零副作用保障**：纯只读拉取，不触发点赞/取消红心，不派发播控或导航指令，不改变全局账号授权数据，不自动预探测、预下载或预缓存全量 700+ 音频；
+- `POST /api/v1/music/netease/playlist/favorite/sync`：检查「我喜欢的音乐」增删/重排并按需发布新 revision（权限同上；Bearer 以外的 Cookie 会话需 CSRF）
+  - 请求体 `{"known_revision": <int|null>, "force": false}`；响应 `status`（`initialized`/`updated`/`unchanged`，指本次服务端实际结果）、`changed`（`known_revision` 与当前 `revision` 是否不同，客户端据此决定是否重拉分页）、`revision`、`etag`、`owner_key`、`playlist_id`、`name`、`total`、`added`/`removed`/`reordered`/`updated`、`synced_at`、`checked_at`、`mode`（`ttl`/`gate`/`full`，本次上游工作量）；
+  - **算法**：TTL（默认 60 秒）内零上游调用；其后先做廉价门检——Owner 校验 + `/user/playlist` 版本提示（`trackUpdateTime`/`trackNumberUpdateTime`/`trackCount`）+ 无序 `/likelist` ID 集合；二者与目录一致即“无变化”，**不重取数 MB 的歌单详情**。变化、首次、手动 `force`、或距上次完整校验超过 6 小时（用于发现同一 ID 的标题/封面/权限变更）时，仅一次 `/playlist/detail` 同时取得有序 ID、元数据与权限，与旧版本做差集（新增/删除/重排/同 ID 元数据变化）后原子发布新不可变 revision；封面仅比较路径（上游会在 http/https 与 CDN 分片间摆动，不视为变化）；
+  - **并发与保护**：同一时刻所有调用共享一次上游检查；手动 `force` 至少间隔 15 秒（窗口内复用上次结果）；会话在检查途中变化（Cookie 保存/清除/账号切换）则丢弃结果，零写入；不同 Owner 或歌单 ID 立即废弃旧目录而不合并；
+  - **错误如实返回**：409 = 会话/Owner 无法证明；502/504 = 上游不可达（本接口不返回“伪成功”的陈旧结果）；
+  - **持久化与容量**：原子写入（临时文件 + `os.replace`）、权限 0600、至多 5000 首/8 MB（超限仅驻内存、不截断）；重启恢复；文件损坏/被篡改（etag 校验）/schema 不符则安全删除并重建；网易云登出（Cookie 清除）同时清空内存与磁盘目录；
+  - 只读上游元数据，不触发点赞/取消红心，不预取音频；`/api/v1/music/queue` 冷启动与显式喜欢点播读取同一目录：浏览当前队列（无 `source`）保持已应用的活跃快照不变，显式 `?source=netease_favorite` 读取在目录已有更新 revision 时生成新快照（新 `queue_version`），旧快照与其分页保持不可变。
 - `GET /api/v1/music/netease/song_url?song_id=...`：解析音频直链
 - `GET /api/v1/music/netease/lyric?song_id=...`：获取逐字歌词
 - `GET /api/v1/music/queue`：获取全量播放队列不可变快照分页音轨元数据
@@ -388,7 +398,7 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
   - **纯读幂等无副作用**：Query 传入 `?source=...` 仅作为条件过滤查询，绝对不激活或更改服务端当前播放队列；
   - **不可变快照分页规则**：首页（`offset=0`）返回最新快照及确定的 `queue_id`、`queue_version`；后续分页（`offset>0`）必须带上此版本号，若发生版本变更直接返回 **HTTP 409 Conflict** (`QUEUE_VERSION_CONFLICT`)，由客户端丢弃脏分页并从第 0 页重新拉取；
   - **全局单调版本**：`queue_version` 采用高精度毫秒单调递增水位，在服务重启或内存清空后依然单调递增，永不碰撞；
-  - **全量歌单覆盖**：`netease_favorite` 在初始化时完整遍历 `has_more` 自动完成多页拉取与去重，杜绝截断前 100 首；若歌单为空返回 **HTTP 409 Conflict** (`EMPTY_PLAYLIST`)。
+  - **全量歌单覆盖**：`netease_favorite` 在初始化时按目录固定的同一 revision 完整遍历 `has_more`（以目录的 `total` 为准）并去重，杜绝截断前 100 首；整表来自一次有序上游详情，而非逐页重取；若歌单为空返回 **HTTP 409 Conflict** (`EMPTY_PLAYLIST`)。
 - `POST /api/v1/music/netease/intelligence`：基于目标歌曲生成心动智能推荐队列
   - **权限与安全约束**：同样严格要求 `require_owner_or_car`（普通注册用户无论有无设备控制权均拒绝 403；车机硬件仅限自身设备）；开启严密的 CSRF 双重 Cookie 校验；
   - **请求体 (`NeteaseIntelligenceRequest`)**：`{"request_id": "...", "seed_song_id": 1901371647, "playlist_id": 987654321, "batch_index": 0, "count": 30}`

@@ -1,5 +1,6 @@
 from app.services.control_service import get_car_status_by_id
 import asyncio
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 from typing import Optional
@@ -35,6 +36,8 @@ from app.schemas.netease import (
     CacheStatsResponse,
     NeteaseCookieLoginRequest,
     NeteaseFavoritePlaylistResponse,
+    NeteaseFavoriteSyncRequest,
+    NeteaseFavoriteSyncResponse,
     NeteaseIntelligenceRequest,
     NeteaseIntelligenceResponse,
     NeteaseLoginStatusResponse,
@@ -56,9 +59,11 @@ from app.services.media_service import (
     parse_range_header,
     record_track_access,
 )
+from app.services.favorite_catalog import FavoriteRevisionGone
 from app.services.netease_service import (
     NeteaseUpstreamError,
     cache_manager,
+    favorite_catalog,
     netease_service,
 )
 
@@ -111,42 +116,64 @@ async def search_netease_songs(
     )
 
 
+def _iso(ts: Optional[float]) -> Optional[str]:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _favorite_http_error(e: Exception) -> HTTPException:
+    if isinstance(e, PermissionError):
+        # Backend NetEase session missing/expired: an auth problem, not "offline".
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    if isinstance(e, FavoriteRevisionGone):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": 409,
+                "error_code": "FAVORITE_REVISION_CONFLICT",
+                "error_detail": str(e),
+                "current_revision": e.current,
+                "message": "喜欢歌单版本已更新，请从第一页重新拉取",
+            },
+        )
+    assert isinstance(e, NeteaseUpstreamError)
+    return HTTPException(status_code=e.status_code, detail=f"Netease upstream error: {e.message}")
+
+
 @router.get("/netease/playlist/favorite", response_model=NeteaseFavoritePlaylistResponse)
 async def get_netease_favorite_playlist(
     request: Request,
     offset: int = Query(0, ge=0, description="Pagination offset"),
     limit: int = Query(30, ge=1, le=100, description="Items per page (default 30, max 100)"),
+    revision: Optional[int] = Query(None, ge=1, description="Pin paging to one catalog revision (from a previous response)"),
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
 ):
     """
-    Paginates the current NetEase account's default favorite music playlist (我喜欢的音乐).
+    Paginates the current NetEase account's default favorite music playlist (我喜欢的音乐)
+    from the backend's bounded metadata catalog.
     - Strictly restricted to MyYaris Administrator (or authorized legacy phone token for transitional compatibility).
     - Standard registered users (role='user') and vehicle devices (role='car') are forbidden (403).
     - Unauthenticated requests are rejected (401).
-    - Returns HTTP 409 Conflict if backend NetEase account is not logged in, avoiding invalidating MyYaris session.
-    - System favorite playlist is automatically identified via specialType==5 and owner UID match.
-    - Preserves upstream track ordering and limits pagination.
+    - Returns HTTP 409 Conflict if backend NetEase account is not logged in/expired (never served from cache).
+    - System favorite playlist is identified via specialType==5 and verified Owner UID match.
+    - Paging is served from one immutable revision; pass ?revision=R from the first page to pin it
+      (409 FAVORITE_REVISION_CONFLICT means: restart from page 1).
+    - Upstream unreachable -> last verified catalog of the same Owner with stale=true; no catalog -> 502/504.
     - Does NOT pre-download, cache, or probe audio streams for all playlist tracks.
     """
     try:
-        data = await netease_service.get_favorite_playlist_tracks(offset=offset, limit=limit)
-    except PermissionError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
-        )
-    except NeteaseUpstreamError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail=f"Netease upstream error: {e.message}",
-        )
+        data = await netease_service.get_favorite_catalog_page(offset=offset, limit=limit, revision=revision)
+    except (PermissionError, FavoriteRevisionGone, NeteaseUpstreamError) as e:
+        raise _favorite_http_error(e)
 
     base_url = str(request.base_url).rstrip("/")
+    page_songs = data.get("songs", [])
+    cached_ids = cache_manager.get_cached_ids(db, [s["id"] for s in page_songs])
     items = []
-    for s in data.get("songs", []):
+    for s in page_songs:
         s_id = s["id"]
-        cached = cache_manager.get_cached_track(db, s_id) is not None
         stream_url = f"{base_url}/api/v1/music/netease/stream/{s_id}"
         items.append(
             NeteaseSongItem(
@@ -157,7 +184,7 @@ async def get_netease_favorite_playlist(
                 album=s.get("album"),
                 duration_ms=s.get("duration_ms", 0),
                 cover_url=s.get("cover_url"),
-                cached=cached,
+                cached=s_id in cached_ids,
                 stream_url=stream_url,
                 fee=s.get("fee", 0),
                 playable=s.get("playable", True),
@@ -178,6 +205,51 @@ async def get_netease_favorite_playlist(
         has_more=data["has_more"],
         songs=items,
         tracks=items,
+        revision=data.get("revision"),
+        etag=data.get("etag"),
+        owner_key=data.get("owner_key"),
+        synced_at=_iso(data.get("synced_at")),
+        checked_at=_iso(data.get("checked_at")),
+        stale=bool(data.get("stale")),
+        stale_reason=data.get("stale_reason"),
+    )
+
+
+@router.post("/netease/playlist/favorite/sync", response_model=NeteaseFavoriteSyncResponse)
+async def sync_netease_favorite_playlist(
+    request: Request,
+    body: NeteaseFavoriteSyncRequest = NeteaseFavoriteSyncRequest(),
+    user: AuthenticatedUser = Depends(require_admin_or_legacy_phone),
+):
+    """
+    Checks the Owner favorite playlist for additions/removals/reorders and publishes a new immutable
+    catalog revision only when something changed. Reads upstream metadata only (no like/unlike).
+    Concurrent calls share one upstream pass; an unchanged playlist costs two small upstream calls
+    (never the multi-megabyte detail). Errors are reported honestly (no stale success here):
+    409 = NetEase session/Owner unprovable, 502/504 = upstream unreachable.
+    """
+    verify_csrf(request, user)
+    try:
+        outcome = await favorite_catalog.sync(force=body.force)
+    except (PermissionError, NeteaseUpstreamError) as e:
+        raise _favorite_http_error(e)
+    snap = outcome.snapshot
+    return NeteaseFavoriteSyncResponse(
+        status=outcome.status,
+        changed=body.known_revision != snap.revision,
+        revision=snap.revision,
+        etag=snap.etag,
+        owner_key=snap.owner_key,
+        playlist_id=snap.playlist_id,
+        name=snap.name,
+        total=snap.total,
+        added=outcome.added,
+        removed=outcome.removed,
+        reordered=outcome.reordered,
+        updated=outcome.updated,
+        synced_at=_iso(snap.updated_at) or "",
+        checked_at=_iso(outcome.checked_at) or "",
+        mode=outcome.upstream_mode,
     )
 
 

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.repositories.database import SessionLocal
 from app.repositories.models import MediaTrack, utc_now
+from app.services.favorite_catalog import FavoriteCatalog
 from app.services.media_service import is_valid_audio_magic, record_track_access
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,14 @@ class NeteaseCookieStore:
     def __init__(self, storage_path: Optional[Path] = None):
         self.path = storage_path or (Path(settings.DATA_DIR) / "netease_cookie.json")
         self.on_change_callbacks: List[Any] = []
+        self.on_clear_callbacks: List[Any] = []
+
+    def _trigger_on_clear(self):
+        for cb in self.on_clear_callbacks:
+            try:
+                cb()
+            except Exception as e:
+                logger.warning(f"Error in cookie on_clear callback: {e}")
 
     def _trigger_on_change(self):
         for cb in self.on_change_callbacks:
@@ -87,6 +96,7 @@ class NeteaseCookieStore:
             except OSError:
                 pass
         self._trigger_on_change()
+        self._trigger_on_clear()
 
     @property
     def has_cookie(self) -> bool:
@@ -162,7 +172,14 @@ class NeteaseService:
             else:
                 return {"code": code or 500, "status": "unknown", "message": data.get("message", "未知状态"), "cookie_saved": False}
 
-    async def get_profile_by_cookie(self, cookie: Optional[str] = None) -> Optional[dict]:
+    async def get_profile_by_cookie(self, cookie: Optional[str] = None, strict: bool = False) -> Optional[dict]:
+        """Resolve the account profile for a cookie.
+
+        strict=False (login flows): any failure yields None.
+        strict=True (Owner verification): an authoritative "no such session" answer raises
+        PermissionError, while connectivity/5xx problems raise NeteaseUpstreamError, so callers
+        can tell an expired login from an offline upstream.
+        """
         c = cookie or self.cookie_store.load()
         if not c:
             return None
@@ -170,7 +187,15 @@ class NeteaseService:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(url, params={"cookie": c, "timestamp": int(utc_now().timestamp() * 1000)})
-                data = resp.json().get("data", {})
+                if strict and resp.status_code in (401, 403):
+                    raise PermissionError("Netease session credentials expired or invalid")
+                if strict and resp.status_code != 200:
+                    raise NeteaseUpstreamError(
+                        f"Upstream login status returned HTTP {resp.status_code}", status_code=502
+                    )
+                body = resp.json()
+                data = body.get("data") if isinstance(body, dict) else None
+                data = data if isinstance(data, dict) else {}
                 profile = data.get("profile") or {}
                 account = data.get("account") or {}
                 if profile or account:
@@ -180,8 +205,18 @@ class NeteaseService:
                         "avatar_url": profile.get("avatarUrl"),
                         "vip_type": profile.get("vipType") or account.get("vipType"),
                     }
+                if strict and isinstance(body, dict) and body.get("code") in (200, 301, 401):
+                    raise PermissionError("Netease session credentials expired or invalid")
+        except (PermissionError, NeteaseUpstreamError):
+            raise
+        except httpx.TimeoutException as e:
+            logger.warning(f"Timeout fetching profile: {e}")
+            if strict:
+                raise NeteaseUpstreamError("Upstream Netease login status timed out", status_code=504)
         except Exception as e:
             logger.warning(f"Failed to fetch profile: {e}")
+            if strict:
+                raise NeteaseUpstreamError("Upstream Netease login status unavailable", status_code=502)
         return None
 
     async def refresh_cookie(self) -> bool:
@@ -496,7 +531,9 @@ class NeteaseService:
             )
         return data.get("playlist") or {}
 
-    async def get_favorite_playlist_info(self, force_refresh: bool = False) -> Dict[str, Any]:
+    async def get_favorite_playlist_info(
+        self, force_refresh: bool = False, max_age: Optional[float] = None
+    ) -> Dict[str, Any]:
         """
         Resolves non-sensitive metadata for the current account's system favorite playlist (我喜欢的音乐).
         Uses third-party upstream API (Binaryify/NeteaseCloudMusicApi) specification:
@@ -518,11 +555,12 @@ class NeteaseService:
             not force_refresh
             and self._cached_favorite_playlist
             and self._cached_cookie_signature == cookie_sig
-            and (now - self._cached_fav_timestamp) < self._fav_cache_ttl_seconds
+            and (now - self._cached_fav_timestamp)
+            < (self._fav_cache_ttl_seconds if max_age is None else min(max_age, self._fav_cache_ttl_seconds))
         ):
             return dict(self._cached_favorite_playlist)
 
-        profile = await self.get_profile_by_cookie(cookie)
+        profile = await self.get_profile_by_cookie(cookie, strict=True)
         if not profile or not profile.get("user_id"):
             raise NeteaseUpstreamError(
                 "Failed to obtain Netease user profile from current session",
@@ -531,7 +569,10 @@ class NeteaseService:
 
         uid = profile["user_id"]
         url = f"{self.base_url}/user/playlist"
-        params = self._with_cookie_param({"uid": uid, "limit": 50, "offset": 0})
+        # timestamp bypasses the upstream container's 2-minute GET response cache.
+        params = self._with_cookie_param(
+            {"uid": uid, "limit": 50, "offset": 0, "timestamp": int(time.time() * 1000)}
+        )
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -620,6 +661,12 @@ class NeteaseService:
             "track_count": matched.get("trackCount", 0),
             "play_count": matched.get("playCount", 0),
             "user_id": uid,
+            # Cheap version hints (not trusted alone; the catalog also compares the like-id set).
+            "signals": [
+                matched.get("trackUpdateTime"),
+                matched.get("trackNumberUpdateTime"),
+                matched.get("trackCount"),
+            ],
         }
 
         # Check if the session cookie changed during async execution to prevent cache pollution
@@ -634,103 +681,179 @@ class NeteaseService:
             logger.warning("Netease session cookie changed during async favorite playlist resolution; discarding stale cache.")
             raise PermissionError("Netease session changed during resolution; please retry.")
 
-    async def get_favorite_playlist_tracks(self, offset: int = 0, limit: int = 30) -> Dict[str, Any]:
-        """
-        Paginates tracks from the owner's favorite playlist.
-        Maintains upstream sorting order without asserting reverse-chronological guarantee.
-        Handles empty playlists and out-of-range offsets gracefully.
-        """
-        fav_info = await self.get_favorite_playlist_info()
-        pid = fav_info["playlist_id"]
-        total = fav_info["track_count"]
-
-        if offset >= total or total == 0:
-            return {
-                "playlist_id": pid,
-                "name": fav_info["name"],
-                "cover_url": fav_info["cover_url"],
-                "track_count": total,
-                "play_count": fav_info["play_count"],
-                "total": total,
-                "offset": offset,
-                "limit": limit,
-                "has_more": False,
-                "songs": [],
-            }
-
-        url = f"{self.base_url}/playlist/track/all"
-        params = self._with_cookie_param({"id": pid, "limit": limit, "offset": offset})
-
+    # ------------------------------------------------------------------
+    # Favorite playlist catalog sources (consumed by FavoriteCatalog)
+    # ------------------------------------------------------------------
+    async def _upstream_json(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        timeout: float,
+        what: str,
+    ) -> Dict[str, Any]:
+        """GET an upstream JSON object with auth/connectivity errors kept distinct."""
+        url = f"{self.base_url}{path}"
+        p = self._with_cookie_param({**params, "timestamp": int(time.time() * 1000)})
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url, params=params)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url, params=p)
+                if resp.status_code in (401, 403):
+                    raise PermissionError("Netease session credentials expired or invalid")
                 if resp.status_code != 200:
-                    raise NeteaseUpstreamError(
-                        f"Upstream playlist track all returned HTTP {resp.status_code}",
-                        status_code=502,
-                    )
+                    raise NeteaseUpstreamError(f"Upstream {what} returned HTTP {resp.status_code}", status_code=502)
                 data = resp.json()
-        except httpx.TimeoutException as e:
-            logger.error(f"Timeout calling Netease playlist/track/all: {e}")
-            raise NeteaseUpstreamError("Upstream Netease playlist tracks timed out", status_code=504)
-        except httpx.RequestError as e:
-            logger.error(f"Network error calling Netease playlist/track/all: {e}")
-            raise NeteaseUpstreamError(f"Upstream Netease playlist tracks connection failed: {e}", status_code=502)
-        except NeteaseUpstreamError:
+        except (PermissionError, NeteaseUpstreamError):
             raise
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout calling Netease {what}: {e}")
+            raise NeteaseUpstreamError(f"Upstream Netease {what} timed out", status_code=504)
+        except httpx.RequestError as e:
+            logger.error(f"Network error calling Netease {what}: {e}")
+            raise NeteaseUpstreamError(f"Upstream Netease {what} connection failed: {e}", status_code=502)
         except Exception as e:
-            logger.error(f"Error calling Netease playlist/track/all: {e}")
-            raise NeteaseUpstreamError(f"Failed to query upstream playlist tracks: {e}", status_code=502)
-
+            logger.error(f"Error calling Netease {what}: {e}")
+            raise NeteaseUpstreamError(f"Failed to query upstream {what}: {e}", status_code=502)
+        if not isinstance(data, dict):
+            raise NeteaseUpstreamError(f"Upstream {what} returned a non-object body", status_code=502)
         code = data.get("code")
+        if code in (301, 401):
+            raise PermissionError("Netease session credentials expired or invalid")
         if code is not None and code != 200:
-            raise NeteaseUpstreamError(
-                f"Upstream playlist tracks returned code {code}: {data.get('message')}",
-                status_code=502,
-            )
+            raise NeteaseUpstreamError(f"Upstream {what} returned code {code}: {data.get('message')}", status_code=502)
+        return data
 
-        raw_songs = data.get("songs", [])
-        privilege_list = data.get("privileges", [])
-        priv_map = {p["id"]: p for p in privilege_list if isinstance(p, dict) and "id" in p}
-
-        songs = []
-        for s in raw_songs:
-            song_id = s.get("id")
-            if not song_id:
-                continue
-            priv = priv_map.get(song_id) or s.get("privilege") or {}
-            st = priv.get("st", s.get("st", 0))
-            fee = priv.get("fee", s.get("fee", 0))
-
-            ar_names = [ar.get("name", "") for ar in s.get("ar", []) if ar.get("name")]
-            artist_str = " / ".join(ar_names) or "Unknown Artist"
-            al_dict = s.get("al") or {}
-
-            songs.append({
-                "id": song_id,
-                "title": s.get("name") or "Unknown Title",
-                "artist": artist_str,
-                "album": al_dict.get("name"),
-                "duration_ms": s.get("dt") or 0,
-                "cover_url": al_dict.get("picUrl"),
-                "fee": fee,
-                "playable": bool(st >= 0),
-            })
-
-        has_more = (offset + len(songs)) < total
-
+    @staticmethod
+    def _normalize_track(s: Dict[str, Any], priv: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        song_id = s.get("id")
+        if not isinstance(song_id, int) or isinstance(song_id, bool) or song_id <= 0:
+            return None
+        priv = priv or s.get("privilege") or {}
+        st = priv.get("st", s.get("st", 0))
+        fee = priv.get("fee", s.get("fee", 0))
+        ar_names = [ar.get("name", "") for ar in (s.get("ar") or []) if isinstance(ar, dict) and ar.get("name")]
+        al_dict = s.get("al") or {}
         return {
-            "playlist_id": pid,
-            "name": fav_info["name"],
-            "cover_url": fav_info["cover_url"],
+            "id": song_id,
+            "title": s.get("name") or "Unknown Title",
+            "artist": " / ".join(ar_names) or "Unknown Artist",
+            "album": al_dict.get("name"),
+            "duration_ms": s.get("dt") or 0,
+            "cover_url": al_dict.get("picUrl"),
+            "fee": fee if isinstance(fee, int) and not isinstance(fee, bool) else 0,
+            "playable": bool((st if isinstance(st, (int, float)) else 0) >= 0),
+        }
+
+    async def get_like_ids(self, uid: Any) -> List[int]:
+        """Unordered liked-song id set (~7 KB for ~750 songs); authoritative for membership."""
+        data = await self._upstream_json("/likelist", {"uid": uid}, timeout=15.0, what="likelist")
+        ids = data.get("ids")
+        if not isinstance(ids, list) or any(not isinstance(i, int) or isinstance(i, bool) for i in ids):
+            raise NeteaseUpstreamError("Upstream likelist returned an unexpected body", status_code=502)
+        return ids
+
+    async def fetch_favorite_playlist_detail(self, playlist_id: int) -> Dict[str, Any]:
+        """One ordered fetch: ids, metadata and privileges come from a single /playlist/detail call.
+
+        Ids absent from the embedded track list are filled via bounded /song/detail batches;
+        ids upstream cannot describe at all are reported in ``skipped_ids`` (never invented).
+        """
+        data = await self._upstream_json("/playlist/detail", {"id": playlist_id}, timeout=45.0, what="playlist detail")
+        playlist = data.get("playlist")
+        if not isinstance(playlist, dict) or playlist.get("id") != playlist_id:
+            raise NeteaseUpstreamError("Upstream playlist detail did not return the requested playlist", status_code=502)
+
+        ids: List[int] = []
+        seen: set = set()
+        for item in playlist.get("trackIds") or []:
+            tid = item.get("id") if isinstance(item, dict) else item
+            if isinstance(tid, int) and not isinstance(tid, bool) and tid > 0 and tid not in seen:
+                seen.add(tid)
+                ids.append(tid)
+
+        tracks: Dict[int, Dict[str, Any]] = {
+            t["id"]: t for t in (playlist.get("tracks") or []) if isinstance(t, dict) and isinstance(t.get("id"), int)
+        }
+        privileges: Dict[int, Dict[str, Any]] = {
+            p["id"]: p for p in (data.get("privileges") or []) if isinstance(p, dict) and isinstance(p.get("id"), int)
+        }
+
+        missing = [i for i in ids if i not in tracks]
+        for start in range(0, min(len(missing), 2000), 100):
+            chunk = missing[start : start + 100]
+            extra = await self._upstream_json(
+                "/song/detail", {"ids": ",".join(str(i) for i in chunk)}, timeout=20.0, what="song detail"
+            )
+            for t in extra.get("songs") or []:
+                if isinstance(t, dict) and isinstance(t.get("id"), int):
+                    tracks[t["id"]] = t
+            for p in extra.get("privileges") or []:
+                if isinstance(p, dict) and isinstance(p.get("id"), int):
+                    privileges[p["id"]] = p
+
+        entries: List[Dict[str, Any]] = []
+        skipped: List[int] = []
+        for tid in ids:
+            norm = self._normalize_track(tracks[tid], privileges.get(tid)) if tid in tracks else None
+            if norm is None:
+                skipped.append(tid)
+            else:
+                entries.append(norm)
+        return {
+            "playlist_id": playlist_id,
+            "name": playlist.get("name"),
+            "cover_url": playlist.get("coverImgUrl"),
+            "track_count": playlist.get("trackCount"),
+            "entries": entries,
+            "skipped_ids": skipped,
+        }
+
+    # ------------------------------------------------------------------
+    # Favorite playlist reads (catalog backed; never one upstream call per page)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _catalog_page(snap, meta: Dict[str, Any], offset: int, limit: int) -> Dict[str, Any]:
+        page = list(snap.tracks[offset : offset + limit])
+        total = snap.total
+        return {
+            "playlist_id": snap.playlist_id,
+            "name": snap.name,
+            "cover_url": snap.cover_url,
             "track_count": total,
-            "play_count": fav_info["play_count"],
+            "play_count": meta.get("play_count"),
             "total": total,
             "offset": offset,
             "limit": limit,
-            "has_more": has_more,
-            "songs": songs,
+            "has_more": (offset + len(page)) < total,
+            "songs": [dict(t) for t in page],
+            "revision": snap.revision,
+            "etag": snap.etag,
+            "owner_key": snap.owner_key,
+            "synced_at": snap.updated_at,
+            "checked_at": meta.get("checked_at"),
+            "stale": bool(meta.get("stale")),
+            "stale_reason": meta.get("stale_reason"),
         }
+
+    async def get_favorite_catalog_page(
+        self,
+        offset: int = 0,
+        limit: int = 30,
+        revision: Optional[int] = None,
+        fresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Page the Owner favorite catalog. ``revision`` pins one immutable revision."""
+        snap, meta = await favorite_catalog.view(revision, fresh=fresh)
+        return self._catalog_page(snap, meta, offset, limit)
+
+    async def get_favorite_playlist_tracks(
+        self,
+        offset: int = 0,
+        limit: int = 30,
+        revision: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Queue-building read: checks upstream first (TTL coalesced) so explicit playback uses the new version."""
+        return await self.get_favorite_catalog_page(offset, limit, revision, fresh=revision is None)
 
 
 class CacheManager:
@@ -751,6 +874,18 @@ class CacheManager:
         if track and os.path.isfile(track.file_path) and os.path.getsize(track.file_path) > 0:
             return track
         return None
+
+    def get_cached_ids(self, db: Session, song_ids: List[int]) -> set:
+        """Batch variant of get_cached_track: one query for a whole page of songs."""
+        if not song_ids:
+            return set()
+        wanted = {self.get_track_id(i): i for i in song_ids}
+        rows = db.query(MediaTrack).filter(MediaTrack.track_id.in_(list(wanted))).all()
+        return {
+            wanted[t.track_id]
+            for t in rows
+            if t.track_id in wanted and os.path.isfile(t.file_path) and os.path.getsize(t.file_path) > 0
+        }
 
     def get_target_path(self, song_id: int, ext: str = "mp3") -> Path:
         return self.cache_dir / f"netease_{song_id}.{ext}"
@@ -972,3 +1107,6 @@ class CacheManager:
 # Singletons
 netease_service = NeteaseService()
 cache_manager = CacheManager()
+favorite_catalog = FavoriteCatalog(netease_service)
+netease_service.cookie_store.on_change_callbacks.append(favorite_catalog.invalidate)
+netease_service.cookie_store.on_clear_callbacks.append(favorite_catalog.clear)

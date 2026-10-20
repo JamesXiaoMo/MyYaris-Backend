@@ -65,7 +65,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 - [网易云喜欢歌单说明](docs/网易云喜欢歌单接入可行性.md)
 - [三端共享契约](https://github.com/JamesXiaoMo/MyYaris/blob/main/docs/API-V2三端契约.md)
 
-“我喜欢的音乐”接口：`GET /api/v1/music/netease/playlist/favorite?offset=0&limit=30`。具体权限、响应字段和异常码以 API 参考为准。
+“我喜欢的音乐”接口：`GET /api/v1/music/netease/playlist/favorite?offset=0&limit=30` 与 `POST .../favorite/sync`（后端持久元数据目录 + 增删差分同步）。具体权限、响应字段和异常码以 API 参考为准。
 
 ## 运行边界
 
