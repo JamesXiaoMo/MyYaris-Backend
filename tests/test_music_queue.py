@@ -87,8 +87,8 @@ def test_get_queue_pure_read_and_immutable_snapshot(client, phone_headers):
 
         # 2. Pure read check: querying with ?source=netease_intelligence does NOT switch active queue
         probe_resp = client.get("/api/v1/music/queue?source=netease_intelligence&offset=0&limit=10", headers=phone_headers)
-        assert probe_resp.status_code == 200
-        assert probe_resp.json()["source"] == "netease_favorite"
+        assert probe_resp.status_code == 409
+        assert probe_resp.json()["detail"]["error_code"] == "QUEUE_NOT_READY"
         # Pure read: GET queue does NOT mutate or activate active queue!
         active_q = music_queue_snapshot_manager.get_active_queue(settings.DEFAULT_CAR_DEVICE_ID)
         assert active_q is None
@@ -213,6 +213,8 @@ def test_authentic_intelligence_mode_and_replenishment(client, phone_headers):
 
         queue_id = b0_data["queue_id"]
         v0 = b0_data["queue_version"]
+        assert music_queue_snapshot_manager.get_active_queue(settings.DEFAULT_CAR_DEVICE_ID) is None
+        music_queue_snapshot_manager.apply_command_queue(settings.DEFAULT_CAR_DEVICE_ID, queue_id=queue_id, queue_version=v0)
 
     # 3. Replenishment: batch_index == 1 appends with stable previous indices
     with patch.object(netease_service.cookie_store, "load", return_value="fake_cookie=1"), \
@@ -424,7 +426,8 @@ def test_monotonic_status_sequence_and_mode_separation(client, phone_headers, ca
         "action": "set_playback_mode",
         "params": {"mode": "intelligence", "seed_song_id": 1901371647},
     }
-    with patch.object(netease_service, "is_song_in_favorite_playlist", new_callable=AsyncMock, return_value=True), \
+    with patch.object(netease_service, "get_favorite_playlist_info", new_callable=AsyncMock, return_value={"playlist_id": 1}), \
+         patch.object(netease_service, "is_song_in_favorite_playlist", new_callable=AsyncMock, return_value=True), \
          patch.object(netease_service, "get_intelligence", new_callable=AsyncMock, return_value=("intelligence", _make_dummy_songs(10))):
         c_resp = client.post("/api/v1/music/control/command", json=cmd_mode, headers=phone_headers)
         assert c_resp.status_code == 200
@@ -582,6 +585,7 @@ def test_immutable_old_snapshot_preserved_after_replenish(client, phone_headers)
         b0_data = r_b0.json()
         qid = b0_data["queue_id"]
         qver1 = b0_data["queue_version"]
+        music_queue_snapshot_manager.apply_command_queue(settings.DEFAULT_CAR_DEVICE_ID, queue_id=qid, queue_version=qver1)
 
         # Read v1 snapshot page 0
         v1_page_before = client.get(f"/api/v1/music/queue?queue_id={qid}&queue_version={qver1}&offset=0&limit=50", headers=phone_headers)

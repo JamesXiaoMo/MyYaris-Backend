@@ -79,7 +79,13 @@ VALID_ACTIONS = {
 }
 
 
-async def process_and_dispatch_music_command(
+async def process_and_dispatch_music_command(cmd, user, db, target_device=None, source_channel="http"):
+    device = resolve_car_device_id(cmd.device_id or target_device or user.device_id)
+    async with music_queue_snapshot_manager.operation_lock(device):
+        return await _process_and_dispatch_music_command(cmd, user, db, device, source_channel)
+
+
+async def _process_and_dispatch_music_command(
     cmd: MusicCommandRequest,
     user: AuthenticatedUser,
     db: Session,
@@ -99,7 +105,25 @@ async def process_and_dispatch_music_command(
             detail=f"Invalid action '{cmd.action}'. Supported actions: {sorted(list(VALID_ACTIONS))}",
         )
 
-    norm_target = resolve_car_device_id(cmd.device_id or target_device)
+    norm_target = resolve_car_device_id(cmd.device_id or target_device or user.device_id)
+    if user.role == "car" and (not user.device_id or not is_same_device(user.device_id, norm_target)):
+        raise HTTPException(403, "Car token may only control its own device")
+
+    # Compatibility actions enter the same queue state machine.
+    if cmd.action in ("set_loop", "set_loop_mode", "set_shuffle"):
+        params = cmd.params or MusicCommandParams()
+        if cmd.action == "set_shuffle":
+            params.mode = "shuffle" if params.shuffle else "list_loop"
+        else:
+            legacy = params.loop_mode or params.mode or "all"
+            if legacy in ("one", "single", "single_loop"):
+                params.mode = "single_loop"
+            elif legacy in ("all", "list_loop", "loop"):
+                params.mode = "list_loop"
+            else:
+                raise HTTPException(422, "Unsupported loop mode; choose favorite loop, shuffle or intelligence")
+        cmd.action = "set_playback_mode"
+        cmd.params = params
 
     # 1. Owner & device control permission gate
     if user.role == "user":
@@ -169,7 +193,10 @@ async def process_and_dispatch_music_command(
             "queue_id", "queue_version", "source", "stream_url", "track_id",
             "title", "artist", "album", "duration_ms", "cover_url",
             "seek_ms", "position_ms", "seek_position_ms", "queue_index",
+            "playlist_id", "restore_position_ms",
         }
+        if cmd.action == "resume":
+            BACKEND_INJECTED_KEYS.add("mode")
 
         conflict = False
         if existing.action != cmd.action:
@@ -330,7 +357,12 @@ async def process_and_dispatch_music_command(
                             "message": "心动模式初始种子曲目必须属于我喜欢的音乐",
                         },
                     )
-                _, songs = await netease_service.get_intelligence(seed_song_id=seed_id, count=30)
+                fav_info = await netease_service.get_favorite_playlist_info()
+                playlist_id = fav_info["playlist_id"]
+                mode, songs = await netease_service.get_intelligence(seed_song_id=seed_id, playlist_id=playlist_id, count=30)
+                if mode != "intelligence" or not songs:
+                    raise NeteaseUpstreamError("Authentic intelligence returned no queue", status_code=502)
+                cmd.params.playlist_id = playlist_id
                 snap = await music_queue_snapshot_manager.prepare_intelligence_queue(
                     device_id=norm_target,
                     seed_song_id=seed_id,
@@ -343,11 +375,13 @@ async def process_and_dispatch_music_command(
                 cmd.params.source = "netease_intelligence"
                 cmd.params.seed_song_id = seed_id
             elif target_mode in ("list_loop", "shuffle"):
-                snap = await music_queue_snapshot_manager.prepare_favorite_queue(
-                    device_id=norm_target,
-                    command_id=cmd.command_id,
-                    db=db,
-                )
+                snap = music_queue_snapshot_manager.get_active_queue(norm_target)
+                if snap and snap.source == "netease_favorite" and snap.is_complete:
+                    music_queue_snapshot_manager.register_pending_snapshot(norm_target, cmd.command_id, snap)
+                else:
+                    snap = await music_queue_snapshot_manager.prepare_favorite_queue(
+                        device_id=norm_target, command_id=cmd.command_id, db=db,
+                    )
                 cmd.params.queue_id = snap.queue_id
                 cmd.params.queue_version = snap.queue_version
                 cmd.params.source = "netease_favorite"
@@ -580,7 +614,28 @@ async def process_and_dispatch_music_command(
 
         elif cmd.action == "resume":
             active_q = music_queue_snapshot_manager.get_active_queue(norm_target)
-            if not active_q:
+            if not active_q and car_status_row and car_status_row.queue_id and car_status_row.current_track_id:
+                # A running vehicle can retain its applied queue across a backend restart.
+                # Revalidate Owner access; never synthesize a replacement heart queue.
+                await netease_service.get_favorite_playlist_info()
+                cmd.params.queue_id = car_status_row.queue_id
+                cmd.params.queue_version = car_status_row.queue_version
+                cmd.params.source = car_status_row.queue_source
+                cmd.params.track_id = car_status_row.current_track_id
+                cmd.params.queue_index = car_status_row.current_index
+                cmd.params.mode = car_status_row.applied_mode
+                cmd.params.restore_position_ms = car_status_row.position_ms or 0
+            elif active_q:
+                cmd.params.queue_id = active_q.queue_id
+                cmd.params.queue_version = active_q.queue_version
+                cmd.params.source = active_q.source
+                if car_status_row:
+                    cmd.params.queue_index = min(car_status_row.current_index or 0, active_q.total - 1)
+                    cmd.params.track_id = active_q.tracks[cmd.params.queue_index]["track_id"]
+                    cmd.params.mode = car_status_row.applied_mode or "list_loop"
+                    if all(getattr(cmd.params, k, None) is None for k in ("seek_ms", "seek_position_ms", "position_ms")):
+                        cmd.params.restore_position_ms = car_status_row.position_ms or 0
+            else:
                 # Explicit failure on error; NO swallow!
                 snap = await music_queue_snapshot_manager.prepare_favorite_queue(
                     device_id=norm_target,
@@ -661,11 +716,13 @@ async def send_music_command(
     cmd: MusicCommandRequest,
     request: Request,
     db: Session = Depends(get_db),
-    user: AuthenticatedUser = Depends(require_phone_or_admin),
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
+    if user.role != "car":
+        require_phone_or_admin(user)
     verify_csrf(request, user)
     """
-    iPhone client dispatches an immediate playback control command to the vehicle.
+    iPhone or bound car client dispatches an immediate playback control command to the vehicle.
     Persisted to SQLite, checked for idempotency/conflict, pushed to online WS car clients,
     and enqueued in memory for reliable fallback polling until car execution confirmation.
     """
@@ -729,6 +786,7 @@ async def acknowledge_music_command(
         applied_mode=ack.applied_mode,
         queue_version=ack.queue_version,
         current_index=ack.current_index,
+        current_track_id=ack.current_track_id,
     )
     if not cmd:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Command not found.")
@@ -831,7 +889,9 @@ def get_car_playback_status(
             detail="Access forbidden: User account lacks vehicle device control permission.",
         )
 
-    target_device = resolve_car_device_id(device_id)
+    target_device = resolve_car_device_id(device_id, user.device_id)
+    if user.role == "car" and (not user.device_id or not is_same_device(user.device_id, target_device)):
+        raise HTTPException(403, "Car token may only read its own device")
     status_row = get_car_status_by_id(db, target_device)
 
     if not status_row:
@@ -958,6 +1018,10 @@ async def music_websocket_endpoint(
     c_type = client_type if client_type in ["car", "phone"] else ("car" if user.role == "car" else "phone")
     raw_dev = device_id or user.device_id or settings.DEFAULT_CAR_DEVICE_ID
     norm_target = resolve_car_device_id(raw_dev)
+    if ((user.role == "car" and (c_type != "car" or not user.device_id or not is_same_device(user.device_id, norm_target)))
+            or (c_type == "car" and user.role not in ("car", "admin"))):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
     await ws_manager.connect(websocket, client_type=c_type, device_id=raw_dev)
 
@@ -1046,6 +1110,7 @@ async def music_websocket_endpoint(
                 if "position_ms" not in report_data and existing_row:
                     report_data["position_ms"] = existing_row.position_ms
 
+                report_data["device_id"] = norm_target
                 req = CarStatusReportRequest(**report_data)
                 saved_row = save_or_update_car_status(db, req, default_device_id=norm_target)
                 resp = car_status_to_response(saved_row)
@@ -1135,6 +1200,7 @@ async def music_websocket_endpoint(
                             applied_mode=applied_mode,
                             queue_version=queue_version,
                             current_index=current_index,
+                            current_track_id=msg.get("current_track_id"),
                         )
                         if cmd:
                             # Broadcast execution status to phones

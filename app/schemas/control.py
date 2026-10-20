@@ -79,6 +79,7 @@ class MusicCommandResponse(BaseModel):
 
 
 class MusicCommandAckRequest(BaseModel):
+    current_track_id: Optional[str] = None
     status: str = Field(..., description="received | applied | executed | failed")
     applied_mode: Optional[str] = None
     queue_version: Optional[int] = None

@@ -440,6 +440,7 @@ class MusicQueueSnapshotManager:
         self._pending_queues: Dict[Tuple[str, str], QueueSnapshot] = {}  # (norm_dev, command_id) -> snapshot
         self._snapshots: Dict[Tuple[str, str, int], QueueSnapshot] = {}  # (norm_dev, queue_id, version) -> snapshot
         self._replenish_cache: Dict[Tuple[str, str], QueueSnapshot] = {}
+        self._intelligence_request_payloads = {}
         self._last_version: Dict[str, int] = {}
         self._lock = asyncio.Lock()
 
@@ -449,6 +450,7 @@ class MusicQueueSnapshotManager:
         self._pending_queues.clear()
         self._snapshots.clear()
         self._replenish_cache.clear()
+        self._intelligence_request_payloads.clear()
         self._last_version.clear()
         logger.info("Cleared all music queue snapshots and caches.")
 
@@ -568,13 +570,18 @@ class MusicQueueSnapshotManager:
         """
         norm_dev = resolve_car_device_id(device_id)
         snapshot = None
+        if command_id and db:
+            command = db.query(MusicCommand).filter(MusicCommand.command_id == command_id).first()
+            if command and command.status in ("failed", "expired"):
+                self.discard_pending_queue(norm_dev, command_id)
+                return None
         if command_id:
             snapshot = self._pending_queues.pop((norm_dev, command_id), None)
         if not snapshot and queue_id and queue_version is not None:
             snapshot = self._snapshots.get((norm_dev, queue_id, queue_version))
         if snapshot:
             curr_active = self._active_queues.get(norm_dev)
-            if not command_id and curr_active and curr_active.queue_version > snapshot.queue_version:
+            if curr_active and curr_active.queue_version > snapshot.queue_version:
                 logger.warning(
                     f"Ignored late status report promotion for queue '{snapshot.queue_id}' (v{snapshot.queue_version}): "
                     f"current active queue is newer (v{curr_active.queue_version})"
@@ -612,6 +619,12 @@ class MusicQueueSnapshotManager:
         """Discards a pending queue snapshot on command failure or timeout without touching active queue."""
         norm_dev = resolve_car_device_id(device_id)
         self._pending_queues.pop((norm_dev, command_id), None)
+
+    def operation_lock(self, device_id):
+        # Serialize upstream preparation and continuation for each vehicle.
+        if not hasattr(self, "_operation_locks"):
+            self._operation_locks = {}
+        return self._operation_locks.setdefault(resolve_car_device_id(device_id), asyncio.Lock())
 
     async def init_favorite_queue(
         self,
@@ -657,8 +670,8 @@ class MusicQueueSnapshotManager:
                 if s_id not in seen_ids:
                     seen_ids.add(s_id)
                     all_songs.append(s)
-            has_more = tracks_data.get("has_more", False)
             curr_offset += len(page_songs)
+            has_more = curr_offset < track_count
             if len(all_songs) >= track_count:
                 break
 
@@ -756,8 +769,9 @@ class MusicQueueSnapshotManager:
 
         now_ts = int(time.time() * 1000)
         opaque_hash = hashlib.sha256(f"{seed_song_id}:{now_ts}".encode("utf-8")).hexdigest()[:12]
-        queue_id = f"q_intel_{opaque_hash}"
         version = self.get_next_queue_version(norm_dev, db=db)
+        opaque_hash = hashlib.sha256(f"{seed_song_id}:{version}:{now_ts}".encode("utf-8")).hexdigest()[:12]
+        queue_id = f"q_intel_{opaque_hash}"
 
         seen_ids = set()
         formatted_tracks = []
@@ -870,12 +884,16 @@ class MusicQueueSnapshotManager:
             if cache_key and cache_key in self._replenish_cache:
                 return self._replenish_cache[cache_key]
 
+            if active is not self._active_queues.get(norm_dev):
+                raise HTTPException(409, detail={"error_code": "QUEUE_VERSION_CONFLICT"})
             # IMMUTABLE SNAPSHOT: shallow copy tracks so old snapshot tracks list is not mutated
             new_tracks = list(active.tracks)
             existing_song_ids = {t["song_id"] for t in new_tracks}
             old_total = len(new_tracks)
             added_count = 0
             for s in songs:
+                if len(new_tracks) >= 150:
+                    break
                 s_id = s["id"]
                 if s_id in existing_song_ids:
                     continue
@@ -895,6 +913,8 @@ class MusicQueueSnapshotManager:
                 })
                 added_count += 1
 
+            if not added_count:
+                raise HTTPException(503, detail={"error_code": "INTELLIGENCE_QUEUE_EXHAUSTED", "message": "心动续批无新增曲目"})
             new_version = self.get_next_queue_version(norm_dev, db=db)
             new_snapshot = QueueSnapshot(
                 queue_id=active.queue_id,
@@ -1095,12 +1115,7 @@ class MusicQueueSnapshotManager:
                 if intel_candidates:
                     target = max(intel_candidates, key=lambda s: s.queue_version)
                 else:
-                    fav_candidates = [s for (d, _, _), s in self._snapshots.items() if d == norm_dev and s.source == "netease_favorite"]
-                    if fav_candidates and queue_version is None:
-                        fav_snap = max(fav_candidates, key=lambda s: s.queue_version)
-                    else:
-                        fav_snap = await self.prepare_favorite_queue(norm_dev, db=db)
-                    target = fav_snap
+                    raise HTTPException(409, detail={"error_code": "QUEUE_NOT_READY", "message": "尚无真实心动队列"})
             else:
                 # Cold device or pure read query for a different source (without activating)
                 fav_candidates = [s for (d, _, _), s in self._snapshots.items() if d == norm_dev and s.source == "netease_favorite"]
@@ -1135,6 +1150,7 @@ class MusicQueueSnapshotManager:
             name=target.name,
             total=total,
             is_complete=target.is_complete,
+            batch_index=max(0, target.batch_count - 1),
             queue_state=target.queue_state,
             offset=offset,
             limit=limit_bounded,
@@ -1280,6 +1296,7 @@ def record_command_ack(
     applied_mode: Optional[str] = None,
     queue_version: Optional[int] = None,
     current_index: Optional[int] = None,
+    current_track_id: Optional[str] = None,
 ) -> Optional[MusicCommand]:
     """
     Records vehicle acknowledgement of command execution.
@@ -1304,6 +1321,16 @@ def record_command_ack(
         return cmd
 
     norm_status = ack_status.lower().strip()
+    status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == cmd.device_id).first()
+    previous = (db.query(MusicCommand).filter(MusicCommand.command_id == status_row.last_applied_command_id).first()
+                if status_row and status_row.last_applied_command_id else None)
+    if _is_expired(cmd.expires_at) or (previous and previous.command_id != command_id and
+                                     previous.created_at > cmd.created_at):
+        cmd.status = "expired"
+        command_queue_manager.mark_acknowledged(command_id)
+        music_queue_snapshot_manager.discard_pending_queue(cmd.device_id, command_id)
+        db.commit()
+        return cmd
     if norm_status in ("applied", "executed", "ok", "success"):
         cmd.status = "applied"
         command_queue_manager.mark_acknowledged(command_id)
@@ -1324,7 +1351,7 @@ def record_command_ack(
             elif cmd.action == "set_playback_mode" and cmd_params.get("mode"):
                 status_row.applied_mode = cmd_params["mode"]
             elif cmd.action == "play_track" and cmd_params.get("source") == "netease_favorite":
-                if not status_row.applied_mode or status_row.applied_mode == "single_loop":
+                if status_row.queue_source != "netease_favorite" or status_row.applied_mode not in ("list_loop", "shuffle"):
                     status_row.applied_mode = "list_loop"
 
             if cmd.action == "switch_queue" and cmd_params.get("source"):
@@ -1349,6 +1376,10 @@ def record_command_ack(
                 status_row.current_index = current_index
             elif cmd_params.get("queue_index") is not None:
                 status_row.current_index = cmd_params["queue_index"]
+            if current_track_id:
+                status_row.current_track_id = current_track_id
+            elif cmd_params.get("track_id"):
+                status_row.current_track_id = cmd_params["track_id"]
             status_row.updated_at = utc_now()
 
         # Promote pending queue snapshot to active queue upon car execution ACK
@@ -1432,6 +1463,12 @@ def save_or_update_car_status(
     status_row = db.query(CarDeviceStatus).filter(CarDeviceStatus.device_id == dev_id).first()
 
     now = utc_now()
+    if status_row and report.last_applied_command_id and status_row.last_applied_command_id != report.last_applied_command_id:
+        incoming = db.query(MusicCommand).filter(MusicCommand.command_id == report.last_applied_command_id).first()
+        previous = db.query(MusicCommand).filter(MusicCommand.command_id == status_row.last_applied_command_id).first()
+        if incoming and (incoming.status in ("failed", "expired") or
+                         (previous and previous.created_at > incoming.created_at)):
+            return status_row
     if not status_row:
         # Default capabilities must be empty list so legacy car units are not falsely upgraded
         caps_str = json.dumps(report.capabilities) if report.capabilities is not None else json.dumps([])
@@ -1463,7 +1500,7 @@ def save_or_update_car_status(
     else:
         # Monotonic status sequence protection: reject out-of-order older status snapshots
         if report.status_seq is not None and status_row.status_seq is not None:
-            if report.status_seq < status_row.status_seq:
+            if report.status_seq <= status_row.status_seq:
                 logger.warning(
                     f"Ignored out-of-order status report for device {dev_id}: "
                     f"report.status_seq ({report.status_seq}) < current ({status_row.status_seq})"
@@ -1510,6 +1547,9 @@ def save_or_update_car_status(
         status_row.updated_at = now
 
     if report.last_applied_command_id:
+        record_command_ack(db, report.last_applied_command_id, "applied", dev_id,
+                           applied_mode=report.applied_mode, queue_version=report.queue_version,
+                           current_index=report.current_index)
         music_queue_snapshot_manager.apply_command_queue(
             device_id=dev_id,
             command_id=report.last_applied_command_id,

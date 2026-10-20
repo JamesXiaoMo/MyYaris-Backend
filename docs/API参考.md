@@ -190,7 +190,7 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 
 ### 5.2 手机下发播控指令 (`/api/v1/music/control/command`)
 - **方法 & 路径**：`POST /api/v1/music/control/command`
-- **鉴权**：`phone` / `admin`
+- **鉴权**：`phone` / `admin` / 绑定自身设备的 `car`
 - **请求体 (`MusicCommandRequest`)**：
   ```json
   {
@@ -263,7 +263,7 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 ### 5.6 车机播放状态上报与查询
 - **车机上报状态**：`POST /api/v1/music/control/status`（上报后实时通过 WebSocket 广播给手机）
   - 关键状态字段：`device_id`, `playback_state` (`playing`|`paused`|`stopped`), `applied_mode`, `requested_mode`, `queue_id`, `queue_version`, `queue_source`, `current_index`, `current_track_id`, `position_ms`, `duration_ms`, `software_volume`, `consecutive_failures`, `error_code`, `error_detail`, `capabilities`, `status_seq`, `last_applied_command_id`
-  - 单调序列保护：仅当 `status_seq >= current_status_seq` 时全量更新快照，迟到 ACK 不回退终态。
+  - 单调序列保护：仅当 `status_seq > current_status_seq` 时全量更新快照，迟到 ACK 不回退终态。
 - **查询当前快照**：`GET /api/v1/music/control/status?device_id=car_example`
 
 ### 5.7 全量播放队列元数据与分页 (`GET /api/v1/music/queue`)
@@ -470,3 +470,21 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 | **代码实现 (Code Completed)** | 后端 41 个路由（40 个 HTTP 接口 + 1 个 WebSocket 接口）全量源码已就绪，位于 `app/api/` 各路由模块中。 |
 | **部署验证 (Deployment Verified)** | 部署于生产服务（Git Commit: `3dde1d8`），系统全量通过 **119 项自动化测试 (0 失败)**。Tailscale TLS 健康检查返回 `200 OK`，实测拒绝非 WGS84 坐标返回 `422`，网易云搜索失败返回 `502/504`，生产库洁净无脏数据。 |
 | **真机端到端未测 (Client Hardware Unverified)** | 车机 Android 硬件播放器实机物理音频发声效果、iOS 端行驶页 UI 收藏夹实际交互与真实网络抖动，需待三端联合实机验收时确认。 |
+
+
+## 2026-10-20 播放统一修订（覆盖早期测试入口说明）
+
+- 用户显式点播放且未选来源时，默认完整、当前已验证 Owner 的 `netease_favorite`。循环顺序首尾循环；随机在全量元数据内无放回遍历。搜索显式单曲使用 `single_track`，自然结束停止；选择循环/随机明确返回喜欢歌单。
+- 打开 App、登录恢复、WS 重连不发起播放，也不暂停已有播放。车机仅恢复已有快照的元数据和 cursor/position；既无快照也无来源时，等待用户点播放才准备喜欢队列。手机不后台代下一曲。
+- 模式切换保留播放/暂停状态。当前歌曲仍在目标快照时保留其索引与音频源，不重新加载同曲、不归零进度；正常暂停 resume 不采用服务器迟到的旧 cursor 覆盖车机实际位置。冷播放器恢复采用服务器实际 cursor/position。
+- `CarMusicQueueController` 是唯一队列调度器；just_audio 始终只加载当前一首，原生 loop/shuffle 关闭，由 completed 事件驱动下一首。首页、内置页、系统媒体按钮统一进入后端播控管线；移除本地三样例默认源及第三方 MediaSession 模式分叉。
+- 心动只接受真实 `intelligence` 上游结果；`simi_fallback`、`empty`、普通随机与空数组均失败并保留旧状态。首批生成只准备快照；切模式指令 pending 后仅由车机 applied 激活。GET 未存在的心动来源返回 `QUEUE_NOT_READY`，不回喜欢伪装成功。
+- 心动 `is_complete=false` 表示未来推荐尚可续批，**不等于当前有限批次元数据不可加载**。客户端仍必须分页完整加载 `total` 首并验证 `queue_state=ready`、版本、索引和前缀；`batch_index` 由服务器给出。
+- 心动续批携带 `device_id`、`queue_id`、`queue_version`、稳定 `request_id`、`batch_index`、`seed_song_id` 和可选 `playlist_id`。同 ID 同参数在调用上游前重放缓存；不同参数 409。只允许上一批尾曲或实际当前曲作种子，最多总计 5 批/150 首，不生成本地版本号。失败不换来源；耗尽停止并显示原因。
+- 元数据完整分页不等于媒体预下载：只按需读取当前曲媒体流，接受后端同源可信 HTTPS 或解析到该后端的相对地址，保留严格 TLS。不可播按有限尝试跳过，最多连续 3 首；失败有可见原因，错误回滚原队列。授权/心动准备失败保持旧状态。
+- HTTP/WS 命令串行执行并按 command_id 去重，自动完成事件也进入相同执行序列；过期/重复/迟到 ACK 在修改实际状态之前检查，包含同 queue_id 的旧模式 ACK。`received` 不代表 applied，applied 不代表真机实声。
+- 车机 `status_seq` 发出前持久化，冷进程使用持久化水位与当前时钟的最大值递增；并发状态构建串行。后端仅接受严格更大的序列，相等重复不覆盖；`updated_at` 继续发送整数毫秒，并保留服务端整数/ISO 兼容修复。
+- 后端 HTTP `/music/control/command` 也接受绑定车机自身 token，执行同一管线；车机不能控制/读取别的设备，WS 不能伪装 phone/car 角色。普通用户的 Owner 资产门禁仍保留。旧 `set_loop`/`set_shuffle` 归一化到正式模式；不支持的语义显式失败。
+- 三个主要菜单为喜欢循环、喜欢随机、网易云心动。兼容单曲循环仍可经协议使用，手机仅在已应用该模式时显示兼容项。手机歌曲详情的心动按钮复用统一模式入口，不再独立生成并冒充播放队列。
+
+验证使用隔离 SQLite、fake 上游、真实 HTTP/WS 路由、fake just_audio 原生平台和本地回环 HTTP。没有发送生产播放命令、调用真实心动/点赞/导航或实车 OBD。构建、部署、设备安装和实际出声必须分别记录，不能相互代替。

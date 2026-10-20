@@ -1,3 +1,4 @@
+from app.services.control_service import get_car_status_by_id
 import asyncio
 import os
 from pathlib import Path
@@ -187,6 +188,12 @@ async def generate_intelligence_queue(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_owner_or_car),
 ):
+    target = resolve_car_device_id(req.device_id, user.device_id)
+    async with music_queue_snapshot_manager.operation_lock(target):
+        return await _generate_intelligence_queue(req, request, db, user)
+
+
+async def _generate_intelligence_queue(req, request, db, user):
     verify_csrf(request, user)
     """
     Generate authentic intelligence mode (心动模式) continuous playback queue from upstream.
@@ -204,6 +211,15 @@ async def generate_intelligence_queue(
             )
 
     batch_idx = req.batch_index or 0
+
+    # Replay before touching upstream or evaluating a now-advanced batch.
+    cached = music_queue_snapshot_manager._replenish_cache.get((target_device, req.request_id)) if req.request_id else None
+    if cached:
+        original = music_queue_snapshot_manager._intelligence_request_payloads.get((target_device, req.request_id))
+        if original is not None and original != req.model_dump():
+            raise HTTPException(409, detail={"error_code": "INTELLIGENCE_REQUEST_CONFLICT"})
+        return NeteaseIntelligenceResponse(mode="intelligence", tracks=[NeteaseQueueTrackItem(**t) for t in cached.tracks],
+                                          queue_id=cached.queue_id, queue_version=cached.queue_version, batch_index=batch_idx)
 
     # 1. Seed qualification check
     if batch_idx == 0:
@@ -254,7 +270,15 @@ async def generate_intelligence_queue(
                     "message": "当前未处于心动模式队列，无法续批",
                 },
             )
-        valid_seed_ids = {t["song_id"] for t in active_q.tracks}
+        if (req.queue_id is not None and req.queue_id != active_q.queue_id) or (req.queue_version is not None and req.queue_version != active_q.queue_version):
+            raise HTTPException(409, detail={"error_code": "QUEUE_VERSION_CONFLICT"})
+        if batch_idx != active_q.batch_count:
+            raise HTTPException(409, detail={"error_code": "INTELLIGENCE_BATCH_CONFLICT"})
+        if active_q.batch_count >= 5 or active_q.total >= 150:
+            raise HTTPException(503, detail={"error_code": "INTELLIGENCE_QUEUE_EXHAUSTED"})
+        current = get_car_status_by_id(db, target_device)
+        current_song = next((t["song_id"] for t in active_q.tracks if current and t["track_id"] == current.current_track_id), None)
+        valid_seed_ids = {active_q.tracks[-1]["song_id"], current_song}
         if req.seed_song_id not in valid_seed_ids:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -296,6 +320,12 @@ async def generate_intelligence_queue(
             },
         )
 
+    if mode != "intelligence" or not songs:
+        raise HTTPException(502, detail={"error_code": "INTELLIGENCE_UPSTREAM_FAILED", "message": "未获得真实心动队列"})
+
+    if batch_idx > 0 and music_queue_snapshot_manager.get_active_queue(target_device) is not active_q:
+        raise HTTPException(409, detail={"error_code": "QUEUE_VERSION_CONFLICT", "message": "续批期间实际队列已变化"})
+
     # 3. Update device queue snapshot
     if batch_idx == 0:
         snapshot = await music_queue_snapshot_manager.create_intelligence_queue(
@@ -303,12 +333,15 @@ async def generate_intelligence_queue(
             seed_song_id=req.seed_song_id,
             songs=songs,
             request_id=req.request_id,
+            db=db,
+            activate=False,
         )
     else:
         snapshot = await music_queue_snapshot_manager.append_intelligence_tracks(
             device_id=target_device,
             songs=songs,
             request_id=req.request_id,
+            db=db,
         )
 
     items = []
@@ -331,6 +364,8 @@ async def generate_intelligence_queue(
             )
         )
 
+    if req.request_id:
+        music_queue_snapshot_manager._intelligence_request_payloads[(target_device, req.request_id)] = req.model_dump()
     track_items = [NeteaseQueueTrackItem(**t) for t in snapshot.tracks]
 
     return NeteaseIntelligenceResponse(

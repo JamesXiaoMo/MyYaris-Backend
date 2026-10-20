@@ -61,6 +61,7 @@ class MusicQueueResponse(BaseModel):
     total: int
     is_complete: bool
     queue_state: str = "ready"
+    batch_index: int = 0
     offset: int
     limit: int
     has_more: bool
@@ -68,6 +69,8 @@ class MusicQueueResponse(BaseModel):
 
 
 class NeteaseIntelligenceRequest(BaseModel):
+    queue_id: Optional[str] = None
+    queue_version: Optional[int] = None
     device_id: Optional[str] = Field(None, description="Target vehicle device ID")
     request_id: Optional[str] = Field(None, description="Client idempotent request ID")
     seed_song_id: int = Field(..., description="Seed song ID to generate recommendations from")

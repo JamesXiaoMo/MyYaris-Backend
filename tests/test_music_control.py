@@ -108,14 +108,17 @@ def test_auth_and_x_device_token(client):
     resp_x = client.get("/api/v1/music/control/status", headers=x_headers)
     assert resp_x.status_code == 200
 
-    # 3. Car token cannot issue commands (requires phone or admin)
+    # 3. Bound car controls enter the same HTTP pipeline as the phone
     car_x_headers = {"X-Device-Token": settings.CAR_TOKEN}
     cmd_resp = client.post(
         "/api/v1/music/control/command",
         json={"action": "pause"},
         headers=car_x_headers,
     )
-    assert cmd_resp.status_code == 403
+    assert cmd_resp.status_code == 200
+    cross_device = client.post("/api/v1/music/control/command",
+        json={"action": "pause", "device_id": "other_vehicle"}, headers=car_x_headers)
+    assert cross_device.status_code == 403
 
 
 def test_websocket_broadcast_and_dispatch(client):
