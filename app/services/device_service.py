@@ -24,3 +24,11 @@ def is_same_device(device_a: Optional[str], device_b: Optional[str]) -> bool:
     if not device_a or not device_b:
         return False
     return resolve_car_device_id(device_a) == resolve_car_device_id(device_b)
+
+
+# iPhone-local playback sessions live in their own queue scope, never in a car device's scope.
+LOCAL_SCOPE_PREFIX = "local~"
+
+
+def is_local_scope(device_id: Optional[str]) -> bool:
+    return bool(device_id) and device_id.strip().startswith(LOCAL_SCOPE_PREFIX)

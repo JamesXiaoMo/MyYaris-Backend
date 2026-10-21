@@ -56,12 +56,15 @@ from app.services.control_service import (
     ws_manager,
     NeteaseUpstreamError,
 )
-from app.services.device_service import is_same_device, resolve_car_device_id
+from app.services.device_service import is_local_scope, is_same_device, resolve_car_device_id
 from app.services.netease_service import netease_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["Music Control & State Sync"])
+
+# Queue sources that belong to the Owner's account (favorite list and its heart recommendations).
+OWNER_QUEUE_SOURCES = ("netease_favorite", "netease_intelligence")
 
 VALID_ACTIONS = {
     "play_track",
@@ -105,6 +108,8 @@ async def _process_and_dispatch_music_command(
             detail=f"Invalid action '{cmd.action}'. Supported actions: {sorted(list(VALID_ACTIONS))}",
         )
 
+    if is_local_scope(cmd.device_id) or is_local_scope(target_device):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Local playback scopes are not command targets")
     norm_target = resolve_car_device_id(cmd.device_id or target_device or user.device_id)
     if user.role == "car" and (not user.device_id or not is_same_device(user.device_id, norm_target)):
         raise HTTPException(403, "Car token may only control its own device")
@@ -148,7 +153,7 @@ async def _process_and_dispatch_music_command(
                     "message": "非车主账号无权修改车主播放队列或切换播放模式",
                 },
             )
-        if cmd.action == "play_track" and cmd.params and cmd.params.source == "netease_favorite":
+        if cmd.action == "play_track" and cmd.params and cmd.params.source in OWNER_QUEUE_SOURCES:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={
@@ -293,6 +298,12 @@ async def _process_and_dispatch_music_command(
                 },
             )
 
+    if cmd.action == "play_track" and cmd.params and cmd.params.autoplay is False:
+        car_status = get_car_status_by_id(db, norm_target)
+        caps = json.loads(car_status.capabilities_json or "[]") if car_status else []
+        if "handoff_v1" not in caps:
+            raise HTTPException(422, detail={"error_code": "CAPABILITY_NOT_SUPPORTED", "message": "Target car does not support silent handoff preparation"})
+
     # 5. Precondition assertion on expected_queue_id and expected_queue_version
     if cmd.params:
         active_q = music_queue_snapshot_manager.get_active_queue(norm_target)
@@ -428,8 +439,9 @@ async def _process_and_dispatch_music_command(
                 except ValueError:
                     pass
 
-            # Case A: Explicit favorite queue member playback
-            if cmd.params.source == "netease_favorite":
+            # Case A: Explicit Owner queue member playback (favorite list, or a handed-off heart queue)
+            if cmd.params.source in OWNER_QUEUE_SOURCES:
+                requested_source = cmd.params.source
                 if s_id is None:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -467,13 +479,13 @@ async def _process_and_dispatch_music_command(
                         },
                     )
 
-                if snap.source != "netease_favorite":
+                if snap.source != requested_source:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                         detail={
                             "code": 422,
                             "error_code": "QUEUE_SOURCE_MISMATCH",
-                            "error_detail": f"Target queue snapshot source '{snap.source}' does not match requested source 'netease_favorite'",
+                            "error_detail": f"Target queue snapshot source '{snap.source}' does not match requested source '{requested_source}'",
                             "message": "队列类型不匹配",
                         },
                     )
@@ -525,7 +537,7 @@ async def _process_and_dispatch_music_command(
                 music_queue_snapshot_manager.register_pending_snapshot(norm_target, cmd.command_id, snap)
                 cmd.params.queue_id = snap.queue_id
                 cmd.params.queue_version = snap.queue_version
-                cmd.params.source = "netease_favorite"
+                cmd.params.source = requested_source
                 cmd.params.queue_index = matched_index
                 cmd.params.track_id = matched_track.get("track_id", f"netease_{s_id}")
                 cmd.params.stream_url = matched_track.get("stream_url", f"/api/v1/music/netease/stream/{s_id}")
@@ -746,6 +758,8 @@ async def get_next_music_command(
     Car client polls for the next pending music playback command.
     Returns 204 No Content if timeout expires with no unacknowledged commands.
     """
+    if is_local_scope(device_id):
+        raise HTTPException(422, detail="Local playback scopes are not vehicle targets")
     target_device = resolve_car_device_id(device_id, user.device_id)
 
     if user.role == "car" and user.device_id:
@@ -849,6 +863,8 @@ async def report_car_playback_status(
     Car client reports real-time playback heartbeat status (playing/paused/position/volume).
     Persists snapshot to database and immediately broadcasts to all connected iPhone WebSockets.
     """
+    if is_local_scope(report.device_id):
+        raise HTTPException(422, detail="Local playback scopes are not vehicle targets")
     target_device = resolve_car_device_id(report.device_id, user.device_id)
     if user.role == "car" and user.device_id:
         if not is_same_device(user.device_id, target_device):
@@ -889,6 +905,8 @@ def get_car_playback_status(
             detail="Access forbidden: User account lacks vehicle device control permission.",
         )
 
+    if is_local_scope(device_id):
+        raise HTTPException(422, detail="Local playback scopes are not vehicle targets")
     target_device = resolve_car_device_id(device_id, user.device_id)
     if user.role == "car" and (not user.device_id or not is_same_device(user.device_id, target_device)):
         raise HTTPException(403, "Car token may only read its own device")
@@ -929,6 +947,8 @@ async def get_music_queue(
     Querying with ?source=... NEVER switches the active playback queue.
     Enforces immutable versioned snapshots. Version mismatch returns 409 QUEUE_VERSION_CONFLICT.
     """
+    if is_local_scope(device_id):
+        raise HTTPException(422, detail="Local playback scopes are not vehicle targets")
     target_device = resolve_car_device_id(device_id, user.device_id)
 
     # Device ownership validation for car clients
@@ -939,9 +959,31 @@ async def get_music_queue(
                 detail="Forbidden: Car token cannot access music queue of other devices.",
             )
 
+    return await read_queue_page_http(
+        target_device,
+        source=source,
+        queue_id=queue_id,
+        queue_version=queue_version,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
+async def read_queue_page_http(
+    scope: str,
+    *,
+    source: Optional[str],
+    queue_id: Optional[str],
+    queue_version: Optional[int],
+    offset: int,
+    limit: int,
+    db: Session,
+) -> MusicQueueResponse:
+    """Shared read-only queue page with HTTP error mapping (car scope and iPhone local scope)."""
     try:
         return await music_queue_snapshot_manager.get_queue_page(
-            device_id=target_device,
+            device_id=scope,
             source=source,
             queue_id=queue_id,
             queue_version=queue_version,
@@ -1017,6 +1059,9 @@ async def music_websocket_endpoint(
     # Determine client identity and normalized target device
     c_type = client_type if client_type in ["car", "phone"] else ("car" if user.role == "car" else "phone")
     raw_dev = device_id or user.device_id or settings.DEFAULT_CAR_DEVICE_ID
+    if is_local_scope(raw_dev):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     norm_target = resolve_car_device_id(raw_dev)
     if ((user.role == "car" and (c_type != "car" or not user.device_id or not is_same_device(user.device_id, norm_target)))
             or (c_type == "car" and user.role not in ("car", "admin"))):

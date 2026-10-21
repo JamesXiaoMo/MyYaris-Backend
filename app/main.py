@@ -6,6 +6,7 @@ from app.api.control import router as control_router
 from app.api.destinations import router as destinations_router, api_v1_router as nav_v1_router
 from app.api.favorites import folders_router as favorite_folders_router, router as favorites_router
 from app.api.health import router as health_router
+from app.api.local_playback import router as local_playback_router
 from app.api.music import router as music_router
 from app.api.netease import router as netease_router
 from app.api.tasks import router as tasks_router
@@ -54,6 +55,7 @@ app.include_router(tasks_router)
 app.include_router(voice_router)
 app.include_router(music_router)
 app.include_router(netease_router)
+app.include_router(local_playback_router)
 app.include_router(control_router)
 app.include_router(favorites_router)
 app.include_router(favorite_folders_router)

@@ -27,7 +27,7 @@ from app.api.auth import (
     require_owner_or_car,
     verify_csrf,
 )
-from app.services.device_service import is_same_device, resolve_car_device_id
+from app.services.device_service import is_local_scope, is_same_device, resolve_car_device_id
 from app.config import settings
 from app.repositories.database import SessionLocal, get_db
 from app.repositories.models import utc_now
@@ -260,28 +260,32 @@ async def generate_intelligence_queue(
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_owner_or_car),
 ):
+    if is_local_scope(req.device_id):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Local playback scopes use /music/local/intelligence")
     target = resolve_car_device_id(req.device_id, user.device_id)
     async with music_queue_snapshot_manager.operation_lock(target):
         return await _generate_intelligence_queue(req, request, db, user)
 
 
-async def _generate_intelligence_queue(req, request, db, user):
+async def _generate_intelligence_queue(req, request, db, user, scope=None):
     verify_csrf(request, user)
     """
     Generate authentic intelligence mode (心动模式) continuous playback queue from upstream.
     Initial seed song (batch_index == 0) must belong to the owner's favorite playlist.
     Replenishment (batch_index > 0) appends to the active queue with stable indices.
     """
-    target_device = resolve_car_device_id(req.device_id, user.device_id)
+    # ``scope`` is an iPhone-local playback scope: its snapshots/active queue never touch a car device.
+    target_device = scope or resolve_car_device_id(req.device_id, user.device_id)
 
     # Device ownership validation for car clients
-    if user.role == "car":
+    if user.role == "car" and not scope:
         if not user.device_id or not is_same_device(user.device_id, target_device):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Forbidden: Car token cannot access music queue of other devices.",
             )
 
+    owner_epoch = music_queue_snapshot_manager._owner_epoch
     batch_idx = req.batch_index or 0
 
     # Replay before touching upstream or evaluating a now-advanced batch.
@@ -392,6 +396,9 @@ async def _generate_intelligence_queue(req, request, db, user):
             },
         )
 
+    if owner_epoch != music_queue_snapshot_manager._owner_epoch:
+        raise HTTPException(409, detail={"error_code": "QUEUE_VERSION_CONFLICT", "message": "Owner changed while preparing intelligence"})
+
     if mode != "intelligence" or not songs:
         raise HTTPException(502, detail={"error_code": "INTELLIGENCE_UPSTREAM_FAILED", "message": "未获得真实心动队列"})
 
@@ -406,7 +413,8 @@ async def _generate_intelligence_queue(req, request, db, user):
             songs=songs,
             request_id=req.request_id,
             db=db,
-            activate=False,
+            # A car queue is promoted only by the vehicle's applied ACK; a local scope has no ACK stage.
+            activate=bool(scope),
         )
     else:
         snapshot = await music_queue_snapshot_manager.append_intelligence_tracks(

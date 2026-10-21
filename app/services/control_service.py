@@ -444,17 +444,22 @@ class MusicQueueSnapshotManager:
         self._snapshots: Dict[Tuple[str, str, int], QueueSnapshot] = {}  # (norm_dev, queue_id, version) -> snapshot
         self._replenish_cache: Dict[Tuple[str, str], QueueSnapshot] = {}
         self._intelligence_request_payloads = {}
+        self._owner_epoch = 0
+        self._transfer_copies = {}
         self._last_version: Dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     def clear_all(self):
         """Clears all in-memory queue snapshots and replenishment caches."""
+        self._owner_epoch += 1
         self._active_queues.clear()
         self._pending_queues.clear()
         self._snapshots.clear()
         self._replenish_cache.clear()
         self._intelligence_request_payloads.clear()
         self._last_version.clear()
+        self._transfer_copies.clear()
+        self.__dict__.pop("_local_scope_order", None)
         logger.info("Cleared all music queue snapshots and caches.")
 
     def get_next_queue_version(self, device_id: str, db: Optional[Session] = None) -> int:
@@ -618,6 +623,100 @@ class MusicQueueSnapshotManager:
             return snapshot
         return None
 
+    _LOCAL_SCOPES_KEPT = 8
+
+    def touch_local_scope(self, scope: str, db: Optional[Session] = None) -> None:
+        """Bound memory/DB rows for iPhone-local scopes: least recently used scopes are dropped."""
+        order = self.__dict__.setdefault("_local_scope_order", [])
+        if scope in order:
+            order.remove(scope)
+        order.append(scope)
+        while len(order) > self._LOCAL_SCOPES_KEPT:
+            self.drop_scope(order.pop(0), db=db)
+
+    def drop_scope(self, scope: str, db: Optional[Session] = None) -> None:
+        """Forgets every queue artefact of one scope. Never touches another scope."""
+        self._active_queues.pop(scope, None)
+        for table in (self._pending_queues, self._snapshots, self._replenish_cache, self._intelligence_request_payloads):
+            for key in [k for k in table if k[0] == scope]:
+                del table[key]
+        self._last_version.pop(scope, None)
+        # Keep a held operation lock stable until its coroutine exits.
+        for key in [k for k in self._transfer_copies if k[0] == scope or k[3] == scope]:
+            del self._transfer_copies[key]
+        order = self.__dict__.get("_local_scope_order", [])
+        if scope in order:
+            order.remove(scope)
+        close_db = db is None
+        if close_db:
+            from app.repositories.database import SessionLocal
+            db = SessionLocal()
+        try:
+            db.query(QueueVersionSequence).filter(QueueVersionSequence.device_id == scope).delete()
+            db.commit()
+        finally:
+            if close_db:
+                db.close()
+
+    def clone_snapshot(
+        self,
+        source_scope: str,
+        queue_id: str,
+        queue_version: int,
+        dest_scope: str,
+        activate: bool,
+        db: Optional[Session] = None,
+    ) -> QueueSnapshot:
+        """Copies one immutable snapshot into another scope under a new monotonic version of that scope.
+
+        The source scope is only read; the destination is never activated implicitly for a car
+        (a car queue becomes active solely through the vehicle's applied ACK).
+        """
+        src = resolve_car_device_id(source_scope)
+        dst = resolve_car_device_id(dest_scope)
+        original = self._snapshots.get((src, queue_id, queue_version))
+        if original is None:
+            original = next(
+                (p for (d, _), p in self._pending_queues.items()
+                 if d == src and p.queue_id == queue_id and p.queue_version == queue_version),
+                None,
+            )
+        if original is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": 409,
+                    "error_code": "QUEUE_VERSION_CONFLICT",
+                    "error_detail": f"Queue snapshot ({queue_id}, v{queue_version}) not found.",
+                    "message": "播放队列版本已变更，请从第一页重新拉取。",
+                },
+            )
+        key = (src, queue_id, queue_version, dst)
+        cached = self._transfer_copies.get(key)
+        if cached is not None and (dst, cached.queue_id, cached.queue_version) in self._snapshots:
+            return cached
+        version = self.get_next_queue_version(dst, db=db)
+        clone = QueueSnapshot(
+            queue_id=original.queue_id,
+            queue_version=version,
+            source=original.source,
+            name=original.name,
+            total=original.total,
+            is_complete=original.is_complete,
+            queue_state=original.queue_state,
+            tracks=[dict(t) for t in original.tracks],
+            device_id=dst,
+            seed_song_id=original.seed_song_id,
+            batch_count=original.batch_count,
+        )
+        clone.catalog_revision = original.catalog_revision
+        self._transfer_copies[key] = clone
+        self._snapshots[(dst, clone.queue_id, version)] = clone
+        if activate:
+            self._active_queues[dst] = clone
+            self.sync_device_queue_version(dst, version, db=db)
+        return clone
+
     def discard_pending_queue(self, device_id: str, command_id: str):
         """Discards a pending queue snapshot on command failure or timeout without touching active queue."""
         norm_dev = resolve_car_device_id(device_id)
@@ -641,6 +740,7 @@ class MusicQueueSnapshotManager:
         Initializes or refreshes the full favorite playlist queue for device_id.
         Paginates exhaustively until all tracks are loaded, deduplicates, and guards queue readiness.
         """
+        owner_epoch = self._owner_epoch
         norm_dev = resolve_car_device_id(device_id)
         fav_info = await netease_service.get_favorite_playlist_info(force_refresh=force_refresh)
         pid = fav_info["playlist_id"]
@@ -763,6 +863,8 @@ class MusicQueueSnapshotManager:
         snapshot.catalog_revision = pinned_revision
 
         async with self._lock:
+            if owner_epoch != self._owner_epoch:
+                raise HTTPException(409, detail={"error_code": "QUEUE_VERSION_CONFLICT", "message": "Owner changed while preparing queue"})
             self._snapshots[(norm_dev, queue_id, version)] = snapshot
             if command_id:
                 self._pending_queues[(norm_dev, command_id)] = snapshot

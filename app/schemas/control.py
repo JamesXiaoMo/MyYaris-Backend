@@ -29,6 +29,8 @@ class MusicCommandParams(BaseModel):
     start_index: Optional[int] = None
     start_track_id: Optional[str] = None
     keep_playback_state: Optional[bool] = None
+    # play_track only: False loads the track at the requested position and stays paused (handoff prepare).
+    autoplay: Optional[bool] = None
 
     @model_validator(mode="before")
     @classmethod
