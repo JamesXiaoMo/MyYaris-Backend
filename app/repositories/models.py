@@ -264,3 +264,80 @@ class UserDeviceBinding(Base):
 
     user = relationship("User", back_populates="device_bindings")
 
+
+class OfflineJob(Base):
+    """A single bulk offline-download job, idempotent per (owner_key, idempotency_key)."""
+
+    __tablename__ = "offline_jobs"
+    __table_args__ = (
+        UniqueConstraint("owner_key", "idempotency_key", name="uq_offline_jobs_owner_idem"),
+    )
+
+    job_id = Column(String(64), primary_key=True, index=True)
+    owner_key = Column(String(64), nullable=False, index=True)  # opaque verified NetEase owner
+    account_id = Column(String(64), nullable=True, index=True)  # MyYaris account (User.id); None for legacy token
+    device_id = Column(String(64), nullable=False, index=True)  # canonical car device id
+    idempotency_key = Column(String(128), nullable=False, index=True)  # client-supplied
+    request_fingerprint = Column(String(64), nullable=False)  # hash of request body
+    state = Column(String(32), default="running", nullable=False, index=True)  # running|paused|done|cancelled
+    quality = Column(String(16), default="320k", nullable=False)
+    total = Column(Integer, default=0, nullable=False)
+    done = Column(Integer, default=0, nullable=False)
+    failed = Column(Integer, default=0, nullable=False)
+    revision = Column(Integer, default=1, nullable=False)  # optimistic-consistency counter (not an immutable snapshot)
+    network_epoch = Column(String(128), nullable=True)  # opaque network identifier reported by the car
+    wifi_confirm_token_hash = Column(String(128), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class OfflineItem(Base):
+    """Per-song offline status. Stores no absolute path / SAF URI / credential."""
+
+    __tablename__ = "offline_items"
+    __table_args__ = (
+        UniqueConstraint("job_id", "song_id", "quality", name="uq_offline_items_job_song_quality"),
+    )
+
+    item_id = Column(String(64), primary_key=True, index=True)
+    job_id = Column(String(64), nullable=False, index=True)
+    owner_key = Column(String(64), nullable=False, index=True)
+    account_id = Column(String(64), nullable=True, index=True)
+    device_id = Column(String(64), nullable=False, index=True)
+    song_id = Column(Integer, nullable=False, index=True)
+    quality = Column(String(16), default="320k", nullable=False)
+    format = Column(String(16), nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    sha256 = Column(String(64), nullable=True)
+    card_volume_id = Column(String(64), nullable=True)  # opaque volume id, never a path
+    status = Column(String(32), default="pending", nullable=False, index=True)  # pending|claimed|saved|failed|revoked
+    version = Column(Integer, default=1, nullable=False)  # per-item optimistic concurrency
+    error_code = Column(String(64), nullable=True)
+    error_detail = Column(Text, nullable=True)
+    claim_deadline = Column(DateTime(timezone=True), nullable=True)
+    last_receipt_at = Column(DateTime(timezone=True), nullable=True)
+    last_verified_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class NetworkAuthorization(Base):
+    """Time-limited, per-batch WiFi authorization bound to (device_id, network_epoch)."""
+
+    __tablename__ = "network_authorizations"
+    __table_args__ = (
+        UniqueConstraint("device_id", "network_epoch", name="uq_network_auth_device_epoch"),
+    )
+
+    id = Column(String(64), primary_key=True, index=True)
+    owner_key = Column(String(64), nullable=False, index=True)
+    account_id = Column(String(64), nullable=True, index=True)
+    device_id = Column(String(64), nullable=False, index=True)
+    network_epoch = Column(String(128), nullable=False)  # opaque, reported by the car; server never infers unlimited from SSID
+    token_hash = Column(String(128), nullable=False)
+    batch_total = Column(Integer, default=1, nullable=False)
+    batch_remaining = Column(Integer, default=1, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+

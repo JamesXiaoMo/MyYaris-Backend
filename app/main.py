@@ -9,6 +9,7 @@ from app.api.health import router as health_router
 from app.api.local_playback import router as local_playback_router
 from app.api.music import router as music_router
 from app.api.netease import router as netease_router
+from app.api.offline import router as offline_router
 from app.api.tasks import router as tasks_router
 from app.api.voice import router as voice_router
 from app.config import settings
@@ -56,6 +57,7 @@ app.include_router(voice_router)
 app.include_router(music_router)
 app.include_router(netease_router)
 app.include_router(local_playback_router)
+app.include_router(offline_router)
 app.include_router(control_router)
 app.include_router(favorites_router)
 app.include_router(favorite_folders_router)

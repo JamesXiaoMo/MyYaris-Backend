@@ -498,3 +498,43 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 - 三个主要菜单为喜欢循环、喜欢随机、网易云心动。兼容单曲循环仍可经协议使用，手机仅在已应用该模式时显示兼容项。手机歌曲详情的心动按钮复用统一模式入口，不再独立生成并冒充播放队列。
 
 验证使用隔离 SQLite、fake 上游、真实 HTTP/WS 路由、fake just_audio 原生平台和本地回环 HTTP。没有发送生产播放命令、调用真实心动/点赞/导航或实车 OBD。构建、部署、设备安装和实际出声必须分别记录，不能相互代替。
+
+---
+
+## 十二、 离线 SD 下载模块 (V3.0 契约)
+
+> 状态：代码实现已完成（`app/api/offline.py`、`app/services/offline_service.py`、`app/schemas/offline.py`、`app/repositories/models.py` 新增三表）。仅后端独立仓库，未部署、未实际下载、未发生产网络授权；车机/iOS 侧由根工程后续整合。
+
+### 12.1 数据模型（新表，`create_all` 自动建）
+
+- `offline_jobs`：`job_id`、`owner_key`（opaque 已验证 Owner）、`account_id`（MyYaris 账号）、`device_id`（canonical 车机 id）、`idempotency_key`+`request_fingerprint`（幂等）、`state`(running|paused|done|cancelled)、`quality`、`total/done/failed`、`revision`（乐观一致性计数器）、`network_epoch`、`wifi_confirm_token_hash`。唯一 `(owner_key, idempotency_key)`。
+- `offline_items`：`item_id`、`job_id`、`owner_key`、`account_id`、`device_id`、`song_id`、`quality`、`format/size_bytes/sha256/card_volume_id`（**无绝对路径/SAF URI/凭据**）、`status`(pending|claimed|saved|failed|revoked)、`version`（逐曲乐观并发）、`claim_deadline`、`last_receipt_at/last_verified_at`。唯一 `(job_id, song_id, quality)`。
+- `network_authorizations`：`device_id`+`network_epoch`（唯一）、`token_hash`、`batch_total/batch_remaining`、`expires_at`。
+
+### 12.2 业务状态（单一 `saved`）
+
+`pending → claimed → saved`（`saved` 即“已存车机并校验通过”，无独立 `ready`）；`claimed` 超时无心跳回退 `pending`；`saved` 可 `revoked`（卡移除/丢文件）；`openable=false` 置 `failed`。`saved` 超过 `OFFLINE_RECHECK_SECONDS`(7 天) 在查询中标记 `stale=true`（需重新核验），不静默保持。
+
+### 12.3 接口与鉴权边界
+
+| 方法/路径 | 鉴权 | 说明 |
+| :--- | :--- | :--- |
+| `POST /api/v1/music/offline/network` | admin | 签发/刷新网络授权（绑定 device+network_epoch，有时效、每批有效），返回一次性 `wifi_confirm_token` |
+| `POST /api/v1/music/offline/jobs` | admin | 创建离线任务（幂等键+请求指纹；同键同请求重放同 job，同键不同请求 409） |
+| `GET /api/v1/music/offline/jobs` / `/jobs/{job_id}` | admin 或 legacy phone | 任务列表/摘要（owner/account 隔离） |
+| `GET /api/v1/music/offline/jobs/{job_id}/items` | admin 或 legacy phone | 逐曲状态分页；`revision` 钉住，变化 409（乐观一致性，非不可变快照） |
+| `POST /api/v1/music/offline/jobs/{job_id}/pause\|resume\|cancel` | admin | 暂停/继续/取消 |
+| `POST /api/v1/music/offline/work/claim` | **仅 car** | 车机认领一批 pending 项；换网(epoch 不匹配)跳过 → 服务端实现换网暂停 |
+| `POST /api/v1/music/offline/work/{item_id}/heartbeat` | **仅 car** | 续期 claim_deadline |
+| `POST /api/v1/music/offline/items/{item_id}/receipt` | **仅 car** | 可信回执：`{job_id, version, size_bytes, sha256, openable, card_volume_id, format}`；校验 version 一致才置 `saved` |
+| `POST /api/v1/music/offline/items/{item_id}/revoke` | **仅 car** | 丢文件/卡移除 → `revoked` |
+
+- **可信 car 回执**：`require_bound_car` 要求 `role=car` 且 `device_id` 归一化后匹配 item；phone/legacy-phone/标准 admin 会话均不能提交回执（不会“手机伪装 car”）。
+- **音频源**：离线模块不提供音频字节，车机复用现有 `/api/v1/music/netease/stream/{song_id}`（含既有缓存/流、Range、MIME 校验），不新增绕鉴权接口。
+- **网络门禁**：服务端不凭 SSID 推断“不限量”；车机报告 `network_epoch` 并执行真实网络判断。授权有时效、每批（每 job）消耗一批，不按曲复用。
+- **错误码**：`OWNER_NOT_VERIFIED`(409)、`IDEMPOTENCY_CONFLICT`(409)、`VERSION_CONFLICT`/`REVISION_CONFLICT`/`JOB_MISMATCH`/`BAD_STATE`/`NOT_CLAIMED`(409)、`NOT_FOUND`(404)、`NOT_CAR`(403)、`NETWORK_NOT_AUTHORIZED`/`NETWORK_TOKEN_MISMATCH`/`NETWORK_AUTH_EXPIRED`/`NETWORK_BATCH_EXHAUSTED`(403)。
+
+### 12.4 验证边界
+
+- 后端 13 项离线测试（隔离 SQLite + fake 上游，不读生产凭据）覆盖：幂等/请求指纹冲突、网络授权门禁与批次耗尽、普通账号/phone/car 越权拒绝、phone 不能提交回执、claim/heartbeat/receipt、过期旧回执 409、revoke（SD 移除）、claim 超时重领、分页 revision 冲突、清单无路径/凭据、owner 隔离、持久化重启。
+- 未验证：车机 SAF `seek/rename` 实测、真机下载、真实音频 URL 请求、生产网络授权签发、部署。

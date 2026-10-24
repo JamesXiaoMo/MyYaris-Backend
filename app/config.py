@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     MEDIA_CACHE_MAX_BYTES: int = 50 * 1024 * 1024 * 1024  # 50 GB
     NETEASE_API_BASE_URL: str = "http://127.0.0.1:3001"
 
+    # Offline SD download (V3.0)
+    OFFLINE_CLAIM_TIMEOUT_MINUTES: int = 30
+    OFFLINE_RECHECK_SECONDS: int = 7 * 24 * 3600  # saved items older than this surface stale=true (need re-verify)
+
     # Owner favorite playlist metadata catalog (bounded, persistent, white-listed metadata only)
     NETEASE_FAV_CHECK_TTL_SECONDS: float = 60.0  # no upstream call at all inside this window
     NETEASE_FAV_FULL_RECHECK_SECONDS: float = 6 * 3600.0  # bounded re-verify of title/cover/permission edits
