@@ -266,7 +266,7 @@ class UserDeviceBinding(Base):
 
 
 class OfflineJob(Base):
-    """A single bulk offline-download job, idempotent per (owner_key, idempotency_key)."""
+    """A complete favorite-membership job; stored idempotency keys include account scope."""
 
     __tablename__ = "offline_jobs"
     __table_args__ = (
@@ -284,6 +284,7 @@ class OfflineJob(Base):
     total = Column(Integer, default=0, nullable=False)
     done = Column(Integer, default=0, nullable=False)
     failed = Column(Integer, default=0, nullable=False)
+    skipped = Column(Integer, default=0, nullable=False)  # saved items requiring no claim in this job
     revision = Column(Integer, default=1, nullable=False)  # optimistic-consistency counter (not an immutable snapshot)
     network_epoch = Column(String(128), nullable=True)  # opaque network identifier reported by the car
     wifi_confirm_token_hash = Column(String(128), nullable=True)
@@ -311,7 +312,12 @@ class OfflineItem(Base):
     sha256 = Column(String(64), nullable=True)
     card_volume_id = Column(String(64), nullable=True)  # opaque volume id, never a path
     status = Column(String(32), default="pending", nullable=False, index=True)  # pending|claimed|saved|failed|revoked
-    version = Column(Integer, default=1, nullable=False)  # per-item optimistic concurrency
+    version = Column(Integer, default=1, nullable=False)  # per-item optimistic concurrency (CAS)
+    attempts = Column(Integer, default=0, nullable=False)  # claim attempts counter (retry cap)
+    lease_token = Column(String(64), nullable=True)
+    work_kind = Column(String(16), default="download", nullable=False)
+    device_generation = Column(Integer, default=1, nullable=False)
+    inventory_version = Column(Integer, default=0, nullable=False)
     error_code = Column(String(64), nullable=True)
     error_detail = Column(Text, nullable=True)
     claim_deadline = Column(DateTime(timezone=True), nullable=True)
@@ -341,3 +347,36 @@ class NetworkAuthorization(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
+
+class OfflineTrack(Base):
+    """Durable account/Owner/device/song/quality inventory, including revocation tombstones."""
+
+    __tablename__ = "offline_tracks"
+    __table_args__ = (
+        UniqueConstraint("owner_key", "account_id", "device_id", "song_id", "quality", name="uq_offline_tracks_scope"),
+    )
+
+    id = Column(String(64), primary_key=True, index=True)
+    owner_key = Column(String(64), nullable=False, index=True)
+    account_id = Column(String(64), nullable=False, index=True)
+    device_id = Column(String(64), nullable=False, index=True)
+    song_id = Column(Integer, nullable=False, index=True)
+    quality = Column(String(16), default="320k", nullable=False)
+    status = Column(String(16), default="revoked", nullable=False)
+    size_bytes = Column(Integer, nullable=True)
+    sha256 = Column(String(64), nullable=True)
+    card_volume_id = Column(String(64), nullable=True)  # opaque volume id, never a path
+    format = Column(String(16), nullable=True)
+    version = Column(Integer, default=1, nullable=False)
+    last_verified_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class OfflineDevice(Base):
+    """Physical card generation fences old work, even across account/Owner switches."""
+
+    __tablename__ = "offline_devices"
+    device_id = Column(String(64), primary_key=True)
+    generation = Column(Integer, default=1, nullable=False)
+    card_volume_id = Column(String(64), nullable=True)

@@ -501,40 +501,78 @@ queued (入库待发) -> sent (WS/HTTP派发) -> received (车机已接单) -> a
 
 ---
 
-## 十二、 离线 SD 下载模块 (V3.0 契约)
+## 十二、离线 SD 下载模块（任务一致性修订契约）
 
-> 状态：代码实现已完成（`app/api/offline.py`、`app/services/offline_service.py`、`app/schemas/offline.py`、`app/repositories/models.py` 新增三表）。仅后端独立仓库，未部署、未实际下载、未发生产网络授权；车机/iOS 侧由根工程后续整合。
+> 仅后端任务/库存记账实现。未部署、未签发生产网络授权、未下载真实音源、未验证真机。`5953fb1` 的旧契约已被拒绝，本节替代旧接口说明。当前用户尚未确认不限量 WiFi，不能开始真实批量任务。车机/iOS 尚待各自整合本契约。
 
-### 12.1 数据模型（新表，`create_all` 自动建）
+### 12.1 边界和持久化
 
-- `offline_jobs`：`job_id`、`owner_key`（opaque 已验证 Owner）、`account_id`（MyYaris 账号）、`device_id`（canonical 车机 id）、`idempotency_key`+`request_fingerprint`（幂等）、`state`(running|paused|done|cancelled)、`quality`、`total/done/failed`、`revision`（乐观一致性计数器）、`network_epoch`、`wifi_confirm_token_hash`。唯一 `(owner_key, idempotency_key)`。
-- `offline_items`：`item_id`、`job_id`、`owner_key`、`account_id`、`device_id`、`song_id`、`quality`、`format/size_bytes/sha256/card_volume_id`（**无绝对路径/SAF URI/凭据**）、`status`(pending|claimed|saved|failed|revoked)、`version`（逐曲乐观并发）、`claim_deadline`、`last_receipt_at/last_verified_at`。唯一 `(job_id, song_id, quality)`。
-- `network_authorizations`：`device_id`+`network_epoch`（唯一）、`token_hash`、`batch_total/batch_remaining`、`expires_at`。
+- 所有路径前缀 `/api/v1/music/offline`。管理与读取复用既有 Owner/admin 隐私规则；普通用户即使有车辆控制权限，也不能访问 Owner 音乐。管理写入保留 cookie CSRF 检查。
+- 每次请求通过既有 `favorite_catalog.view()` 确认当前会话可证明的 Owner；不以 `peek()` 或客户端提交的 Owner 作为身份依据。会话失效或无法证明 Owner 返回 `OWNER_NOT_VERIFIED`。上游不可达时，仅允许目录原契约已证明属于当前会话的同一 Owner。
+- 任务、网络授权、库存隔离到 MyYaris `account_id` + 已验证 `owner_key` + canonical `device_id`。动态 admin 只读写本账号任务；legacy admin/phone 共用独立的 `__legacy__` scope，不能读动态账号任务。车机凭已认证设备身份执行当前 Owner 的指定任务，账号从该任务继承，客户端不能选择账号/Owner。
+- 仅 `role=car` 可以 claim/heartbeat/fail/receipt/revoke，且已认证 `user.device_id` 必须存在；显式设备必须与绑定设备归一化后完全一致（保留既有车机别名）。admin、phone、legacy phone 不能写可信回执；`local~` 播放 scope 不能作为车辆目标。
+- `offline_jobs` 保留完整歌单 `total`、`done/failed/skipped`、`state`、`revision`。幂等键在存储前加入账号 scope 并摘要化；同账号/Owner同键同请求重放原任务，不重复消耗网络批次；不同请求冲突。
+- `offline_items` 保留每首的 `version/attempts/work_kind`、租约、库存版本、物理卡 generation 及文件校验数据；每次 heartbeat 也递增版本。`offline_tracks` 是跨任务持久库存，唯一 `(owner_key, account_id, device_id, song_id, quality)`，撤销后保留 tombstone 和版本。`offline_devices` 保存物理卡 generation，用于拒绝旧卡任务的迟到回执。
+- 后端不保存绝对路径、SAF URI、上游音源 URL、原始错误详情或音源凭据。`card_volume_id` 是客户端生成的 opaque ID（仅字母数字、下划线、连字符），`network_epoch` 也必须是 opaque 标识，不上传 SSID/地址。
 
-### 12.2 业务状态（单一 `saved`）
+### 12.2 确认网络与完整歌单
 
-`pending → claimed → saved`（`saved` 即“已存车机并校验通过”，无独立 `ready`）；`claimed` 超时无心跳回退 `pending`；`saved` 可 `revoked`（卡移除/丢文件）；`openable=false` 置 `failed`。`saved` 超过 `OFFLINE_RECHECK_SECONDS`(7 天) 在查询中标记 `stale=true`（需重新核验），不静默保持。
+1. 管理端在用户确认后调用 `POST /network`：`{device_id, network_epoch, unlimited_wifi_confirmed:true, batch_total:1, expires_in_minutes:60}`。缺失/false 不签发授权。返回 `wifi_confirm_token`（仅该响应返回原文，数据库仅存 hash）、批次剩余量、UTC 过期时间。`batch_total` 为 1–1000，时效为 1–10080 分钟；这只是有限授权，不代表服务端已证明网络不限量。
+2. `POST /jobs`：`{idempotency_key, device_id, favorite_revision, quality, network_epoch, wifi_confirm_token}`。服务端读取固定 revision 的**全部**目录曲目和 `skipped_ids`，不截断为单页，不把缺失元数据的歌曲静默丢弃。可选 `song_ids` 必须等于完整集合，否则 `INCOMPLETE_FAVORITES`；空歌单不能创建任务。重复 ID 只计算一次。支持质量 `128k/192k/320k/lossless/hires`。
+3. 新任务原子消耗一个网络批次。授权必须匹配账号、Owner、设备、epoch、token 且未过期。已保存且仍新鲜的同 scope 同质量歌曲直接以 `saved` 纳入完整任务，`skipped` 计数，不重新下载；未完成的跨任务同曲下载也只能有一个有效租约。
+4. 授权刷新会轮换 token，旧任务不会自动继承新确认；它在下一次工作请求时暂停，需要显式 resume。服务端每次 claim/heartbeat/在途 receipt/fail 均检查时效、epoch、确认 hash 和任务状态。网络变更/过期/授权被替换时，服务端持久暂停该任务并作废在途租约，再返回 403；后续即使网络恢复也不自动继续。
+5. 实际网络判断在车机执行：下载前及下载中检测 WiFi/计费状态，换网或限量立即停止音频请求，并上报变化。服务端的 epoch 不能检测客户端未报告的换网，也不能中断已在途字节。不能声称凭 SSID 证明“不限量”。
 
-### 12.3 接口与鉴权边界
+### 12.3 工作、暂停和有界重试
 
-| 方法/路径 | 鉴权 | 说明 |
+| 方法/相对路径 | 权限 | 请求与语义 |
 | :--- | :--- | :--- |
-| `POST /api/v1/music/offline/network` | admin | 签发/刷新网络授权（绑定 device+network_epoch，有时效、每批有效），返回一次性 `wifi_confirm_token` |
-| `POST /api/v1/music/offline/jobs` | admin | 创建离线任务（幂等键+请求指纹；同键同请求重放同 job，同键不同请求 409） |
-| `GET /api/v1/music/offline/jobs` / `/jobs/{job_id}` | admin 或 legacy phone | 任务列表/摘要（owner/account 隔离） |
-| `GET /api/v1/music/offline/jobs/{job_id}/items` | admin 或 legacy phone | 逐曲状态分页；`revision` 钉住，变化 409（乐观一致性，非不可变快照） |
-| `POST /api/v1/music/offline/jobs/{job_id}/pause\|resume\|cancel` | admin | 暂停/继续/取消 |
-| `POST /api/v1/music/offline/work/claim` | **仅 car** | 车机认领一批 pending 项；换网(epoch 不匹配)跳过 → 服务端实现换网暂停 |
-| `POST /api/v1/music/offline/work/{item_id}/heartbeat` | **仅 car** | 续期 claim_deadline |
-| `POST /api/v1/music/offline/items/{item_id}/receipt` | **仅 car** | 可信回执：`{job_id, version, size_bytes, sha256, openable, card_volume_id, format}`；校验 version 一致才置 `saved` |
-| `POST /api/v1/music/offline/items/{item_id}/revoke` | **仅 car** | 丢文件/卡移除 → `revoked` |
+| `GET /jobs`、`GET /jobs/{job_id}` | admin / legacy phone | 仅当前 Owner + 自己账号的任务；列表可按设备过滤 |
+| `GET /jobs/{job_id}/items?offset=0&limit=50&revision=...` | admin / legacy phone | 完整成员分页，limit 1–100；revision 变化返回 409，重读第一页 |
+| `POST /jobs/{job_id}/pause`、`cancel` | admin + CSRF | `{revision}`；原子状态变更，立即作废该任务所有在途租约，递增相应 item version |
+| `POST /jobs/{job_id}/resume` | admin + CSRF | `{revision, network_epoch, wifi_confirm_token}`；仅 paused 能恢复；变更确认/epoch 时须消耗新的授权批次 |
+| `POST /work/claim` | bound car | `{device_id?, job_id, network_epoch, limit:10}`；job/epoch 必填，limit 1–100 |
+| `POST /work/{item_id}/heartbeat` | bound car | `{device_id?, version, lease_token, network_epoch}`；只能续未过期的在途 claim，返回**新 version**及截止时间 |
+| `POST /work/{item_id}/fail` | bound car | 同 heartbeat 字段，加枚举 `error_code`；不接受任意 error_detail |
+| `POST /items/{item_id}/receipt` | bound car | 见下节，只有文件核验通过才记 `saved` |
+| `POST /items/{item_id}/revoke` | bound car | `{device_id?, version, reason}`；全局库存撤销规则见下节 |
 
-- **可信 car 回执**：`require_bound_car` 要求 `role=car` 且 `device_id` 归一化后匹配 item；phone/legacy-phone/标准 admin 会话均不能提交回执（不会“手机伪装 car”）。
-- **音频源**：离线模块不提供音频字节，车机复用现有 `/api/v1/music/netease/stream/{song_id}`（含既有缓存/流、Range、MIME 校验），不新增绕鉴权接口。
-- **网络门禁**：服务端不凭 SSID 推断“不限量”；车机报告 `network_epoch` 并执行真实网络判断。授权有时效、每批（每 job）消耗一批，不按曲复用。
-- **错误码**：`OWNER_NOT_VERIFIED`(409)、`IDEMPOTENCY_CONFLICT`(409)、`VERSION_CONFLICT`/`REVISION_CONFLICT`/`JOB_MISMATCH`/`BAD_STATE`/`NOT_CLAIMED`(409)、`NOT_FOUND`(404)、`NOT_CAR`(403)、`NETWORK_NOT_AUTHORIZED`/`NETWORK_TOKEN_MISMATCH`/`NETWORK_AUTH_EXPIRED`/`NETWORK_BATCH_EXHAUSTED`(403)。
+- claim 返回顶层 `owner_key`，每项含 `item_id/job_id/owner_key/device_id/song_id/quality/status/version/lease_token/lease_expires_at/work_kind/attempts` 和文件校验元数据。`work_kind=download` 才可请求音源；`work_kind=verify` 只能核验已有本地文件。**普通清单不会返回 lease_token**。
+- 租约截止时间不晚于网络授权到期时间与 `OFFLINE_CLAIM_TIMEOUT_MINUTES`（默认 30 分钟）上限。迟到 heartbeat/receipt/fail 不可续活旧 claim；重新认领获得新租约和版本。客户端在每次 heartbeat 后必须改用响应中的新 version。
+- `running → paused → running`；running/paused 可取消。`cancelled/done` 是任务终态，不能 resume；重试终态需显式新任务。`done` 表示所有项已终结，**不保证全部成功**，必须结合 done/failed 和逐项状态展示。
+- 默认每项最多 `OFFLINE_MAX_CLAIM_ATTEMPTS=3` 次认领。超时或 `SOURCE_UNAVAILABLE/DOWNLOAD_FAILED` 可回 pending，达到上限置 failed；没有后台无限重试。`NETWORK_LOST` 暂停整个任务，未到上限的该项回 pending，须重新确认并显式 resume。`STORAGE_FULL/HASH_MISMATCH/NOT_OPENABLE/FILE_MISSING` 为可见失败；本地核验发现文件缺失/损坏则撤销对应库存，不偷偷转为音源下载。
+- 暂停/取消不删除音乐；已保存文件仍可查询/重新核验/撤销。只有“针对已有 saved 文件的精确本地重新核验”可不携带网络租约，它不会授权音频请求，也不能改成另一文件/另一卡。
 
-### 12.4 验证边界
+### 12.4 可信回执、重核验、撤销
 
-- 后端 13 项离线测试（隔离 SQLite + fake 上游，不读生产凭据）覆盖：幂等/请求指纹冲突、网络授权门禁与批次耗尽、普通账号/phone/car 越权拒绝、phone 不能提交回执、claim/heartbeat/receipt、过期旧回执 409、revoke（SD 移除）、claim 超时重领、分页 revision 冲突、清单无路径/凭据、owner 隔离、持久化重启。
-- 未验证：车机 SAF `seek/rename` 实测、真机下载、真实音频 URL 请求、生产网络授权签发、部署。
+`POST /items/{item_id}/receipt` 请求：
+
+```json
+{
+  "job_id": "job_example",
+  "version": 2,
+  "lease_token": "48位小写十六进制租约，使用claim返回值",
+  "network_epoch": "epoch_example",
+  "size_bytes": 123456,
+  "sha256": "64位十六进制摘要，使用车机计算值",
+  "openable": true,
+  "card_volume_id": "opaque_volume_id",
+  "format": "mp3"
+}
+```
+
+- 以上摘要/租约说明文字仅示意，实际提交须满足相应格式。`size_bytes>0`，SHA256 必须是完整 64 位十六进制；格式只允许 `mp3/flac/m4a/aac/ogg/wav`。车机负责 MIME/文件头匹配、完整落盘、size/hash 与可打开校验；后端无法直接访问 SD，只信任已绑定车机的结构化回执。
+- receipt、库存及所有同 scope 等待/已保存任务引用在同一事务内更新；被取消/失败/撤销的结果不因别的任务成功而自动复活。逐项只有一个 `saved` 状态，无独立 ready。
+- `saved` 超过 `OFFLINE_RECHECK_SECONDS`（默认 7 天）或缺少核验时间，清单返回 `stale=true`，不能当作当前可信已存。新任务会领取 `work_kind=verify` 并返回原文件 size/hash/card/format，车机必须本地核验，不能直接重下；匹配原文件的有效回执刷新库存和所有 saved 引用。
+- `openable=false` 撤销该曲同账号/Owner/设备/质量的全部任务引用及库存。`FILE_MISSING/HASH_MISMATCH/NOT_OPENABLE` revoke 也如此。撤销会递增版本、清除租约，旧 job/旧回执不能恢复库存。确认需要补文件后，显式新任务才可重新下载。
+- `CARD_REMOVED/CARD_CHANGED` revoke 会提升物理设备 generation，撤销该设备**所有账号/Owner/质量/歌曲的库存及在途/历史引用**，避免切回旧账号恢复已拔出的卡；不同车辆不受影响。换卡后首次下载成功的回执也会在一个事务内作废其他旧卡工作；旧卡上的本地重新核验不能用来宣称换卡成功。
+- 清单返回校验元数据与枚举 error_code，不含文件位置、原始日志、授权 token、Cookie 或上游 URL。
+
+### 12.5 并发、迁移与验证边界
+
+- 所有离线变更在 SQLite `BEGIN IMMEDIATE` 事务内完成：门禁、读取、item 原子 `UPDATE ... WHERE version=...`、跨任务去重、库存、generation、计数/revision 一起提交。分页读取也在同一受保护事务中返回一致的内容和 revision；不同 Session/连接/进程不依赖 Python 内存锁。繁忙时回 `DATABASE_BUSY`，无部分写入；其他数据库当前显式不支持此模块。
+- 每次 item 状态/租约/有效元数据变更都更新关联任务 revision；跨任务库存传播与全设备撤销更新所有受影响任务。revision 是乐观一致性版本；`stale` 还取决于当前时间，不是不可变快照。
+- `run_db_migrations` 在创建新表之外还给旧表补 `skipped/attempts/lease_token/work_kind/device_generation/inventory_version`；首次升级使旧 claimed/saved 失效为 `REVERIFY_REQUIRED` 并暂停旧任务（保留 cancelled），使旧网络确认过期。原基线缺少可验证租约/跨任务库存，不能把旧 saved 自动导成可信库存。重复迁移不再重置新状态。
+- 错误：`NOT_FOUND` 为 404；`NOT_CAR/DEVICE_MISMATCH` 为 403；网络门禁错误为 403；`VERSION_CONFLICT/REVISION_CONFLICT/LEASE_MISMATCH/LEASE_EXPIRED/INVENTORY_CHANGED/RECEIPT_MISMATCH/INCOMPLETE_FAVORITES/FAVORITE_REVISION_CHANGED/JOB_NOT_RUNNING/BAD_STATE` 等为 409；无效字段/额外字段为 422（`INVALID_OFFLINE_REQUEST`，不会回显可能含路径或凭据的原始输入）。
+- fake 验收在 `tests/test_offline.py`、`tests/test_offline_concurrency.py`：明确网络确认与全歌单、身份/账号/设备隔离、暂停取消与过期租约、持久跨任务库存/过期核验/全设备撤销、有界失败重试、真实独立 SQLite 连接竞争及旧表迁移。通过数量以本次运行报告为准，不沿用旧“247 项通过”。
+- 音频继续复用既有授权 `/api/v1/music/netease/stream/{song_id}` 及现有缓存/流协议；本模块不获取音频。车机/iOS 的本地优先、SAF 原子落盘/seek/rename、换网即时停止、真机下载及实际状态展示仍需另行整合与验证。本次不部署、不执行这些操作。

@@ -157,8 +157,51 @@ def run_db_migrations(engine) -> None:
                         conn.execute(text(f"ALTER TABLE car_device_status ADD COLUMN {col_name} {col_def}"))
                         conn.commit()
 
-            logger.info("Database schema migration completed successfully.")
+            logger.info("Core database schema migration completed successfully.")
         except Exception as e:
             logger.error(f"Error during schema migration: {e}", exc_info=True)
 
+    _migrate_offline_schema(engine)
 
+
+def _migrate_offline_schema(engine):
+    """Atomic, fail-closed SQLite upgrade for offline work and historical receipts."""
+    with engine.connect() as conn:
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            # Offline consistency upgrade. create_all alone cannot add columns to
+            # the rejected baseline tables. Only the first upgrade fences old leases
+            # and unverified historical saved entries; repeated runs preserve state.
+            offline_columns = {
+                "offline_jobs": [("skipped", "INTEGER NOT NULL DEFAULT 0")],
+                "offline_items": [
+                    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                    ("lease_token", "VARCHAR(64)"),
+                    ("work_kind", "VARCHAR(16) NOT NULL DEFAULT 'download'"),
+                    ("device_generation", "INTEGER NOT NULL DEFAULT 1"),
+                    ("inventory_version", "INTEGER NOT NULL DEFAULT 0"),
+                ],
+                "offline_tracks": [("status", "VARCHAR(16) NOT NULL DEFAULT 'revoked'")],
+            }
+            upgrading = False
+            for table, additions in offline_columns.items():
+                cols = {r[1] for r in conn.execute(text(f"PRAGMA table_info({table})"))}
+                for name, definition in additions:
+                    if name not in cols:
+                        upgrading = True
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
+            for table in ("offline_jobs", "offline_items", "network_authorizations", "offline_tracks"):
+                conn.execute(text(f"UPDATE {table} SET account_id = '__legacy__' WHERE account_id IS NULL"))
+            if upgrading:
+                conn.execute(text("UPDATE offline_items SET status='revoked', error_code='REVERIFY_REQUIRED', "
+                                  "version=version+1, claim_deadline=NULL, lease_token=NULL, last_verified_at=NULL "
+                                  "WHERE status IN ('claimed', 'saved')"))
+                conn.execute(text("UPDATE offline_jobs SET state=CASE WHEN state='cancelled' THEN state ELSE 'paused' END, "
+                                  "revision=revision+1, done=0, failed=(SELECT count(*) FROM offline_items "
+                                  "WHERE offline_items.job_id=offline_jobs.job_id AND status IN ('failed','revoked'))"))
+                conn.execute(text("UPDATE offline_tracks SET status='revoked', last_verified_at=NULL, version=version+1"))
+                conn.execute(text("UPDATE network_authorizations SET batch_remaining=0, expires_at=CURRENT_TIMESTAMP"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise

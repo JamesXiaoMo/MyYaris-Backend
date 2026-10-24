@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Offline SD download (V3.0)
     OFFLINE_CLAIM_TIMEOUT_MINUTES: int = 30
     OFFLINE_RECHECK_SECONDS: int = 7 * 24 * 3600  # saved items older than this surface stale=true (need re-verify)
+    OFFLINE_MAX_CLAIM_ATTEMPTS: int = 3  # a claimed item that repeatedly times out becomes failed
 
     # Owner favorite playlist metadata catalog (bounded, persistent, white-listed metadata only)
     NETEASE_FAV_CHECK_TTL_SECONDS: float = 60.0  # no upstream call at all inside this window

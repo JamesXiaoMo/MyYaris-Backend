@@ -1,450 +1,523 @@
-"""Offline SD download service: jobs, items, trusted car receipts, revocation.
+"""SD work bookkeeping only; never fetches audio or touches the vehicle filesystem.
 
-Frozen minimal contract (business rules):
-- A single unified "saved" state is used (no separate "ready").
-- Receipt/heartbeat/revoke are accepted only from the bound vehicle device (role=car)
-  whose canonical device_id matches the item; enforced at the API layer.
-- Per-item ``version`` is optimistic concurrency: every mutation bumps it and any
-  call carrying a stale version is rejected (VERSION_CONFLICT).
-- Job idempotency is (owner_key, idempotency_key) + request fingerprint; a replay
-  of the same request returns the same job, a different fingerprint conflicts.
-- Network authorization is bound to (device_id, network_epoch), time-limited and
-  per-batch. The server never infers "unlimited" from an SSID; the car reports the
-  epoch and performs the actual network judgement.
-- No absolute path / SAF URI / credential is ever stored or returned.
+SQLite BEGIN IMMEDIATE serializes the complete gate/read/CAS/inventory/counter
+transaction across independent Sessions/processes. Item versions and opaque leases
+fence late workers; durable inventory tombstones and physical card generations
+fence old jobs. API authentication supplies the verified Owner and bound device.
 """
 import hashlib
 import json
+import re
 import secrets
 from datetime import timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from functools import wraps
 
+from sqlalchemy import update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.repositories.models import (
-    NetworkAuthorization,
-    OfflineItem,
-    OfflineJob,
-    utc_now,
-)
+from app.repositories.models import NetworkAuthorization, OfflineDevice, OfflineItem, OfflineJob, OfflineTrack, utc_now
 
-# Item status (single unified saved state)
-PENDING = "pending"
-CLAIMED = "claimed"
-SAVED = "saved"
-FAILED = "failed"
-REVOKED = "revoked"
-
-# Job states
-RUNNING = "running"
-PAUSED = "paused"
-DONE = "done"
-CANCELLED = "cancelled"
+PENDING, CLAIMED, SAVED, FAILED, REVOKED = "pending", "claimed", "saved", "failed", "revoked"
+RUNNING, PAUSED, DONE, CANCELLED = "running", "paused", "done", "cancelled"
+LEGACY_ACCOUNT = "__legacy__"
+ERROR_CODES = {"SOURCE_UNAVAILABLE", "DOWNLOAD_FAILED", "NETWORK_LOST", "STORAGE_FULL", "HASH_MISMATCH", "NOT_OPENABLE", "FILE_MISSING"}
+REASONS = {"CARD_REMOVED", "CARD_CHANGED", "FILE_MISSING", "NOT_OPENABLE", "HASH_MISMATCH"}
 
 
 class OfflineConflict(Exception):
-    def __init__(self, code: str, message: str):
-        self.code = code
-        self.message = message
+    def __init__(self, code, message):
+        self.code, self.message = code, message
         super().__init__(f"{code}: {message}")
 
 
-def _new_id(prefix: str) -> str:
+def _new_id(prefix):
     return f"{prefix}_{secrets.token_hex(12)}"
 
 
-def _sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def _sha256_hex(value):
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def _now():
     return utc_now()
 
 
-def _is_expired(dt) -> bool:
-    """Time-zone safe expiry check (SQLite returns offset-naive datetimes)."""
-    if dt is None:
-        return False
-    now = _now()
-    if dt.tzinfo is None:
-        return dt < now.replace(tzinfo=None)
-    return dt < now
+def _aware(dt):
+    return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
 
 
-def _age_seconds(dt) -> float:
-    if dt is None:
-        return 0.0
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (_now() - dt).total_seconds()
+def _is_expired(dt):
+    return dt is None or _aware(dt) <= _now()
 
 
-# ---------------------------------------------------------------------------
-# Network authorization (device + network epoch, time-limited, per-batch)
-# ---------------------------------------------------------------------------
+def _stale(row):
+    return row.last_verified_at is None or (_now() - _aware(row.last_verified_at)).total_seconds() >= settings.OFFLINE_RECHECK_SECONDS
 
-def issue_network_authorization(
-    db: Session,
-    *,
-    owner_key: str,
-    account_id: Optional[str],
-    device_id: str,
-    network_epoch: str,
-    batch_total: int,
-    expires_in_minutes: int,
-) -> Tuple[NetworkAuthorization, str]:
-    """Creates or refreshes an authorization. Returns (record, plaintext token)."""
+
+def account_scope(account_id):
+    return account_id or LEGACY_ACCOUNT
+
+
+def _transaction(fn):
+    @wraps(fn)
+    def wrapped(db: Session, *args, **kwargs):
+        # Authentication and object lookup may have opened a read transaction. There
+        # must be no caller-owned writes to discard; this service owns its unit of work.
+        if db.new or db.dirty or db.deleted:
+            raise OfflineConflict("TRANSACTION_DIRTY", "offline operation requires a clean session")
+        db.rollback()
+        db.expire_all()
+        previous_expiration = db.expire_on_commit
+        db.expire_on_commit = False
+        try:
+            if db.bind.dialect.name != "sqlite":
+                raise OfflineConflict("UNSUPPORTED_DATABASE", "offline work requires SQLite transaction locking")
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            result = fn(db, *args, **kwargs)
+            db.commit()
+            return result
+        except OperationalError:
+            db.rollback()
+            raise OfflineConflict("DATABASE_BUSY", "offline transaction unavailable; retry explicitly") from None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.expire_on_commit = previous_expiration
+    return wrapped
+
+
+def _device(db, device_id):
+    row = db.get(OfflineDevice, device_id)
+    if row is None:
+        row = OfflineDevice(device_id=device_id, generation=1)
+        db.add(row)
+        db.flush()
+    return row
+
+
+def _scope(row):
+    return (OfflineTrack.owner_key == row.owner_key, OfflineTrack.account_id == row.account_id,
+            OfflineTrack.device_id == row.device_id, OfflineTrack.song_id == row.song_id, OfflineTrack.quality == row.quality)
+
+
+def _track(db, row):
+    return db.query(OfflineTrack).filter(*_scope(row)).first()
+
+
+def _track_items(db, row):
+    return db.query(OfflineItem).filter(OfflineItem.owner_key == row.owner_key, OfflineItem.account_id == row.account_id,
+        OfflineItem.device_id == row.device_id, OfflineItem.song_id == row.song_id, OfflineItem.quality == row.quality)
+
+
+def _network(db, *, owner_key, account_id, device_id, network_epoch, token_hash=None):
+    na = db.query(NetworkAuthorization).filter_by(device_id=device_id, network_epoch=network_epoch).first()
+    if na is None:
+        raise OfflineConflict("NETWORK_NOT_AUTHORIZED", "network confirmation required")
+    if na.owner_key != owner_key or na.account_id != account_scope(account_id):
+        raise OfflineConflict("NETWORK_OWNER_MISMATCH", "network confirmation scope changed")
+    if token_hash is not None and not secrets.compare_digest(token_hash, na.token_hash):
+        raise OfflineConflict("NETWORK_TOKEN_MISMATCH", "network confirmation changed")
+    if _is_expired(na.expires_at):
+        raise OfflineConflict("NETWORK_AUTH_EXPIRED", "network confirmation expired")
+    return na
+
+
+@_transaction
+def issue_network_authorization(db, *, owner_key, account_id, device_id, network_epoch, batch_total, expires_in_minutes):
+    if not 1 <= batch_total <= 1000 or not 1 <= expires_in_minutes <= 10080:
+        raise OfflineConflict("BAD_CONFIRMATION", "invalid authorization bounds")
     token = secrets.token_urlsafe(32)
-    token_hash = _sha256_hex(token)
-    now = _now()
-    existing = (
-        db.query(NetworkAuthorization)
-        .filter(
-            NetworkAuthorization.device_id == device_id,
-            NetworkAuthorization.network_epoch == network_epoch,
-        )
-        .first()
-    )
-    if existing is not None:
-        existing.owner_key = owner_key
-        existing.account_id = account_id
-        existing.token_hash = token_hash
-        existing.batch_total = batch_total
-        existing.batch_remaining = batch_total
-        existing.expires_at = now + timedelta(minutes=expires_in_minutes)
-        existing.updated_at = now
-        na = existing
-    else:
-        na = NetworkAuthorization(
-            id=_new_id("netauth"),
-            owner_key=owner_key,
-            account_id=account_id,
-            device_id=device_id,
-            network_epoch=network_epoch,
-            token_hash=token_hash,
-            batch_total=batch_total,
-            batch_remaining=batch_total,
-            expires_at=now + timedelta(minutes=expires_in_minutes),
-        )
+    na = db.query(NetworkAuthorization).filter_by(device_id=device_id, network_epoch=network_epoch).first()
+    if na is None:
+        na = NetworkAuthorization(id=_new_id("netauth"), device_id=device_id, network_epoch=network_epoch)
         db.add(na)
-    db.commit()
-    db.refresh(na)
+    na.owner_key, na.account_id = owner_key, account_scope(account_id)
+    na.token_hash, na.batch_total, na.batch_remaining = _sha256_hex(token), batch_total, batch_total
+    na.expires_at = _now() + timedelta(minutes=expires_in_minutes)
+    db.flush()
     return na, token
 
 
-def _consume_network_batch(
-    db: Session,
-    *,
-    device_id: str,
-    network_epoch: str,
-    wifi_confirm_token: str,
-) -> None:
-    na = (
-        db.query(NetworkAuthorization)
-        .filter(
-            NetworkAuthorization.device_id == device_id,
-            NetworkAuthorization.network_epoch == network_epoch,
-        )
-        .first()
-    )
-    if na is None:
-        raise OfflineConflict("NETWORK_NOT_AUTHORIZED", "network epoch not authorized for this device")
-    if not secrets.compare_digest(_sha256_hex(wifi_confirm_token), na.token_hash):
-        raise OfflineConflict("NETWORK_TOKEN_MISMATCH", "wifi confirmation token mismatch")
-    if _is_expired(na.expires_at):
-        raise OfflineConflict("NETWORK_AUTH_EXPIRED", "network authorization expired")
-    if na.batch_remaining <= 0:
-        raise OfflineConflict("NETWORK_BATCH_EXHAUSTED", "network authorization batch exhausted")
-    na.batch_remaining -= 1
-
-
-# ---------------------------------------------------------------------------
-# Jobs
-# ---------------------------------------------------------------------------
-
-def _job_fingerprint(song_ids: List[int], quality: str, device_id: str, network_epoch: str) -> str:
-    payload = {
-        "song_ids": sorted(int(s) for s in song_ids),
-        "quality": quality,
-        "device_id": device_id,
-        "network_epoch": network_epoch,
-    }
-    return _sha256_hex(json.dumps(payload, sort_keys=True))
-
-
-def create_job(
-    db: Session,
-    *,
-    owner_key: str,
-    account_id: Optional[str],
-    device_id: str,
-    idempotency_key: str,
-    song_ids: List[int],
-    quality: str,
-    network_epoch: str,
-    wifi_confirm_token: str,
-) -> Tuple[OfflineJob, bool]:
-    """Returns (job, created). Idempotent on (owner_key, idempotency_key)."""
-    fingerprint = _job_fingerprint(song_ids, quality, device_id, network_epoch)
-
-    existing = (
-        db.query(OfflineJob)
-        .filter(OfflineJob.owner_key == owner_key, OfflineJob.idempotency_key == idempotency_key)
-        .first()
-    )
-    if existing is not None:
-        if existing.request_fingerprint != fingerprint:
-            raise OfflineConflict("IDEMPOTENCY_CONFLICT", "same idempotency_key with a different request")
-        return existing, False
-
-    # Consume one network batch only when actually creating a new job.
-    _consume_network_batch(
-        db, device_id=device_id, network_epoch=network_epoch, wifi_confirm_token=wifi_confirm_token
-    )
-
-    job = OfflineJob(
-        job_id=_new_id("job"),
-        owner_key=owner_key,
-        account_id=account_id,
-        device_id=device_id,
-        idempotency_key=idempotency_key,
-        request_fingerprint=fingerprint,
-        state=RUNNING,
-        quality=quality,
-        total=len(song_ids),
-        done=0,
-        failed=0,
-        revision=1,
-        network_epoch=network_epoch,
-        wifi_confirm_token_hash=_sha256_hex(wifi_confirm_token),
-    )
+@_transaction
+def create_job(db, *, owner_key, account_id, device_id, idempotency_key, song_ids, quality, network_epoch, wifi_confirm_token):
+    account_id = account_scope(account_id)
+    # Canonical full membership, never truncate or count duplicate song IDs twice.
+    song_ids = sorted(set(song_ids))
+    if not song_ids or any(type(s) is not int or s <= 0 for s in song_ids):
+        raise OfflineConflict("BAD_SONG_IDS", "positive song identifiers required")
+    fingerprint = _sha256_hex(json.dumps([song_ids, quality, device_id, network_epoch, account_id]))
+    scoped_key = _sha256_hex(json.dumps([account_id, idempotency_key]))
+    job = db.query(OfflineJob).filter_by(owner_key=owner_key, idempotency_key=scoped_key).first()
+    if job:
+        if job.request_fingerprint != fingerprint:
+            raise OfflineConflict("IDEMPOTENCY_CONFLICT", "same key with different request")
+        return job, False
+    na = _network(db, owner_key=owner_key, account_id=account_id, device_id=device_id,
+                  network_epoch=network_epoch, token_hash=_sha256_hex(wifi_confirm_token))
+    res = db.execute(update(NetworkAuthorization).where(NetworkAuthorization.id == na.id,
+        NetworkAuthorization.batch_remaining > 0).values(batch_remaining=NetworkAuthorization.batch_remaining - 1))
+    if res.rowcount != 1:
+        raise OfflineConflict("NETWORK_BATCH_EXHAUSTED", "network confirmation batch exhausted")
+    device = _device(db, device_id)
+    job = OfflineJob(job_id=_new_id("job"), owner_key=owner_key, account_id=account_id, device_id=device_id,
+        idempotency_key=scoped_key, request_fingerprint=fingerprint, state=RUNNING, quality=quality,
+        total=len(song_ids), done=0, failed=0, skipped=0, revision=1, network_epoch=network_epoch,
+        wifi_confirm_token_hash=na.token_hash)
     db.add(job)
     for sid in song_ids:
-        db.add(
-            OfflineItem(
-                item_id=_new_id("itm"),
-                job_id=job.job_id,
-                owner_key=owner_key,
-                account_id=account_id,
-                device_id=device_id,
-                song_id=int(sid),
-                quality=quality,
-                status=PENDING,
-                version=1,
-            )
-        )
-    db.commit()
-    db.refresh(job)
+        item = OfflineItem(item_id=_new_id("itm"), job_id=job.job_id, owner_key=owner_key, account_id=account_id,
+            device_id=device_id, song_id=sid, quality=quality, status=PENDING, version=1, attempts=0,
+            device_generation=device.generation, inventory_version=0, work_kind="download")
+        track = _track(db, item)
+        if track:
+            item.inventory_version = track.version
+            if track.status == SAVED and track.card_volume_id == device.card_volume_id:
+                _copy_saved(item, track)
+                if _stale(track):
+                    item.status = PENDING
+        db.add(item)
+    _touch_job(db, job.job_id)
     return job, True
 
 
-def get_job(db: Session, job_id: str, *, owner_key: str) -> OfflineJob:
-    job = db.query(OfflineJob).filter(OfflineJob.job_id == job_id, OfflineJob.owner_key == owner_key).first()
+def get_job(db, job_id, *, owner_key, account_id=None, device_id=None, car=False):
+    q = db.query(OfflineJob).populate_existing().filter_by(job_id=job_id, owner_key=owner_key)
+    q = q.filter_by(device_id=device_id) if car else q.filter_by(account_id=account_scope(account_id))
+    job = q.first()
     if job is None:
         raise OfflineConflict("NOT_FOUND", "job not found")
     return job
 
 
-def list_jobs(db: Session, *, owner_key: str, device_id: Optional[str] = None) -> List[OfflineJob]:
-    q = db.query(OfflineJob).filter(OfflineJob.owner_key == owner_key)
+def list_jobs(db, *, owner_key, account_id=None, device_id=None):
+    q = db.query(OfflineJob).populate_existing().filter_by(owner_key=owner_key, account_id=account_scope(account_id))
     if device_id:
-        q = q.filter(OfflineJob.device_id == device_id)
+        q = q.filter_by(device_id=device_id)
     return q.order_by(OfflineJob.created_at.desc()).all()
 
 
-def set_job_state(db: Session, job: OfflineJob, state: str) -> OfflineJob:
-    if state not in (PAUSED, RUNNING, CANCELLED):
-        raise OfflineConflict("BAD_STATE", "invalid job state transition")
-    job.state = state
-    db.commit()
-    db.refresh(job)
-    return job
-
-
-def _touch_job(db: Session, job_id: str) -> None:
-    db.flush()  # autoflush is disabled; persist pending item mutations before recounting
-    job = db.query(OfflineJob).filter(OfflineJob.job_id == job_id).first()
-    if job is None:
-        return
-    items = db.query(OfflineItem).filter(OfflineItem.job_id == job_id).all()
-    job.done = sum(1 for i in items if i.status == SAVED)
-    job.failed = sum(1 for i in items if i.status in (FAILED, REVOKED))
-    job.revision += 1
-    if job.state not in (PAUSED, CANCELLED):
-        job.state = DONE if not any(i.status in (PENDING, CLAIMED) for i in items) else RUNNING
-
-
-# ---------------------------------------------------------------------------
-# Items
-# ---------------------------------------------------------------------------
-
-def get_item(db: Session, item_id: str, *, device_id: str) -> OfflineItem:
-    item = db.query(OfflineItem).filter(OfflineItem.item_id == item_id, OfflineItem.device_id == device_id).first()
+def get_item(db, item_id, *, device_id, owner_key):
+    item = db.query(OfflineItem).populate_existing().filter_by(item_id=item_id, device_id=device_id, owner_key=owner_key).first()
     if item is None:
         raise OfflineConflict("NOT_FOUND", "item not found")
     return item
 
 
-def list_items(
-    db: Session,
-    *,
-    job: OfflineJob,
-    offset: int,
-    limit: int,
-    revision: Optional[int] = None,
-) -> Tuple[List[OfflineItem], int, bool]:
-    """Optimistic consistency: pin ``revision`` and re-read; 409 on any change."""
-    if revision is not None and revision != job.revision:
-        raise OfflineConflict("REVISION_CONFLICT", "job changed; re-read items from page 1")
-
-    total = db.query(OfflineItem).filter(OfflineItem.job_id == job.job_id).count()
-    items = (
-        db.query(OfflineItem)
-        .filter(OfflineItem.job_id == job.job_id)
-        .order_by(OfflineItem.created_at.asc(), OfflineItem.item_id.asc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    has_more = offset + len(items) < total
-    return items, total, has_more
+def _touch_job(db, job_id):
+    db.flush()
+    job = db.get(OfflineJob, job_id)
+    items = db.query(OfflineItem).filter_by(job_id=job_id).all()
+    job.done = sum(i.status == SAVED for i in items)
+    job.failed = sum(i.status in (FAILED, REVOKED) for i in items)
+    job.skipped = sum(i.status == SAVED and i.attempts == 0 for i in items)
+    job.revision += 1
+    job.updated_at = _now()
+    if job.state not in (PAUSED, CANCELLED):
+        job.state = RUNNING if any(i.status in (PENDING, CLAIMED) for i in items) else DONE
+    db.flush()
 
 
-def claim_batch(
-    db: Session,
-    *,
-    device_id: str,
-    job_id: Optional[str],
-    limit: int,
-    network_epoch: Optional[str],
-) -> List[OfflineItem]:
-    now = _now()
+def _invalidate_claim(item):
+    item.status = PENDING
+    item.version += 1
+    item.claim_deadline = item.lease_token = None
 
-    # Reclaim stale claims whose claim_deadline passed without heartbeat.
-    expired = db.query(OfflineItem).filter(OfflineItem.status == CLAIMED, OfflineItem.claim_deadline < now).all()
-    expired_job_ids = {it.job_id for it in expired}
-    for it in expired:
-        it.status = PENDING
-        it.claim_deadline = None
-        it.version += 1
-    if expired:
-        db.flush()  # autoflush is disabled; make reclaimed items visible to the pending query
 
-    q = (
-        db.query(OfflineItem)
-        .join(OfflineJob, OfflineItem.job_id == OfflineJob.job_id)
-        .filter(OfflineItem.device_id == device_id, OfflineItem.status == PENDING)
-    )
-    if job_id:
-        q = q.filter(OfflineItem.job_id == job_id)
-    if network_epoch is not None:
-        q = q.filter(OfflineJob.network_epoch == network_epoch)
+def _pause(db, job):
+    job.state = PAUSED
+    for item in db.query(OfflineItem).filter_by(job_id=job.job_id, status=CLAIMED).all():
+        _invalidate_claim(item)
+    _touch_job(db, job.job_id)
 
-    items = q.order_by(OfflineItem.created_at.asc(), OfflineItem.item_id.asc()).limit(limit).all()
 
-    deadline = now + timedelta(minutes=settings.OFFLINE_CLAIM_TIMEOUT_MINUTES)
-    touched = set(expired_job_ids)
-    claimed: List[OfflineItem] = []
-    for it in items:
-        it.status = CLAIMED
-        it.claim_deadline = deadline
-        it.version += 1
-        claimed.append(it)
-        touched.add(it.job_id)
+def _gate(db, job, network_epoch):
+    if job.state != RUNNING:
+        raise OfflineConflict("JOB_NOT_RUNNING", "job requires explicit resume or new job")
+    try:
+        if not network_epoch or network_epoch != job.network_epoch:
+            raise OfflineConflict("NETWORK_EPOCH_MISMATCH", "network changed; explicit confirmation and resume required")
+        return _network(db, owner_key=job.owner_key, account_id=job.account_id, device_id=job.device_id,
+                        network_epoch=network_epoch, token_hash=job.wifi_confirm_token_hash)
+    except OfflineConflict:
+        # This intentional committed denial must survive the HTTP error rollback.
+        _pause(db, job)
+        db.commit()
+        raise
 
-    for jid in touched:
+
+@_transaction
+def set_job_state(db, job, state, *, revision, network_epoch=None, wifi_confirm_token=None):
+    if job.revision != revision:
+        raise OfflineConflict("REVISION_CONFLICT", "stale job revision")
+    transitions = {RUNNING: {PAUSED, CANCELLED}, PAUSED: {RUNNING, CANCELLED}, DONE: set(), CANCELLED: set()}
+    if state not in transitions.get(job.state, set()):
+        raise OfflineConflict("BAD_STATE", "invalid job transition")
+    if state == RUNNING:
+        na = _network(db, owner_key=job.owner_key, account_id=job.account_id, device_id=job.device_id,
+            network_epoch=network_epoch, token_hash=_sha256_hex(wifi_confirm_token or ""))
+        # Explicit new confirmation may replace an expired or changed-network grant.
+        if na.token_hash != job.wifi_confirm_token_hash or network_epoch != job.network_epoch:
+            if na.batch_remaining <= 0:
+                raise OfflineConflict("NETWORK_BATCH_EXHAUSTED", "network confirmation batch exhausted")
+            na.batch_remaining -= 1
+        job.network_epoch, job.wifi_confirm_token_hash = network_epoch, na.token_hash
+        job.state = RUNNING
+        _touch_job(db, job.job_id)
+    else:
+        _pause(db, job)
+        job.state = state
+    return job
+
+
+@_transaction
+def list_items(db, *, job, offset, limit, revision=None):
+    if revision is not None and job.revision != revision:
+        raise OfflineConflict("REVISION_CONFLICT", "job changed; reread page one")
+    q = db.query(OfflineItem).filter_by(job_id=job.job_id)
+    total = q.count()
+    items = q.order_by(OfflineItem.created_at, OfflineItem.item_id).offset(offset).limit(limit).all()
+    return items, total, offset + len(items) < total
+
+
+def _copy_saved(item, track):
+    item.status, item.work_kind = SAVED, "verify"
+    for key in ("size_bytes", "sha256", "card_volume_id", "format", "last_verified_at"):
+        setattr(item, key, getattr(track, key))
+    item.inventory_version = track.version
+    item.claim_deadline = item.lease_token = None
+    item.error_code = item.error_detail = None
+
+
+def _expire_claims(db, device_id):
+    jobs = set()
+    for item in db.query(OfflineItem).filter(OfflineItem.device_id == device_id,
+            OfflineItem.status == CLAIMED, OfflineItem.claim_deadline <= _now()).all():
+        _invalidate_claim(item)
+        if item.attempts >= settings.OFFLINE_MAX_CLAIM_ATTEMPTS:
+            item.status, item.error_code = FAILED, "CLAIM_LIMIT_EXCEEDED"
+        jobs.add(item.job_id)
+    for jid in jobs:
         _touch_job(db, jid)
-    db.commit()
+
+
+@_transaction
+def claim_batch(db, *, owner_key, device_id, job_id, limit, network_epoch):
+    job = get_job(db, job_id, owner_key=owner_key, device_id=device_id, car=True)
+    na = _gate(db, job, network_epoch)
+    _expire_claims(db, device_id)
+    device = _device(db, device_id)
+    items = db.query(OfflineItem).filter_by(job_id=job_id, status=PENDING).order_by(OfflineItem.created_at, OfflineItem.item_id).all()
+    claimed = []
+    changed = False
+    for item in items:
+        track = _track(db, item)
+        if track and track.status == SAVED and track.card_volume_id == device.card_volume_id and not _stale(track):
+            _copy_saved(item, track)
+            item.version += 1
+            changed = True
+            continue
+        active = _track_items(db, item).filter(OfflineItem.status == CLAIMED).first()
+        if active:
+            continue
+        if item.attempts >= settings.OFFLINE_MAX_CLAIM_ATTEMPTS:
+            item.status, item.error_code = FAILED, "CLAIM_LIMIT_EXCEEDED"
+            item.version += 1
+            changed = True
+            continue
+        if len(claimed) >= limit:
+            continue
+        if track and track.status == SAVED:
+            for key in ("size_bytes", "sha256", "card_volume_id", "format", "last_verified_at"):
+                setattr(item, key, getattr(track, key))
+            db.flush()
+        version = item.version
+        lease = secrets.token_hex(24)
+        kind = "verify" if track and track.status == SAVED else "download"
+        deadline = min(_aware(na.expires_at), _now() + timedelta(minutes=settings.OFFLINE_CLAIM_TIMEOUT_MINUTES))
+        res = db.execute(update(OfflineItem).where(OfflineItem.item_id == item.item_id,
+            OfflineItem.version == version, OfflineItem.status == PENDING).values(status=CLAIMED,
+            version=version + 1, attempts=OfflineItem.attempts + 1, lease_token=lease, claim_deadline=deadline,
+            inventory_version=track.version if track else 0, device_generation=device.generation,
+            work_kind=kind, error_code=None, error_detail=None).execution_options(synchronize_session=False))
+        if res.rowcount != 1:
+            raise OfflineConflict("VERSION_CONFLICT", "item changed during claim")
+        db.refresh(item)
+        claimed.append(item)
+        changed = True
+    if changed:
+        _touch_job(db, job_id)
     return claimed
 
 
-def heartbeat(db: Session, item: OfflineItem, *, version: int) -> OfflineItem:
+def _cas(db, item, version, **values):
+    result = db.execute(update(OfflineItem).where(OfflineItem.item_id == item.item_id,
+        OfflineItem.version == version).values(version=version + 1, **values).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        raise OfflineConflict("VERSION_CONFLICT", "stale item version")
+    db.refresh(item)
+
+
+def _check_version(item, version):
     if item.version != version:
         raise OfflineConflict("VERSION_CONFLICT", "stale item version")
+
+
+def _lease(db, item, *, version, lease_token, network_epoch):
+    _check_version(item, version)
     if item.status != CLAIMED:
-        raise OfflineConflict("NOT_CLAIMED", "item is not claimed")
-    item.claim_deadline = _now() + timedelta(minutes=settings.OFFLINE_CLAIM_TIMEOUT_MINUTES)
-    db.commit()
-    db.refresh(item)
+        raise OfflineConflict("NOT_CLAIMED", "active claim required")
+    job = db.get(OfflineJob, item.job_id)
+    na = _gate(db, job, network_epoch)
+    if not lease_token or not secrets.compare_digest(item.lease_token or "", lease_token):
+        raise OfflineConflict("LEASE_MISMATCH", "claim lease mismatch")
+    if _is_expired(item.claim_deadline):
+        raise OfflineConflict("LEASE_EXPIRED", "claim lease expired")
+    device = _device(db, item.device_id)
+    track = _track(db, item)
+    if item.device_generation != device.generation or item.inventory_version != (track.version if track else 0):
+        raise OfflineConflict("INVENTORY_CHANGED", "card or inventory changed; claim again")
+    return na
+
+
+@_transaction
+def heartbeat(db, item, *, version, lease_token, network_epoch):
+    na = _lease(db, item, version=version, lease_token=lease_token, network_epoch=network_epoch)
+    deadline = min(_aware(na.expires_at), _now() + timedelta(minutes=settings.OFFLINE_CLAIM_TIMEOUT_MINUTES))
+    _cas(db, item, version, claim_deadline=deadline, updated_at=_now())
+    _touch_job(db, item.job_id)
     return item
 
 
-def submit_receipt(
-    db: Session,
-    item: OfflineItem,
-    *,
-    version: int,
-    size_bytes: int,
-    sha256: str,
-    openable: bool,
-    card_volume_id: str,
-    format: Optional[str],
-) -> OfflineItem:
-    if item.version != version:
-        raise OfflineConflict("VERSION_CONFLICT", "stale item version")
-    if item.status not in (CLAIMED, SAVED):
-        raise OfflineConflict("BAD_STATE", "item is not in a claimable state")
-
-    now = _now()
-    if not openable:
-        item.status = FAILED
-        item.error_code = "NOT_OPENABLE"
-        item.error_detail = "car reported file is not openable"
-        item.claim_deadline = None
+def _invalidate_inventory(db, *, device_id, reason, target=None, exclude=None):
+    tracks = db.query(OfflineTrack).filter_by(device_id=device_id)
+    items = db.query(OfflineItem).filter_by(device_id=device_id)
+    if target is not None:
+        tracks = tracks.filter(*_scope(target))
+        items = _track_items(db, target)
+    for track in tracks.all():
+        track.status, track.last_verified_at = REVOKED, None
+        track.version += 1
+    jobs = set()
+    for item in items.all():
+        if item.item_id == exclude:
+            continue
+        # Failed and revoked entries also lose their token/version; no late job can resurrect.
+        item.status, item.error_code, item.error_detail = REVOKED, reason, None
+        item.last_verified_at = item.claim_deadline = item.lease_token = None
         item.version += 1
+        jobs.add(item.job_id)
+    for jid in jobs:
+        _touch_job(db, jid)
+
+
+def _save_track(db, item):
+    track = _track(db, item)
+    if track is None:
+        track = OfflineTrack(id=_new_id("trk"), owner_key=item.owner_key, account_id=item.account_id,
+            device_id=item.device_id, song_id=item.song_id, quality=item.quality, version=0)
+        db.add(track)
+    track.status = SAVED
+    track.version += 1
+    for key in ("size_bytes", "sha256", "card_volume_id", "format", "last_verified_at"):
+        setattr(track, key, getattr(item, key))
+    db.flush()
+    jobs = {item.job_id}
+    for other in _track_items(db, item).all():
+        # Only waiting/saved entries can inherit this fresh authoritative receipt.
+        # Cancelled/failed/revoked jobs retain their explicit outcome.
+        if other.item_id != item.item_id and db.get(OfflineJob, other.job_id).state == CANCELLED:
+            continue
+        if other.status in (PENDING, SAVED) or other.item_id == item.item_id:
+            _copy_saved(other, track)
+            if other.item_id != item.item_id:
+                other.version += 1
+            jobs.add(other.job_id)
+    for jid in jobs:
+        _touch_job(db, jid)
+
+
+@_transaction
+def submit_receipt(db, item, *, version, size_bytes, sha256, openable, card_volume_id, format=None,
+                   lease_token=None, network_epoch=None):
+    _check_version(item, version)
+    sha256 = sha256.lower()
+    device = _device(db, item.device_id)
+    if item.status == SAVED:
+        # Offline local re-verification is allowed for the exact existing file/card,
+        # including a completed/paused job; it grants no download permission.
+        track = _track(db, item)
+        if not track or track.status != SAVED or item.device_generation != device.generation or item.inventory_version != track.version:
+            raise OfflineConflict("INVENTORY_CHANGED", "inventory changed")
+        if (card_volume_id, sha256, size_bytes, format) != (track.card_volume_id, track.sha256, track.size_bytes, track.format):
+            raise OfflineConflict("RECEIPT_MISMATCH", "reverification must describe the existing file")
     else:
-        item.status = SAVED
-        item.size_bytes = size_bytes
-        item.sha256 = sha256
-        item.card_volume_id = card_volume_id
-        item.format = format
-        item.error_code = None
-        item.error_detail = None
-        item.last_receipt_at = now
-        item.last_verified_at = now
-        item.claim_deadline = None
-        item.version += 1
-
-    _touch_job(db, item.job_id)
-    db.commit()
-    db.refresh(item)
+        _lease(db, item, version=version, lease_token=lease_token, network_epoch=network_epoch)
+        if item.work_kind == "verify":
+            track = _track(db, item)
+            if (card_volume_id, sha256, size_bytes, format) != (track.card_volume_id, track.sha256, track.size_bytes, track.format):
+                raise OfflineConflict("RECEIPT_MISMATCH", "verification must describe the existing file")
+    if not openable:
+        _invalidate_inventory(db, device_id=item.device_id, reason="NOT_OPENABLE", target=item)
+        return item
+    if size_bytes <= 0 or not re.fullmatch(r"[a-fA-F0-9]{64}", sha256) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", card_volume_id) or format not in {"mp3", "flac", "m4a", "aac", "ogg", "wav"}:
+        raise OfflineConflict("BAD_RECEIPT", "complete file verification required")
+    if device.card_volume_id and device.card_volume_id != card_volume_id:
+        # First receipt for a replacement card fences all other old work atomically.
+        _invalidate_inventory(db, device_id=item.device_id, reason="CARD_CHANGED", exclude=item.item_id)
+        device.generation += 1
+    device.card_volume_id = card_volume_id
+    _cas(db, item, version, status=SAVED, size_bytes=size_bytes, sha256=sha256.lower(), card_volume_id=card_volume_id,
+         format=format, error_code=None, error_detail=None, claim_deadline=None, lease_token=None,
+         last_receipt_at=_now(), last_verified_at=_now(), device_generation=device.generation, updated_at=_now())
+    _save_track(db, item)
     return item
 
 
-def revoke_item(db: Session, item: OfflineItem, *, version: int, reason: str) -> OfflineItem:
-    if item.version != version:
-        raise OfflineConflict("VERSION_CONFLICT", "stale item version")
-    if item.status != SAVED:
-        raise OfflineConflict("BAD_STATE", "only a saved item can be revoked")
-
-    item.status = REVOKED
-    item.error_code = "CARD_REMOVED" if reason == "CARD_REMOVED" else "REVOKED"
-    item.error_detail = reason
-    item.last_verified_at = None
-    item.version += 1
-
-    _touch_job(db, item.job_id)
-    db.commit()
-    db.refresh(item)
+@_transaction
+def revoke_item(db, item, *, version, reason):
+    _check_version(item, version)
+    if reason not in REASONS:
+        raise OfflineConflict("BAD_REASON", "unsupported revocation reason")
+    device = _device(db, item.device_id)
+    if reason in {"CARD_REMOVED", "CARD_CHANGED"}:
+        device.generation += 1
+        device.card_volume_id = None
+        _invalidate_inventory(db, device_id=item.device_id, reason=reason)
+    else:
+        _invalidate_inventory(db, device_id=item.device_id, reason=reason, target=item)
     return item
 
 
-def item_payload(item: OfflineItem) -> Dict[str, Any]:
-    stale = False
-    if item.status == SAVED and item.last_verified_at is not None:
-        stale = _age_seconds(item.last_verified_at) > settings.OFFLINE_RECHECK_SECONDS
-    return {
-        "item_id": item.item_id,
-        "song_id": item.song_id,
-        "quality": item.quality,
-        "status": item.status,
-        "version": item.version,
-        "format": item.format,
-        "size_bytes": item.size_bytes,
-        "sha256": item.sha256,
-        "card_volume_id": item.card_volume_id,
-        "error_code": item.error_code,
-        "stale": stale,
-        "last_verified_at": item.last_verified_at.isoformat() if item.last_verified_at else None,
+@_transaction
+def fail_item(db, item, *, version, lease_token, network_epoch, error_code, error_detail=None):
+    _lease(db, item, version=version, lease_token=lease_token, network_epoch=network_epoch)
+    if error_code not in ERROR_CODES:
+        raise OfflineConflict("BAD_ERROR_CODE", "unsupported failure code")
+    if item.work_kind == "verify" and error_code in {"FILE_MISSING", "HASH_MISMATCH", "NOT_OPENABLE"}:
+        _invalidate_inventory(db, device_id=item.device_id, reason=error_code, target=item)
+        return item
+    retry = error_code in {"SOURCE_UNAVAILABLE", "DOWNLOAD_FAILED", "NETWORK_LOST"} and item.attempts < settings.OFFLINE_MAX_CLAIM_ATTEMPTS
+    # Raw diagnostics may contain paths/URLs/credentials: intentionally never persist them.
+    _cas(db, item, version, status=PENDING if retry else FAILED, error_code=error_code, error_detail=None,
+         claim_deadline=None, lease_token=None, updated_at=_now())
+    _touch_job(db, item.job_id)
+    if error_code == "NETWORK_LOST":
+        _pause(db, db.get(OfflineJob, item.job_id))
+    return item
+
+
+def item_payload(item):
+    return {key: getattr(item, key) for key in ("item_id", "song_id", "quality", "status", "version", "format",
+            "size_bytes", "sha256", "card_volume_id", "error_code")} | {
+        "stale": item.status == SAVED and _stale(item),
+        "last_verified_at": _aware(item.last_verified_at).isoformat() if item.last_verified_at else None,
     }
+
+
+def claim_payload(item):
+    return item_payload(item) | {"job_id": item.job_id, "owner_key": item.owner_key, "device_id": item.device_id,
+        "lease_token": item.lease_token, "lease_expires_at": _aware(item.claim_deadline).isoformat(),
+        "work_kind": item.work_kind, "attempts": item.attempts}
