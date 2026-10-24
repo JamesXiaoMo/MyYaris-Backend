@@ -352,19 +352,21 @@ def test_stream_head_method_support(client, db_session):
 def test_stream_rejects_html_masquerade(client):
     test_song_id = 77665544
     html_error = b"<html><head><title>404 Not Found</title></head><body>Song unavailable</body></html>"
+    fake_stream, _ = _make_fake_cdn_handler(html_error, content_type="text/html", ignore_range=True)
 
     with patch.object(
         netease_service,
         "get_song_url",
-        new=AsyncMock(return_value={"song_id": test_song_id, "url": "http://fake-cdn/blocked.mp3", "type": "mp3"}),
+        new=AsyncMock(
+            return_value={
+                "song_id": test_song_id,
+                "url": "http://fake-cdn/blocked.mp3",
+                "type": "mp3",
+                "size": len(html_error),
+            }
+        ),
     ):
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200  # Masqueraded 200 OK
-            mock_resp.headers = {"content-type": "text/html"}
-            mock_resp.content = html_error
-            mock_get.return_value = mock_resp
-
+        with patch("httpx.AsyncClient.stream", side_effect=fake_stream):
             # When requesting initial bytes (Range 0-1023), backend must detect non-audio and return 502
             resp = client.get(
                 f"/api/v1/music/netease/stream/{test_song_id}",
@@ -924,54 +926,102 @@ async def test_session_change_during_async_prevents_cache_pollution():
 # Fake CDN Range / Short-Probe / Container Magic / Protocol Tests
 # ---------------------------------------------------------------------------
 
-def _make_fake_cdn_handler(full_audio: bytes, content_type: str = "audio/mpeg", ignore_range: bool = False):
+def _make_fake_cdn_handler(
+    full_audio: bytes,
+    content_type: str = "audio/mpeg",
+    ignore_range: bool = False,
+    omit_content_length_on_200: bool = False,
+    emit_chunk_size: int = 512,
+):
     """
-    Build a deterministic Fake CDN handler for httpx.AsyncClient.get that honors
-    or ignores HTTP Range headers and records all upstream requests.
+    Build a deterministic streaming Fake CDN handler for httpx.AsyncClient.stream that honors
+    or ignores HTTP Range headers and records all upstream stream requests with exact
+    byte/chunk counters and stream close tracking.
     """
     calls = []
 
-    async def fake_get(url, headers=None, **kwargs):
+    def fake_stream(method, url, headers=None, **kwargs):
         req_headers = dict(headers or {})
-        calls.append({"url": url, "headers": req_headers})
         range_hdr = req_headers.get("Range") or req_headers.get("range")
         total = len(full_audio)
-
-        resp = MagicMock()
-        if ignore_range or not range_hdr:
-            resp.status_code = 200
-            resp.content = full_audio
-            resp.headers = {
-                "content-type": content_type,
-                "content-length": str(total),
-                "accept-ranges": "bytes",
-            }
-            return resp
-
-        from app.services.media_service import parse_range_header, RangeNotSatisfiableError
-        try:
-            start, end = parse_range_header(range_hdr, total)
-        except RangeNotSatisfiableError:
-            resp.status_code = 416
-            resp.content = b""
-            resp.headers = {
-                "content-range": f"bytes */{total}",
-                "accept-ranges": "bytes",
-            }
-            return resp
-
-        chunk = full_audio[start : end + 1]
-        resp.status_code = 206
-        resp.content = chunk
-        resp.headers = {
-            "content-type": content_type,
-            "content-range": f"bytes {start}-{end}/{total}",
-            "content-length": str(len(chunk)),
-            "accept-ranges": "bytes",
+        call_record = {
+            "method": method,
+            "url": url,
+            "headers": req_headers,
+            "bytes_read": 0,
+            "chunks_read": 0,
+            "closed": False,
         }
-        return resp
+        calls.append(call_record)
 
-    return fake_get, calls
+        status_code = 200
+        resp_headers = {}
+        payload = b""
+
+        if ignore_range or not range_hdr:
+            status_code = 200
+            payload = full_audio
+            resp_headers = {
+                "content-type": content_type,
+                "accept-ranges": "bytes",
+            }
+            if not omit_content_length_on_200:
+                resp_headers["content-length"] = str(total)
+        else:
+            from app.services.media_service import parse_range_header, RangeNotSatisfiableError
+            try:
+                start, end = parse_range_header(range_hdr, total)
+            except RangeNotSatisfiableError:
+                status_code = 416
+                payload = b""
+                resp_headers = {
+                    "content-range": f"bytes */{total}",
+                    "accept-ranges": "bytes",
+                }
+            else:
+                payload = full_audio[start : end + 1]
+                status_code = 206
+                resp_headers = {
+                    "content-type": content_type,
+                    "content-range": f"bytes {start}-{end}/{total}",
+                    "content-length": str(len(payload)),
+                    "accept-ranges": "bytes",
+                }
+
+        class _FakeStreamContext:
+            async def __aenter__(self):
+                resp = MagicMock()
+                resp.status_code = status_code
+                resp.headers = resp_headers
+
+                def _raise_for_status():
+                    if status_code >= 400:
+                        raise httpx.HTTPStatusError(
+                            f"HTTP {status_code}",
+                            request=httpx.Request(method, url),
+                            response=MagicMock(status_code=status_code),
+                        )
+
+                resp.raise_for_status = _raise_for_status
+
+                async def _aiter_bytes(chunk_size=emit_chunk_size):
+                    step = min(emit_chunk_size, chunk_size or emit_chunk_size)
+                    for idx in range(0, len(payload), step):
+                        piece = payload[idx : idx + step]
+                        call_record["bytes_read"] += len(piece)
+                        call_record["chunks_read"] += 1
+                        yield piece
+
+                resp.aiter_bytes = _aiter_bytes
+                return resp
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                call_record["closed"] = True
+                return False
+
+        return _FakeStreamContext()
+
+    return fake_stream, calls
 
 
 @pytest.mark.parametrize(
@@ -996,7 +1046,7 @@ def test_stream_uncached_short_range_probes_0_1_and_0_0_and_0_1023(client, conta
     song_id = 509512457
     full_audio = header_bytes + (b"\x55\xaa\x33\xcc" * 2000)  # > 8 KB
     total_len = len(full_audio)
-    fake_get, calls = _make_fake_cdn_handler(full_audio)
+    fake_stream, calls = _make_fake_cdn_handler(full_audio)
 
     with patch.object(
         netease_service,
@@ -1010,7 +1060,7 @@ def test_stream_uncached_short_range_probes_0_1_and_0_0_and_0_1023(client, conta
                 "size": total_len,
             }
         ),
-    ), patch("httpx.AsyncClient.get", side_effect=fake_get), patch.object(
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_stream), patch.object(
         cache_manager, "cache_track_background", new_callable=AsyncMock
     ) as mock_bg_cache:
         # 1. Range: bytes=0-1 (2 bytes)
@@ -1025,6 +1075,8 @@ def test_stream_uncached_short_range_probes_0_1_and_0_0_and_0_1023(client, conta
         assert r01.headers["Accept-Ranges"] == "bytes"
         # Upstream probe must have fetched a bounded validation window, not just 2 bytes
         assert calls[-1]["headers"]["Range"] == "bytes=0-511"
+        assert calls[-1]["bytes_read"] == 512
+        assert calls[-1]["closed"] is True
         assert mock_bg_cache.call_count == 0
 
         # 2. Range: bytes=0-0 (1 byte)
@@ -1037,6 +1089,8 @@ def test_stream_uncached_short_range_probes_0_1_and_0_0_and_0_1023(client, conta
         assert r00.headers["Content-Length"] == "1"
         assert r00.headers["Content-Range"] == f"bytes 0-0/{total_len}"
         assert calls[-1]["headers"]["Range"] == "bytes=0-511"
+        assert calls[-1]["bytes_read"] == 512
+        assert calls[-1]["closed"] is True
         assert mock_bg_cache.call_count == 0
 
         # 3. Range: bytes=0-1023 (1024 bytes pre-check probe)
@@ -1049,6 +1103,8 @@ def test_stream_uncached_short_range_probes_0_1_and_0_0_and_0_1023(client, conta
         assert r1023.headers["Content-Length"] == "1024"
         assert r1023.headers["Content-Range"] == f"bytes 0-1023/{total_len}"
         assert calls[-1]["headers"]["Range"] == "bytes=0-1023"
+        assert calls[-1]["bytes_read"] == 1024
+        assert calls[-1]["closed"] is True
         # Probe <= 1024 bytes must NOT trigger background full-song download
         assert mock_bg_cache.call_count == 0
 
@@ -1061,7 +1117,7 @@ def test_stream_uncached_nonzero_and_suffix_and_playback_ranges(client):
     song_id = 509512458
     full_audio = b"ID3\x04\x00\x00\x00\x00\x00\x23TSSE" + bytes(range(256)) * 20  # 5134 bytes
     total_len = len(full_audio)
-    fake_get, calls = _make_fake_cdn_handler(full_audio)
+    fake_stream, calls = _make_fake_cdn_handler(full_audio)
 
     with patch.object(
         netease_service,
@@ -1075,7 +1131,7 @@ def test_stream_uncached_nonzero_and_suffix_and_playback_ranges(client):
                 "size": total_len,
             }
         ),
-    ), patch("httpx.AsyncClient.get", side_effect=fake_get), patch.object(
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_stream), patch.object(
         cache_manager, "cache_track_background", new_callable=AsyncMock
     ) as mock_bg_cache:
         # 1. Arbitrary non-zero Range: bytes=1024-2047
@@ -1087,6 +1143,7 @@ def test_stream_uncached_nonzero_and_suffix_and_playback_ranges(client):
         assert r_mid.content == full_audio[1024:2048]
         assert r_mid.headers["Content-Length"] == "1024"
         assert r_mid.headers["Content-Range"] == f"bytes 1024-2047/{total_len}"
+        assert calls[-1]["bytes_read"] == 1024
         assert mock_bg_cache.call_count == 1
 
         # 2. Suffix Range: bytes=-500
@@ -1098,6 +1155,7 @@ def test_stream_uncached_nonzero_and_suffix_and_playback_ranges(client):
         assert r_suffix.content == full_audio[-500:]
         assert r_suffix.headers["Content-Length"] == "500"
         assert r_suffix.headers["Content-Range"] == f"bytes {total_len - 500}-{total_len - 1}/{total_len}"
+        assert calls[-1]["bytes_read"] == 500
         assert mock_bg_cache.call_count == 2
 
         # 3. Large playback Range from 0: bytes=0-4095 (> 1024B) triggers background cache
@@ -1109,20 +1167,21 @@ def test_stream_uncached_nonzero_and_suffix_and_playback_ranges(client):
         assert r_play.content == full_audio[:4096]
         assert r_play.headers["Content-Length"] == "4096"
         assert r_play.headers["Content-Range"] == f"bytes 0-4095/{total_len}"
+        assert calls[-1]["bytes_read"] == 4096
         assert mock_bg_cache.call_count == 3
 
 
 def test_stream_uncached_when_upstream_ignores_range_and_returns_200(client):
     """
     If upstream CDN ignores Range and returns 200 OK with full audio payload,
-    backend must still validate audio magic at byte 0, slice the exact requested range,
-    and return 206 Partial Content with consistent Content-Range and Content-Length
-    (or 416 if requested range is beyond total size).
+    backend must validate audio magic on a bounded prefix, slice the exact requested range
+    within MAX_200_FALLBACK_READ_BYTES, and return 206 Partial Content with consistent
+    Content-Range and Content-Length (or 416 if requested range is beyond total size).
     """
     song_id = 509512459
     full_audio = b"ID3\x04\x00\x00\x00\x00\x00\x23TSSE" + bytes(range(256)) * 10  # 2574 bytes
     total_len = len(full_audio)
-    fake_get, _ = _make_fake_cdn_handler(full_audio, ignore_range=True)
+    fake_stream, calls = _make_fake_cdn_handler(full_audio, ignore_range=True)
 
     with patch.object(
         netease_service,
@@ -1136,10 +1195,10 @@ def test_stream_uncached_when_upstream_ignores_range_and_returns_200(client):
                 "size": total_len,
             }
         ),
-    ), patch("httpx.AsyncClient.get", side_effect=fake_get), patch.object(
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_stream), patch.object(
         cache_manager, "cache_track_background", new_callable=AsyncMock
     ):
-        # 1. Short probe bytes=0-1 against 200-only upstream -> sliced to 2 bytes 206
+        # 1. Short probe bytes=0-1 against 200-only upstream -> reads only 512B, sliced to 2B 206
         r01 = client.get(
             f"/api/v1/music/netease/stream/{song_id}",
             headers={"Range": "bytes=0-1"},
@@ -1148,8 +1207,10 @@ def test_stream_uncached_when_upstream_ignores_range_and_returns_200(client):
         assert r01.content == full_audio[:2]
         assert r01.headers["Content-Length"] == "2"
         assert r01.headers["Content-Range"] == f"bytes 0-1/{total_len}"
+        assert calls[-1]["bytes_read"] == 512
+        assert calls[-1]["closed"] is True
 
-        # 2. Non-zero range bytes=100-199 against 200-only upstream -> sliced to 100 bytes 206
+        # 2. Non-zero range bytes=100-199 against 200-only upstream -> reads only 512B, sliced to 100B 206
         r_mid = client.get(
             f"/api/v1/music/netease/stream/{song_id}",
             headers={"Range": "bytes=100-199"},
@@ -1158,8 +1219,10 @@ def test_stream_uncached_when_upstream_ignores_range_and_returns_200(client):
         assert r_mid.content == full_audio[100:200]
         assert r_mid.headers["Content-Length"] == "100"
         assert r_mid.headers["Content-Range"] == f"bytes 100-199/{total_len}"
+        assert calls[-1]["bytes_read"] == 512
+        assert calls[-1]["closed"] is True
 
-        # 3. Suffix range bytes=-200 against 200-only upstream -> sliced to last 200 bytes 206
+        # 3. Suffix range bytes=-200 on small (2574B <= 64KB) 200-only upstream -> sliced to last 200B 206
         r_suf = client.get(
             f"/api/v1/music/netease/stream/{song_id}",
             headers={"Range": "bytes=-200"},
@@ -1169,13 +1232,15 @@ def test_stream_uncached_when_upstream_ignores_range_and_returns_200(client):
         assert r_suf.headers["Content-Length"] == "200"
         assert r_suf.headers["Content-Range"] == f"bytes {total_len - 200}-{total_len - 1}/{total_len}"
 
-        # 4. Out-of-bounds range against 200-only upstream -> 416
+        # 4. Out-of-bounds range against 200-only upstream -> 416 with 0 body bytes read
         r_416 = client.get(
             f"/api/v1/music/netease/stream/{song_id}",
             headers={"Range": f"bytes={total_len + 500}-"},
         )
         assert r_416.status_code == 416
         assert r_416.headers["Content-Range"] == f"bytes */{total_len}"
+        assert calls[-1]["bytes_read"] == 0
+        assert calls[-1]["closed"] is True
 
 
 def test_stream_uncached_416_and_invalid_range_headers_and_head(client):
@@ -1188,7 +1253,7 @@ def test_stream_uncached_416_and_invalid_range_headers_and_head(client):
     song_id = 509512460
     full_audio = b"ID3\x04\x00\x00\x00\x00\x00\x23TSSE" + b"\x00" * 4000
     total_len = len(full_audio)
-    fake_get, calls = _make_fake_cdn_handler(full_audio)
+    fake_stream, calls = _make_fake_cdn_handler(full_audio)
 
     with patch.object(
         netease_service,
@@ -1202,7 +1267,7 @@ def test_stream_uncached_416_and_invalid_range_headers_and_head(client):
                 "size": total_len,
             }
         ),
-    ), patch("httpx.AsyncClient.get", side_effect=fake_get):
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_stream):
         # 1. Invalid Range headers -> 416 without calling upstream CDN
         for bad_range in ("invalid_range", "bytes=", "bytes=500-200", "bytes=-0", "bytes=0-1, 4-5"):
             res = client.get(
@@ -1213,7 +1278,7 @@ def test_stream_uncached_416_and_invalid_range_headers_and_head(client):
             assert res.headers.get("Accept-Ranges") == "bytes"
         assert len(calls) == 0
 
-        # 2. Valid Range syntax but beyond EOF -> upstream returns 416 -> preserved as 416
+        # 2. Valid Range syntax but beyond EOF -> 416
         res_eof = client.get(
             f"/api/v1/music/netease/stream/{song_id}",
             headers={"Range": f"bytes={total_len + 1000}-"},
@@ -1261,7 +1326,7 @@ def test_stream_rejects_error_pages_and_invalid_containers_across_ranges(client)
 
     song_id = 509512461
     html_payload = b"   \n<!DOCTYPE html><html><body>Copyright Restricted</body></html>" * 20
-    fake_get_html, _ = _make_fake_cdn_handler(html_payload, content_type="text/html; charset=utf-8")
+    fake_stream_html, _ = _make_fake_cdn_handler(html_payload, content_type="text/html; charset=utf-8")
 
     with patch.object(
         netease_service,
@@ -1275,7 +1340,7 @@ def test_stream_rejects_error_pages_and_invalid_containers_across_ranges(client)
                 "size": len(html_payload),
             }
         ),
-    ), patch("httpx.AsyncClient.get", side_effect=fake_get_html), patch.object(
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_stream_html), patch.object(
         cache_manager, "cache_track_background", new_callable=AsyncMock
     ) as mock_bg_cache:
         for rng in ("bytes=0-1", "bytes=0-0", "bytes=0-1023", "bytes=100-200", "bytes=-100"):
@@ -1285,6 +1350,333 @@ def test_stream_rejects_error_pages_and_invalid_containers_across_ranges(client)
             )
             assert res.status_code == 502, f"Expected 502 for HTML error payload on Range {rng}, got {res.status_code}"
         assert mock_bg_cache.call_count == 0
+
+
+def test_stream_uncached_huge_200_and_malicious_206_do_not_read_full_song_with_counters(client):
+    """
+    Prove with streaming byte/chunk counters that:
+    1. When upstream ignores Range and returns a huge 200 OK stream (e.g. 10 MB):
+       - Short probes (bytes=0-1, bytes=0-0) read ONLY 512 bytes (1 chunk) and close the stream.
+       - 1 KB probe (bytes=0-1023) reads ONLY 1024 bytes (2 chunks) and close the stream.
+       - Deep offset (bytes=500000-500511) or suffix (bytes=-500) on a 10 MB file is safely
+         rejected with HTTP 502 and 0 body bytes read (never reads the whole 10 MB song).
+    2. When upstream ignores Range and returns 200 OK with unknown total length
+       (no Content-Length header and known_size=0):
+       - Safely rejected with HTTP 502 and 0 body bytes read (never computes total via len(full)).
+    3. When upstream returns a malicious/oversized 206 Partial Content:
+       - Header declaring huge Content-Range (bytes 0-9999999/10000000) for bytes=0-1 is rejected
+         with HTTP 502 and 0 body bytes read.
+       - Lying header (Content-Range: bytes 0-511/10000000, Content-Length: 512) that actually
+         streams 10 MB of chunks is aborted immediately once total_read > 512 (<= 1024 bytes read)
+         with HTTP 502 and closed=True.
+    """
+    song_id = 509512462
+    header = b"ID3\x04\x00\x00\x00\x00\x00\x23TSSE" + b"\x11" * 500  # 514 bytes
+    huge_total = 10 * 1024 * 1024  # 10 MiB virtual stream
+
+    # --- Part 1: Huge 10 MB 200 OK stream (ignoring Range) ---
+    calls_200 = []
+
+    def fake_huge_200_stream(method, url, headers=None, **kwargs):
+        rec = {"headers": dict(headers or {}), "bytes_read": 0, "chunks_read": 0, "closed": False}
+        calls_200.append(rec)
+
+        class _Ctx:
+            async def __aenter__(self):
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.headers = {
+                    "content-type": "audio/mpeg",
+                    "content-length": str(huge_total),
+                    "accept-ranges": "bytes",
+                }
+
+                async def _aiter_bytes(chunk_size=512):
+                    # Yield up to 10 MiB in 512-byte chunks if caller keeps reading
+                    first = (header + b"\x22" * 512)[:512]
+                    rec["bytes_read"] += len(first)
+                    rec["chunks_read"] += 1
+                    yield first
+                    for _ in range((huge_total // 512) - 1):
+                        piece = b"\x22" * 512
+                        rec["bytes_read"] += len(piece)
+                        rec["chunks_read"] += 1
+                        yield piece
+
+                resp.aiter_bytes = _aiter_bytes
+                return resp
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                rec["closed"] = True
+                return False
+
+        return _Ctx()
+
+    with patch.object(
+        netease_service,
+        "get_song_url",
+        new=AsyncMock(
+            return_value={
+                "song_id": song_id,
+                "url": "https://fake-cdn.music.126.net/huge200.mp3",
+                "type": "mp3",
+                "br": 320000,
+                "size": huge_total,
+            }
+        ),
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_huge_200_stream), patch.object(
+        cache_manager, "cache_track_background", new_callable=AsyncMock
+    ):
+        # 1a. AVPlayer initial probe bytes=0-1 against 10 MB 200 OK -> reads ONLY 512B (1 chunk)
+        r01 = client.get(f"/api/v1/music/netease/stream/{song_id}", headers={"Range": "bytes=0-1"})
+        assert r01.status_code == 206
+        assert r01.content == b"ID"
+        assert r01.headers["Content-Length"] == "2"
+        assert r01.headers["Content-Range"] == f"bytes 0-1/{huge_total}"
+        assert calls_200[-1]["bytes_read"] == 512
+        assert calls_200[-1]["chunks_read"] == 1
+        assert calls_200[-1]["closed"] is True
+
+        # 1b. 1 KB probe bytes=0-1023 against 10 MB 200 OK -> reads ONLY 1024B (2 chunks)
+        r1023 = client.get(f"/api/v1/music/netease/stream/{song_id}", headers={"Range": "bytes=0-1023"})
+        assert r1023.status_code == 206
+        assert len(r1023.content) == 1024
+        assert r1023.headers["Content-Range"] == f"bytes 0-1023/{huge_total}"
+        assert calls_200[-1]["bytes_read"] == 1024
+        assert calls_200[-1]["chunks_read"] == 2
+        assert calls_200[-1]["closed"] is True
+
+        # 1c. Deep offset bytes=500000-500511 against 10 MB 200 OK -> rejected 502 with 0 bytes read
+        r_deep = client.get(
+            f"/api/v1/music/netease/stream/{song_id}",
+            headers={"Range": "bytes=500000-500511"},
+        )
+        assert r_deep.status_code == 502
+        assert calls_200[-1]["bytes_read"] == 0
+        assert calls_200[-1]["chunks_read"] == 0
+        assert calls_200[-1]["closed"] is True
+
+        # 1d. Suffix bytes=-500 against 10 MB 200 OK -> rejected 502 with 0 bytes read
+        r_suf = client.get(
+            f"/api/v1/music/netease/stream/{song_id}",
+            headers={"Range": "bytes=-500"},
+        )
+        assert r_suf.status_code == 502
+        assert calls_200[-1]["bytes_read"] == 0
+        assert calls_200[-1]["chunks_read"] == 0
+        assert calls_200[-1]["closed"] is True
+
+    # --- Part 2: 200 OK with unknown total size (no Content-Length, known_size=0) ---
+    fake_unknown_200, calls_unk = _make_fake_cdn_handler(
+        header + b"\x00" * 4096,
+        ignore_range=True,
+        omit_content_length_on_200=True,
+    )
+    with patch.object(
+        netease_service,
+        "get_song_url",
+        new=AsyncMock(
+            return_value={
+                "song_id": song_id + 1,
+                "url": "https://fake-cdn.music.126.net/unknown200.mp3",
+                "type": "mp3",
+                "br": 320000,
+                "size": 0,
+            }
+        ),
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_unknown_200):
+        r_unk = client.get(
+            f"/api/v1/music/netease/stream/{song_id + 1}",
+            headers={"Range": "bytes=0-1"},
+        )
+        assert r_unk.status_code == 502
+        assert calls_unk[-1]["bytes_read"] == 0
+        assert calls_unk[-1]["closed"] is True
+
+    # --- Part 3: Malicious 206 Partial Content (huge Content-Range or lying body stream) ---
+    calls_206 = []
+    mode_206 = "huge_header"
+
+    def fake_malicious_206_stream(method, url, headers=None, **kwargs):
+        rec = {"mode": mode_206, "bytes_read": 0, "chunks_read": 0, "closed": False}
+        calls_206.append(rec)
+
+        class _Ctx206:
+            async def __aenter__(self):
+                resp = MagicMock()
+                resp.status_code = 206
+                if mode_206 == "huge_header":
+                    resp.headers = {
+                        "content-type": "audio/mpeg",
+                        "content-range": f"bytes 0-{huge_total - 1}/{huge_total}",
+                        "content-length": str(huge_total),
+                    }
+                else:
+                    # Lying header claims 512 bytes, but body streams 10 MiB
+                    resp.headers = {
+                        "content-type": "audio/mpeg",
+                        "content-range": f"bytes 0-511/{huge_total}",
+                        "content-length": "512",
+                    }
+
+                async def _aiter_bytes(chunk_size=512):
+                    for _ in range(huge_total // 512):
+                        piece = (header + b"\x33" * 512)[:512]
+                        rec["bytes_read"] += len(piece)
+                        rec["chunks_read"] += 1
+                        yield piece
+
+                resp.aiter_bytes = _aiter_bytes
+                return resp
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                rec["closed"] = True
+                return False
+
+        return _Ctx206()
+
+    with patch.object(
+        netease_service,
+        "get_song_url",
+        new=AsyncMock(
+            return_value={
+                "song_id": song_id + 2,
+                "url": "https://fake-cdn.music.126.net/malicious206.mp3",
+                "type": "mp3",
+                "br": 320000,
+                "size": huge_total,
+            }
+        ),
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_malicious_206_stream):
+        # 3a. Malicious 206 declaring huge Content-Range -> rejected with 0 bytes read
+        mode_206 = "huge_header"
+        r_m1 = client.get(
+            f"/api/v1/music/netease/stream/{song_id + 2}",
+            headers={"Range": "bytes=0-1"},
+        )
+        assert r_m1.status_code == 502
+        assert calls_206[-1]["bytes_read"] == 0
+        assert calls_206[-1]["chunks_read"] == 0
+        assert calls_206[-1]["closed"] is True
+
+        # 3b. Malicious 206 with lying 512B header streaming 10 MB -> aborted at chunk 2 (1024B)
+        mode_206 = "lying_body"
+        r_m2 = client.get(
+            f"/api/v1/music/netease/stream/{song_id + 2}",
+            headers={"Range": "bytes=0-1"},
+        )
+        assert r_m2.status_code == 502
+        assert calls_206[-1]["bytes_read"] <= 1024
+        assert calls_206[-1]["chunks_read"] <= 2
+        assert calls_206[-1]["closed"] is True
+
+
+def test_stream_uncached_head_unknown_size_and_error_detail_sanitization(client):
+    """
+    Verify:
+    1. Uncached HEAD when upstream song_url returns unknown size (size=0 / None)
+       never falls through to range_spec unpacking errors across no-Range, explicit Range,
+       open Range, and suffix Range.
+    2. Upstream httpx exceptions containing signed CDN URLs/tokens never leak into HTTP 502 detail.
+    """
+    song_id = 509512465
+    signed_url = "https://m801.music.126.net/20261024/track.mp3?authSecret=SUPER_SECRET_SIG_TOKEN_98765"
+
+    with patch.object(
+        netease_service,
+        "get_song_url",
+        new=AsyncMock(
+            return_value={
+                "song_id": song_id,
+                "url": signed_url,
+                "type": "mp3",
+                "br": 320000,
+                "size": None,
+                "size_bytes": None,
+            }
+        ),
+    ):
+        # 1a. HEAD without Range when size is unknown -> 200 OK, no Content-Length, no crash
+        h_none = client.head(f"/api/v1/music/netease/stream/{song_id}")
+        assert h_none.status_code == 200
+        assert h_none.headers.get("Accept-Ranges") == "bytes"
+        assert "content-length" not in {k.lower() for k in h_none.headers.keys()}
+        assert len(h_none.content) == 0
+
+        # 1b. HEAD with explicit Range bytes=0-1 when size is unknown -> 206 bytes 0-1/*
+        h_exp = client.head(
+            f"/api/v1/music/netease/stream/{song_id}",
+            headers={"Range": "bytes=0-1"},
+        )
+        assert h_exp.status_code == 206
+        assert h_exp.headers.get("Content-Range") == "bytes 0-1/*"
+        assert h_exp.headers.get("Content-Length") == "2"
+        assert len(h_exp.content) == 0
+
+        # 1c. HEAD with open Range bytes=0- when size is unknown -> 200 OK
+        h_open0 = client.head(
+            f"/api/v1/music/netease/stream/{song_id}",
+            headers={"Range": "bytes=0-"},
+        )
+        assert h_open0.status_code == 200
+        assert len(h_open0.content) == 0
+
+        # 1d. HEAD with suffix Range bytes=-500 or non-zero open Range bytes=1024- when size is unknown -> 416
+        for unsat_rng in ("bytes=-500", "bytes=1024-"):
+            h_416 = client.head(
+                f"/api/v1/music/netease/stream/{song_id}",
+                headers={"Range": unsat_rng},
+            )
+            assert h_416.status_code == 416
+            assert h_416.headers.get("Content-Range") == "bytes */*"
+
+        # 2. Exception detail sanitization: signed_url in httpx exception must NOT be echoed
+        def raising_stream(method, url, headers=None, **kwargs):
+            raise httpx.ConnectError(f"Connection refused for url '{signed_url}'")
+
+        with patch("httpx.AsyncClient.stream", side_effect=raising_stream):
+            r_err = client.get(
+                f"/api/v1/music/netease/stream/{song_id}",
+                headers={"Range": "bytes=0-1"},
+            )
+            assert r_err.status_code == 502
+            detail = r_err.json().get("detail", "")
+            assert "SUPER_SECRET_SIG_TOKEN_98765" not in detail
+            assert "authSecret" not in detail
+            assert "m801.music.126.net" not in detail
+
+
+def test_tee_stream_and_cache_rejects_html_masquerade_before_200_headers(client):
+    """
+    Verify that full/open-ended GET (no Range or Range: bytes=0-) pre-validates the first
+    upstream chunk before returning StreamingResponse(200), returning HTTP 502 Bad Gateway
+    when upstream yields an HTML error page instead of committing HTTP 200 headers first.
+    """
+    song_id = 509512466
+    html_payload = b"<!DOCTYPE html><html><body>403 Forbidden</body></html>"
+    fake_stream_html, _ = _make_fake_cdn_handler(html_payload, content_type="text/html")
+
+    with patch.object(
+        netease_service,
+        "get_song_url",
+        new=AsyncMock(
+            return_value={
+                "song_id": song_id,
+                "url": "https://fake-cdn.music.126.net/full_html.mp3",
+                "type": "mp3",
+                "br": 320000,
+                "size": len(html_payload),
+            }
+        ),
+    ), patch("httpx.AsyncClient.stream", side_effect=fake_stream_html):
+        res_no_range = client.get(f"/api/v1/music/netease/stream/{song_id}")
+        assert res_no_range.status_code == 502
+
+        res_open_range = client.get(
+            f"/api/v1/music/netease/stream/{song_id}",
+            headers={"Range": "bytes=0-"},
+        )
+        assert res_open_range.status_code == 502
 
 
 

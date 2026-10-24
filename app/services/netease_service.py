@@ -960,6 +960,8 @@ class CacheManager:
                                 first_chunk = False
                             f.write(chunk)
                             total_bytes += len(chunk)
+                            if total_bytes > self.MAX_CACHE_TRACK_BYTES:
+                                raise ValueError(f"Upstream stream exceeded max track size for song {song_id}")
                             yield chunk
 
             # Download finished successfully - move to final destination
@@ -975,7 +977,7 @@ class CacheManager:
                 finally:
                     db.close()
         except Exception as e:
-            logger.error(f"Error during tee streaming for song {song_id}: {e}")
+            logger.error(f"Error during tee streaming for song {song_id}: {type(e).__name__}")
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
@@ -1048,7 +1050,7 @@ class CacheManager:
                     finally:
                         db.close()
             except Exception as e:
-                logger.warning(f"Background cache failed for song {song_id}: {e}")
+                logger.warning(f"Background cache failed for song {song_id}: {type(e).__name__}")
                 if tmp_path.exists():
                     try:
                         tmp_path.unlink()
