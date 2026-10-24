@@ -1,6 +1,7 @@
 import hashlib
 import mimetypes
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Tuple
@@ -20,6 +21,19 @@ SUPPORTED_AUDIO_EXTENSIONS = {
     ".opus",
 }
 
+MIN_AUDIO_MAGIC_PROBE_BYTES = 512
+
+DISALLOWED_AUDIO_CONTENT_TYPES = {
+    "application/json",
+    "application/problem+json",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/javascript",
+    "text/javascript",
+}
+
+_CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", re.IGNORECASE)
+
 
 class RangeNotSatisfiableError(Exception):
     def __init__(self, file_size: int):
@@ -27,33 +41,65 @@ class RangeNotSatisfiableError(Exception):
         super().__init__(f"Range not satisfiable for file size {file_size}")
 
 
-def is_valid_audio_magic(chunk: bytes) -> bool:
+def is_error_masquerade_payload(chunk: bytes, content_type: Optional[str] = None) -> bool:
     """
-    Validate that an audio stream starts with genuine audio magic bytes
-    and is not an upstream 200 OK error masquerading as audio (HTML, XML, or JSON error payloads).
+    Detect whether an upstream HTTP response is an HTML/XML/JSON error page
+    or non-audio text payload masquerading as an audio stream.
     """
-    if not chunk or len(chunk) < 4:
-        return False
+    if content_type:
+        ct = content_type.split(";", 1)[0].strip().lower()
+        if ct.startswith("text/") or ct in DISALLOWED_AUDIO_CONTENT_TYPES:
+            return True
 
-    sample = chunk[:64].lstrip().lower()
+    if not chunk:
+        return True
+
+    sample = chunk[:512].lstrip().lower()
     if (
         sample.startswith(b"<!doctype")
         or sample.startswith(b"<html")
         or sample.startswith(b"<?xml")
+        or sample.startswith(b"<error")
+        or sample.startswith(b"<head")
+        or sample.startswith(b"<body")
         or sample.startswith(b"{\"code\"")
         or sample.startswith(b"{\"status\"")
         or sample.startswith(b"{\"message\"")
         or sample.startswith(b"{\"msg\"")
         or sample.startswith(b"{\"error\"")
     ):
+        return True
+
+    if sample.startswith(b"{") and any(
+        key in sample[:256] for key in (b"\"code\"", b"\"status\"", b"\"message\"", b"\"msg\"", b"\"error\"")
+    ):
+        return True
+
+    return False
+
+
+def is_valid_audio_magic(chunk: bytes) -> bool:
+    """
+    Validate that an audio stream starts with genuine audio container magic bytes
+    and is not an upstream 200/206 error masquerading as audio (HTML, XML, or JSON error payloads).
+    """
+    if not chunk or len(chunk) < 4:
         return False
+
+    if is_error_masquerade_payload(chunk):
+        return False
+
+    sample = chunk[:64].lstrip().lower()
 
     # Unit testing mock support
     if sample.startswith(b"mpeg_audio_stream"):
         return True
 
-    # 1. MP3 with ID3v2 container: 'ID3'
-    if chunk.startswith(b"ID3"):
+    # 1. MP3 with ID3v2 container: 'ID3' + valid version (< 0xFF) and synchsafe size if >= 10B
+    if chunk.startswith(b"ID3") and chunk[3] < 0xFF:
+        if len(chunk) >= 10:
+            if chunk[4] >= 0xFF or any(b >= 0x80 for b in chunk[6:10]):
+                return False
         return True
 
     # 2. FLAC: 'fLaC'
@@ -64,20 +110,35 @@ def is_valid_audio_magic(chunk: bytes) -> bool:
     if chunk.startswith(b"OggS"):
         return True
 
-    # 4. WAV: 'RIFF'
-    if chunk.startswith(b"RIFF"):
+    # 4. WAV: 'RIFF' + 4-byte size + 'WAVE' (requires >= 12 bytes to exclude WEBP/AVI)
+    if len(chunk) >= 12 and chunk[:4] == b"RIFF" and chunk[8:12] == b"WAVE":
         return True
 
-    # 5. MP4 / M4A: '....ftyp'
-    if len(chunk) >= 8 and chunk[4:8] == b"ftyp":
+    # 5. MP4 / M4A: 4-byte box size + 'ftyp' + 4-byte printable ASCII major brand (requires >= 12 bytes)
+    if (
+        len(chunk) >= 12
+        and chunk[4:8] == b"ftyp"
+        and all(0x20 <= b <= 0x7E for b in chunk[8:12])
+    ):
         return True
 
-    # 6. Raw MP3 syncword: 11 consecutive bits set (0xFF, 0xEx)
-    if chunk[0] == 0xFF and (chunk[1] & 0xE0) == 0xE0:
+    # 6. Raw MP3 frame syncword: 11 bits set, valid version (!= 01), valid layer (!= 00), valid bitrate/samplerate
+    if (
+        chunk[0] == 0xFF
+        and (chunk[1] & 0xE0) == 0xE0
+        and (chunk[1] & 0x18) != 0x08
+        and (chunk[1] & 0x06) != 0x00
+        and (chunk[2] & 0xF0) != 0xF0
+        and (chunk[2] & 0x0C) != 0x0C
+    ):
         return True
 
-    # 7. AAC ADTS syncword: 12 consecutive bits set (0xFF, 0xFx)
-    if chunk[0] == 0xFF and (chunk[1] & 0xF0) == 0xF0:
+    # 7. AAC ADTS syncword: 12 bits set (layer == 00) and valid sampling_frequency_index (!= 15)
+    if (
+        chunk[0] == 0xFF
+        and (chunk[1] & 0xF6) == 0xF0
+        and ((chunk[2] >> 2) & 0x0F) != 0x0F
+    ):
         return True
 
     return False
@@ -217,6 +278,85 @@ def scan_local_tracks(
     }
 
 
+def parse_client_range_spec(
+    range_header: Optional[str],
+    file_size_hint: int = 0,
+) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+    """
+    Validate and parse an HTTP Range header without requiring a known file size.
+    Returns:
+      - None if range_header is None or empty
+      - ("explicit", start, end) for 'bytes=start-end' (0 <= start <= end)
+      - ("open", start, None) for 'bytes=start-' (0 <= start)
+      - ("suffix", None, suffix_len) for 'bytes=-suffix' (suffix_len > 0)
+    Raises RangeNotSatisfiableError if syntax is invalid, multipart, or bounds are inverted.
+    """
+    if not range_header or not range_header.strip():
+        return None
+
+    clean_range = range_header.strip()
+    if len(clean_range) < 6 or clean_range[:6].lower() != "bytes=":
+        raise RangeNotSatisfiableError(file_size_hint)
+
+    range_val = clean_range[6:].strip()
+    if not range_val or "," in range_val:
+        raise RangeNotSatisfiableError(file_size_hint)
+
+    parts = range_val.split("-", 1)
+    if len(parts) != 2:
+        raise RangeNotSatisfiableError(file_size_hint)
+
+    start_str, end_str = parts[0].strip(), parts[1].strip()
+
+    if start_str and end_str:
+        if not (start_str.isdigit() and end_str.isdigit()):
+            raise RangeNotSatisfiableError(file_size_hint)
+        start = int(start_str)
+        end = int(end_str)
+        if start < 0 or end < start:
+            raise RangeNotSatisfiableError(file_size_hint)
+        return ("explicit", start, end)
+    elif start_str and not end_str:
+        if not start_str.isdigit():
+            raise RangeNotSatisfiableError(file_size_hint)
+        start = int(start_str)
+        if start < 0:
+            raise RangeNotSatisfiableError(file_size_hint)
+        return ("open", start, None)
+    elif not start_str and end_str:
+        if not end_str.isdigit():
+            raise RangeNotSatisfiableError(file_size_hint)
+        suffix_len = int(end_str)
+        if suffix_len <= 0:
+            raise RangeNotSatisfiableError(file_size_hint)
+        return ("suffix", None, suffix_len)
+    else:
+        raise RangeNotSatisfiableError(file_size_hint)
+
+
+def parse_content_range_header(
+    content_range: Optional[str],
+) -> Optional[Tuple[int, int, Optional[int]]]:
+    """
+    Parse an upstream HTTP Content-Range header ('bytes start-end/total' or 'bytes start-end/*').
+    Returns (start, end, total_or_none) if valid, else None.
+    """
+    if not content_range or not content_range.strip():
+        return None
+    m = _CONTENT_RANGE_RE.match(content_range.strip())
+    if not m:
+        return None
+    start = int(m.group(1))
+    end = int(m.group(2))
+    total_str = m.group(3)
+    total = None if total_str == "*" else int(total_str)
+    if start < 0 or end < start:
+        return None
+    if total is not None and (total <= 0 or end >= total):
+        return None
+    return (start, end, total)
+
+
 def parse_range_header(
     range_header: Optional[str],
     file_size: int,
@@ -227,47 +367,22 @@ def parse_range_header(
     Returns (None, None) if no Range header provided.
     Raises RangeNotSatisfiableError if range cannot be satisfied.
     """
-    if not range_header or not range_header.strip():
+    spec = parse_client_range_spec(range_header, file_size)
+    if spec is None:
         return None, None
 
-    clean_range = range_header.strip()
-    if not clean_range.startswith("bytes="):
+    if file_size <= 0:
         raise RangeNotSatisfiableError(file_size)
 
-    range_val = clean_range[6:].strip()
-    if not range_val or "," in range_val:
-        # Multipart ranges not supported or empty
-        raise RangeNotSatisfiableError(file_size)
-
-    parts = range_val.split("-", 1)
-    if len(parts) != 2:
-        raise RangeNotSatisfiableError(file_size)
-
-    start_str, end_str = parts[0].strip(), parts[1].strip()
-
-    if start_str and end_str:
-        try:
-            start = int(start_str)
-            end = int(end_str)
-        except ValueError:
-            raise RangeNotSatisfiableError(file_size)
-    elif start_str and not end_str:
-        try:
-            start = int(start_str)
-            end = file_size - 1
-        except ValueError:
-            raise RangeNotSatisfiableError(file_size)
-    elif not start_str and end_str:
-        try:
-            suffix_len = int(end_str)
-            if suffix_len <= 0:
-                raise RangeNotSatisfiableError(file_size)
-            start = max(0, file_size - suffix_len)
-            end = file_size - 1
-        except ValueError:
-            raise RangeNotSatisfiableError(file_size)
+    kind, a, b = spec
+    if kind == "explicit":
+        start, end = int(a), int(b)
+    elif kind == "open":
+        start, end = int(a), file_size - 1
     else:
-        raise RangeNotSatisfiableError(file_size)
+        suffix_len = int(b)
+        start = max(0, file_size - suffix_len)
+        end = file_size - 1
 
     if start < 0 or start >= file_size or end < start:
         raise RangeNotSatisfiableError(file_size)

@@ -859,11 +859,41 @@ class NeteaseService:
 class CacheManager:
     """Manages the on-demand caching of Netease songs and LRU cache eviction."""
 
+    MAX_CACHE_TRACK_BYTES = 100 * 1024 * 1024  # 100 MB per-track upper bound
+    VERIFIED_URL_TTL_SECONDS = 300.0
+    MAX_VERIFIED_URLS = 256
+
     def __init__(self, cache_dir: Optional[str] = None):
         self.cache_dir = Path(cache_dir or settings.MEDIA_CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._download_locks: Dict[int, asyncio.Lock] = {}
         self._meta_lock = asyncio.Lock()
+        self._bg_download_semaphore = asyncio.Semaphore(1)
+        self._verified_stream_urls: Dict[Tuple[int, str], float] = {}
+
+    def is_stream_url_verified(self, song_id: int, remote_url: str) -> bool:
+        key = (song_id, remote_url)
+        ts = self._verified_stream_urls.get(key)
+        if ts is None:
+            return False
+        if (time.monotonic() - ts) > self.VERIFIED_URL_TTL_SECONDS:
+            self._verified_stream_urls.pop(key, None)
+            return False
+        return True
+
+    def mark_stream_url_verified(self, song_id: int, remote_url: str) -> None:
+        now = time.monotonic()
+        if len(self._verified_stream_urls) >= self.MAX_VERIFIED_URLS:
+            expired = [
+                k for k, t in self._verified_stream_urls.items()
+                if (now - t) > self.VERIFIED_URL_TTL_SECONDS
+            ]
+            for k in expired:
+                self._verified_stream_urls.pop(k, None)
+            if len(self._verified_stream_urls) >= self.MAX_VERIFIED_URLS:
+                oldest_key = next(iter(self._verified_stream_urls))
+                self._verified_stream_urls.pop(oldest_key, None)
+        self._verified_stream_urls[(song_id, remote_url)] = now
 
     def get_track_id(self, song_id: int) -> str:
         return f"netease_{song_id}"
@@ -960,11 +990,17 @@ class CacheManager:
         metadata: Dict[str, Any],
         db_factory,
     ):
-        """Downloads full song in background and registers to disk and database cache."""
+        """
+        Downloads full song in background and registers to disk and database cache.
+        Strictly bounded to single-flight execution and MAX_CACHE_TRACK_BYTES so
+        playback range requests cannot trigger concurrent multi-song or unbounded downloads.
+        """
+        if self._bg_download_semaphore.locked():
+            return  # Another background track download is already active; do not queue multi-song pre-downloads
         lock = await self._get_song_lock(song_id)
         if lock.locked():
             return  # Already being cached by another task
-        async with lock:
+        async with self._bg_download_semaphore, lock:
             db = db_factory()
             try:
                 if self.get_cached_track(db, song_id):
@@ -978,7 +1014,7 @@ class CacheManager:
             try:
                 async with httpx.AsyncClient(timeout=45.0) as client:
                     async with client.stream("GET", remote_url) as resp:
-                        if resp.status_code >= 400:
+                        if resp.status_code not in (200, 206):
                             logger.warning(f"Background cache failed for {song_id}: HTTP {resp.status_code}")
                             return
                         total_bytes = 0
@@ -990,10 +1026,17 @@ class CacheManager:
                                 if first_chunk:
                                     if not is_valid_audio_magic(chunk):
                                         logger.warning(f"Background cache failed magic check for song {song_id}: {chunk[:32]!r}")
+                                        if tmp_path.exists():
+                                            tmp_path.unlink(missing_ok=True)
                                         return
                                     first_chunk = False
-                                f.write(chunk)
                                 total_bytes += len(chunk)
+                                if total_bytes > self.MAX_CACHE_TRACK_BYTES:
+                                    logger.warning(f"Background cache exceeded max size ({total_bytes}B) for song {song_id}")
+                                    if tmp_path.exists():
+                                        tmp_path.unlink(missing_ok=True)
+                                    return
+                                f.write(chunk)
 
                 if total_bytes > 0:
                     os.replace(tmp_path, final_path)
