@@ -380,3 +380,43 @@ class OfflineDevice(Base):
     device_id = Column(String(64), primary_key=True)
     generation = Column(Integer, default=1, nullable=False)
     card_volume_id = Column(String(64), nullable=True)
+
+
+class Trip(Base):
+    """One driving trip session recorded by the car unit."""
+
+    __tablename__ = "trips"
+
+    trip_id = Column(String(64), primary_key=True, index=True)
+    device_id = Column(String(64), nullable=False, index=True)
+    started_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    ended_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    point_count = Column(Integer, default=0, nullable=False)
+    distance_km = Column(Float, default=0.0, nullable=False)
+    start_lat = Column(Float, nullable=True)
+    start_lon = Column(Float, nullable=True)
+    end_lat = Column(Float, nullable=True)
+    end_lon = Column(Float, nullable=True)
+    status = Column(String(16), default="recording", nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class TripPoint(Base):
+    """Individual GPS sample recorded every ~10 seconds during a trip."""
+
+    __tablename__ = "trip_points"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trip_id = Column(
+        String(64),
+        ForeignKey("trips.trip_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    device_id = Column(String(64), nullable=False, index=True)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    speed_kmh = Column(Float, nullable=True)
+    accuracy_m = Column(Float, nullable=True)
+    recorded_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
