@@ -310,27 +310,34 @@ class NeteaseService:
 
         return {"total": total, "songs": songs}
 
+    BEST_QUALITY_LADDER = ("jymaster", "hires", "lossless", "exhigh")
+
     async def get_song_url(self, song_id: int, level: str = "exhigh") -> Dict[str, Any]:
-        """Fetch CDN audio streaming URL for a song."""
-        # Try song/url/v1 first
+        """Fetch CDN audio streaming URL for a song.
+        When level == 'best', walks from highest lossless/master tier down to exhigh
+        so every track gets the best quality available for the current account.
+        """
+        levels_to_try = self.BEST_QUALITY_LADDER if level == "best" else (level,)
         url_v1 = f"{self.base_url}/song/url/v1"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                params = self._with_cookie_param({"id": song_id, "level": level})
-                resp = await client.get(url_v1, params=params)
-                if resp.status_code == 200:
-                    data = resp.json().get("data", [])
-                    if data and data[0].get("url"):
-                        item = data[0]
-                        return {
-                            "song_id": song_id,
-                            "url": item.get("url"),
-                            "br": item.get("br"),
-                            "size_bytes": item.get("size"),
-                            "type": item.get("type", "mp3"),
-                        }
-        except Exception as e:
-            logger.warning(f"Error with song/url/v1 for {song_id}: {e}")
+        for try_level in levels_to_try:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    params = self._with_cookie_param({"id": song_id, "level": try_level})
+                    resp = await client.get(url_v1, params=params)
+                    if resp.status_code == 200:
+                        data = resp.json().get("data", [])
+                        if data and data[0].get("url"):
+                            item = data[0]
+                            return {
+                                "song_id": song_id,
+                                "url": item.get("url"),
+                                "br": item.get("br"),
+                                "size_bytes": item.get("size"),
+                                "type": item.get("type", "mp3"),
+                                "level": item.get("level", try_level),
+                            }
+            except Exception as e:
+                logger.warning(f"Error with song/url/v1 ({try_level}) for {song_id}: {e}")
 
         # Fallback to standard song/url
         url_std = f"{self.base_url}/song/url"

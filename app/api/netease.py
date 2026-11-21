@@ -631,15 +631,21 @@ async def stream_netease_audio(
     background_tasks: BackgroundTasks,
     range: Optional[str] = Header(None, alias="Range"),
     token: Optional[str] = Query(None, description="Optional authentication token"),
+    level: Optional[str] = Query(None, description="Optional quality level: best | jymaster | hires | lossless | exhigh"),
     db: Session = Depends(get_db),
 ):
     """
     Dynamic 'stream-and-cache' streaming endpoint supporting HTTP 206 Partial Content and HEAD probing.
     - If song is cached on local server SSD, serves directly with instant seek and zero network cost.
-    - If uncached, streams from Netease CDN with strictly bounded stream reads.
+    - If level='best' is explicitly requested and server cache is lossy (<500 kbps), fetches highest
+      available lossless/master quality from Netease upstream.
     - Strictly rejects non-audio error masquerades (HTML/JSON) with HTTP 502/404.
     """
+    requested_level = (level or "").strip().lower()
+    wants_best = requested_level in ("best", "jymaster", "hires", "lossless")
     cached_track = cache_manager.get_cached_track(db, song_id)
+    if wants_best and cached_track and (cached_track.bitrate_kbps or 0) < 500:
+        cached_track = None
 
     # 1. Cache HIT: Serve from local disk via HTTP 206 Range generator
     if cached_track:
@@ -693,7 +699,10 @@ async def stream_netease_audio(
             )
 
     # 2. Cache MISS: Fetch remote CDN url
-    url_info = await netease_service.get_song_url(song_id)
+    url_info = await netease_service.get_song_url(
+        song_id,
+        level=requested_level if requested_level else "exhigh",
+    )
     cdn_url = url_info.get("url")
     if not cdn_url:
         raise HTTPException(
