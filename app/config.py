@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     MEDIA_CACHE_DIR: str = ""
     MEDIA_CACHE_MAX_BYTES: int = 50 * 1024 * 1024 * 1024  # 50 GB
     NETEASE_API_BASE_URL: str = "http://127.0.0.1:3001"
+    DJ_PUBLIC_BASE_URL: str = ""
+    DJ_SESSION_TTL_SECONDS: int = 4 * 3600
 
     # Offline SD download (V3.0)
     OFFLINE_CLAIM_TIMEOUT_MINUTES: int = 30

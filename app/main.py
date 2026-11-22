@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth import router as auth_router
 from app.api.control import router as control_router
+from app.api.dj import router as dj_router
 from app.api.destinations import router as destinations_router, api_v1_router as nav_v1_router
 from app.api.favorites import folders_router as favorite_folders_router, router as favorites_router
 from app.api.health import router as health_router
@@ -61,6 +62,7 @@ app.include_router(netease_router)
 app.include_router(local_playback_router)
 app.include_router(offline_router)
 app.include_router(control_router)
+app.include_router(dj_router)
 app.include_router(favorites_router)
 app.include_router(favorite_folders_router)
 
