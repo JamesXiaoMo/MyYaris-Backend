@@ -1162,6 +1162,66 @@ class MusicQueueSnapshotManager:
 
         return snapshot
 
+    async def prepare_custom_queue(
+        self,
+        device_id: str,
+        tracks: List[Dict[str, Any]],
+        source: str = "dj_queue",
+        name: str = "扫码点歌列表",
+        queue_id: Optional[str] = None,
+        command_id: Optional[str] = None,
+        activate: bool = True,
+        db: Optional[Session] = None,
+    ) -> QueueSnapshot:
+        """
+        Creates or updates a multi-track custom queue snapshot (e.g. Guest DJ playlist).
+        """
+        norm_dev = resolve_car_device_id(device_id)
+        now_ts = int(time.time() * 1000)
+        if not queue_id:
+            opaque_hash = hashlib.sha256(f"{source}:{norm_dev}:{now_ts}".encode("utf-8")).hexdigest()[:12]
+            queue_id = f"q_{source}_{opaque_hash}"
+        version = self.get_next_queue_version(norm_dev, db=db)
+
+        normalized_tracks: List[Dict[str, Any]] = []
+        for idx, item in enumerate(tracks):
+            sid = int(item["song_id"])
+            normalized_tracks.append({
+                "track_id": f"netease_{sid}",
+                "song_id": sid,
+                "title": str(item.get("title") or f"Track {sid}"),
+                "artist": str(item.get("artist") or "Unknown Artist"),
+                "album": item.get("album"),
+                "duration_ms": int(item.get("duration_ms") or 0),
+                "cover_url": item.get("cover_url"),
+                "stream_url": f"/api/v1/music/netease/stream/{sid}",
+                "fee": 0,
+                "playable": True,
+                "queue_index": idx,
+            })
+
+        snapshot = QueueSnapshot(
+            queue_id=queue_id,
+            queue_version=version,
+            source=source,
+            name=name,
+            total=len(normalized_tracks),
+            is_complete=True,
+            queue_state="ready",
+            tracks=normalized_tracks,
+            device_id=norm_dev,
+        )
+
+        async with self._lock:
+            self._snapshots[(norm_dev, queue_id, version)] = snapshot
+            if command_id:
+                self._pending_queues[(norm_dev, command_id)] = snapshot
+            if activate:
+                self._active_queues[norm_dev] = snapshot
+                self.sync_device_queue_version(norm_dev, version, db=db)
+
+        return snapshot
+
     async def prepare_single_track_queue(
         self,
         device_id: str,

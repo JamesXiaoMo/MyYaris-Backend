@@ -31,6 +31,7 @@ class _GuestSession:
         self.token = token
         self.device_id = device_id
         self.expires_at = expires_at
+        self.queue_id = f"q_dj_{secrets.token_hex(6)}"
         self.queue: List[Dict[str, Any]] = []
         self.track_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -258,29 +259,63 @@ async def search_dj_songs(
     return {"total": int(raw.get("total") or len(tracks)), "tracks": tracks}
 
 
-async def _dispatch_single_track(
-    device_id: str,
-    track: Dict[str, Any],
+async def _sync_dj_queue_to_car(
+    sess: _GuestSession,
     db: Session,
+    play_index: Optional[int] = None,
+    play_now: bool = False,
 ) -> None:
-    sid = int(track["song_id"])
-    cmd = MusicCommandRequest(
-        device_id=device_id,
-        action="play_track",
-        params=MusicCommandParams(
-            source="single_track",
-            song_id=sid,
-            track_id=f"netease_{sid}",
-            stream_url=f"/api/v1/music/netease/stream/{sid}",
-            title=str(track.get("title") or ""),
-            artist=str(track.get("artist") or ""),
-            album=str(track.get("album") or ""),
-            duration_ms=int(track.get("duration_ms") or 0),
-            cover_url=_https_cover(track.get("cover_url")),
-        ),
+    if not sess.queue:
+        return
+    snap = await music_queue_snapshot_manager.prepare_custom_queue(
+        device_id=sess.device_id,
+        tracks=sess.queue,
+        source="dj_queue",
+        name="扫码点歌列表",
+        queue_id=sess.queue_id,
+        activate=True,
+        db=db,
     )
+    row = get_car_status_by_id(db, sess.device_id)
+    car_on_dj = bool(row and row.queue_id == sess.queue_id and row.playback_state == "playing")
+
+    if play_now or not car_on_dj:
+        idx = 0 if play_index is None else max(0, min(play_index, len(sess.queue) - 1))
+        track = sess.queue[idx]
+        sid = int(track["song_id"])
+        cmd = MusicCommandRequest(
+            device_id=sess.device_id,
+            action="play_track",
+            params=MusicCommandParams(
+                source="dj_queue",
+                queue_id=snap.queue_id,
+                queue_version=snap.queue_version,
+                queue_index=idx,
+                song_id=sid,
+                track_id=f"netease_{sid}",
+                stream_url=f"/api/v1/music/netease/stream/{sid}",
+                title=str(track.get("title") or ""),
+                artist=str(track.get("artist") or ""),
+                album=str(track.get("album") or ""),
+                duration_ms=int(track.get("duration_ms") or 0),
+                cover_url=_https_cover(track.get("cover_url")),
+            ),
+        )
+    else:
+        current_tid = row.current_track_id if row else None
+        cmd = MusicCommandRequest(
+            device_id=sess.device_id,
+            action="switch_queue",
+            params=MusicCommandParams(
+                source="dj_queue",
+                queue_id=snap.queue_id,
+                queue_version=snap.queue_version,
+                start_track_id=current_tid,
+                start_index=0,
+            ),
+        )
     await process_and_dispatch_music_command(
-        cmd, _guest_car_user(device_id), db, target_device=device_id, source_channel="dj_web"
+        cmd, _guest_car_user(sess.device_id), db, target_device=sess.device_id, source_channel="dj_web"
     )
 
 
@@ -300,14 +335,53 @@ async def dj_play_song(
         "cover_url": _https_cover(req.cover_url),
     }
     sess.track_cache[f"netease_{req.song_id}"] = item
-    if req.mode == "queue":
+
+    existing_idx = next((i for i, x in enumerate(sess.queue) if x.get("song_id") == req.song_id), None)
+    if existing_idx is not None:
+        sess.queue[existing_idx] = item
+        target_idx = existing_idx
+    else:
         if len(sess.queue) >= 30:
             raise HTTPException(status_code=400, detail="点歌队列已满（最多 30 首）")
         sess.queue.append(item)
-        return {"ok": True, "mode": "queue", "queue_count": len(sess.queue), "queue": sess.queue}
+        target_idx = len(sess.queue) - 1
 
-    await _dispatch_single_track(sess.device_id, item, db)
-    return {"ok": True, "mode": "now", "queue_count": len(sess.queue)}
+    await _sync_dj_queue_to_car(sess, db, play_index=target_idx, play_now=(req.mode == "now"))
+    return {
+        "ok": True,
+        "mode": req.mode,
+        "index": target_idx,
+        "queue_count": len(sess.queue),
+        "queue": sess.queue,
+    }
+
+
+@router.post("/api/v1/dj/queue/{index}/play")
+async def dj_play_queue_index(
+    index: int,
+    token: str = Depends(_extract_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    sess = dj_store.validate(token)
+    if index < 0 or index >= len(sess.queue):
+        raise HTTPException(status_code=404, detail="队列中不存在该歌曲")
+    await _sync_dj_queue_to_car(sess, db, play_index=index, play_now=True)
+    return {"ok": True, "index": index, "queue": sess.queue}
+
+
+@router.delete("/api/v1/dj/queue/{index}")
+async def dj_remove_queue_index(
+    index: int,
+    token: str = Depends(_extract_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    sess = dj_store.validate(token)
+    if index < 0 or index >= len(sess.queue):
+        raise HTTPException(status_code=404, detail="队列中不存在该歌曲")
+    sess.queue.pop(index)
+    if sess.queue:
+        await _sync_dj_queue_to_car(sess, db, play_now=False)
+    return {"ok": True, "queue_count": len(sess.queue), "queue": sess.queue}
 
 
 @router.post("/api/v1/dj/control")
@@ -317,16 +391,11 @@ async def dj_control(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     sess = dj_store.validate(token)
-    if req.action == "next" and sess.queue:
-        next_track = sess.queue.pop(0)
-        await _dispatch_single_track(sess.device_id, next_track, db)
-        return {"ok": True, "action": "next", "from_dj_queue": True, "track": next_track, "queue": sess.queue}
-
     cmd = MusicCommandRequest(device_id=sess.device_id, action=req.action)
     await process_and_dispatch_music_command(
         cmd, _guest_car_user(sess.device_id), db, target_device=sess.device_id, source_channel="dj_web"
     )
-    return {"ok": True, "action": req.action, "from_dj_queue": False, "queue": sess.queue}
+    return {"ok": True, "action": req.action, "queue": sess.queue}
 
 
 _DJ_HTML = """<!doctype html>
@@ -468,12 +537,27 @@ async function api(path, opts={}){
 }
 
 function renderQueue(q){
-  document.getElementById("qTitle").textContent = `已点歌队列 (${q.length} 首)`;
+  document.getElementById("qTitle").textContent = `点歌列表（已同步车机 · ${q.length} 首）`;
   const list = document.getElementById("qList");
   list.innerHTML = q.length
-    ? q.map((x,i)=>`<div class="q-item"><span>${i+1}. ${esc(x.title)}</span><span style="color:#6E7382">${esc(x.artist)}</span></div>`).join("")
-    : `<div class="empty" style="padding:10px 0">暂无插队歌曲</div>`;
+    ? q.map((x,i)=>`<div class="q-item" style="align-items:center;gap:8px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" onclick="playQ(${i})">${i+1}. ${esc(x.title)} <span style="color:#6E7382;font-size:12px">· ${esc(x.artist)}</span></span><button class="btn-q" style="padding:4px 8px;font-size:11px" onclick="playQ(${i})">播放</button><button class="btn-q" style="padding:4px 8px;font-size:11px;background:#FDECEC;color:#A82F36" onclick="delQ(${i})">移除</button></div>`).join("")
+    : `<div class="empty" style="padding:10px 0">点击下方「+ 列表」或「立即播放」自动同步到车机</div>`;
 }
+window.playQ = async (i)=>{
+  try{
+    const r = await api(`/api/v1/dj/queue/${i}/play`, {method:"POST"});
+    if(r.queue) renderQueue(r.queue);
+    toast("已切到该曲目");
+    setTimeout(refreshStatus, 600);
+  }catch(e){ toast(e.message); }
+};
+window.delQ = async (i)=>{
+  try{
+    const r = await api(`/api/v1/dj/queue/${i}`, {method:"DELETE"});
+    if(r.queue) renderQueue(r.queue);
+    toast("已从点歌列表移除");
+  }catch(e){ toast(e.message); }
+};
 
 async function refreshStatus(){
   if(!token){ document.getElementById("st").textContent="缺少二维码参数"; return; }
@@ -548,7 +632,7 @@ document.getElementById("sf").onsubmit = async (ev)=>{
             <div class="t-sub">${esc(t.artist)}${t.album ? " · " + esc(t.album) : ""}</div>
           </div>
           <div class="acts">
-            <button class="btn-q" onclick="pick(${i},'queue')">+ 插队</button>
+            <button class="btn-q" onclick="pick(${i},'queue')">+ 列表</button>
             <button class="btn-p" onclick="pick(${i},'now')">立即播放</button>
           </div>
         </div>

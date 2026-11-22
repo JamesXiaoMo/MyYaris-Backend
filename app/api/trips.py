@@ -213,6 +213,12 @@ def upload_trip_points(
 
     trip.point_count = (trip.point_count or 0) + len(parsed_points)
     trip.distance_km = float(trip.distance_km or 0.0) + added_distance
+
+    # Keep the vehicle's last known parking spot synchronized with the latest GPS point
+    last_ts, last_pt = parsed_points[-1]
+    from app.api.vehicle import update_last_parking_spot
+
+    update_last_parking_spot(db, norm_device, last_pt.latitude, last_pt.longitude, recorded_at=last_ts)
     db.commit()
     db.refresh(trip)
 

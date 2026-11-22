@@ -63,8 +63,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["Music Control & State Sync"])
 
-# Queue sources that belong to the Owner's account (favorite list and its heart recommendations).
-OWNER_QUEUE_SOURCES = ("netease_favorite", "netease_intelligence")
+# Queue sources that support full multi-track snapshots on the car unit.
+OWNER_QUEUE_SOURCES = ("netease_favorite", "netease_intelligence", "dj_queue")
 
 VALID_ACTIONS = {
     "play_track",
@@ -405,6 +405,25 @@ async def _process_and_dispatch_music_command(
                     command_id=cmd.command_id,
                     db=db,
                 )
+                cmd.params.queue_id = snap.queue_id
+                cmd.params.queue_version = snap.queue_version
+            elif target_src == "dj_queue" and cmd.params.queue_id and cmd.params.queue_version is not None:
+                snap = music_queue_snapshot_manager.get_snapshot(
+                    norm_target,
+                    cmd.params.queue_id,
+                    cmd.params.queue_version,
+                )
+                if not snap:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": 409,
+                            "error_code": "QUEUE_VERSION_CONFLICT",
+                            "error_detail": f"DJ queue snapshot ({cmd.params.queue_id}, v{cmd.params.queue_version}) not found",
+                            "message": "点歌列表版本已过期，请重试",
+                        },
+                    )
+                music_queue_snapshot_manager.register_pending_snapshot(norm_target, cmd.command_id, snap)
                 cmd.params.queue_id = snap.queue_id
                 cmd.params.queue_version = snap.queue_version
             elif target_src == "single_track" and cmd.params.song_id:

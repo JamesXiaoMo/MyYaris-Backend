@@ -420,3 +420,109 @@ class TripPoint(Base):
     speed_kmh = Column(Float, nullable=True)
     accuracy_m = Column(Float, nullable=True)
     recorded_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+
+class VehicleState(Base):
+    """Latest persisted OBD-II telemetry snapshot & last known parking location per vehicle."""
+
+    __tablename__ = "vehicle_state"
+
+    device_id = Column(String(64), primary_key=True, index=True)
+
+    # --- Fuel & Range (Primary Widget Metrics) ---
+    fuel_level_liters = Column(Float, nullable=True)
+    fuel_level_percent = Column(Float, nullable=True)
+    estimated_range_km = Column(Float, nullable=True)
+    total_odometer_km = Column(Float, nullable=True)
+    trip_distance_km = Column(Float, nullable=True)
+    fuel_rate_l_h = Column(Float, nullable=True)
+    total_fuel_consumed_liters = Column(Float, nullable=True)
+
+    # --- Hybrid HV Battery & Electric Drive ---
+    battery_soc = Column(Float, nullable=True)
+    battery_voltage = Column(Float, nullable=True)
+    battery_current = Column(Float, nullable=True)
+    battery_power_kw = Column(Float, nullable=True)
+    battery_remaining_life = Column(Float, nullable=True)
+    max_cell_voltage = Column(Float, nullable=True)
+    min_cell_voltage = Column(Float, nullable=True)
+    avg_cell_voltage = Column(Float, nullable=True)
+    cell_delta_voltage = Column(Float, nullable=True)
+    battery_temperatures_json = Column(Text, nullable=True)
+    voltage_before_boost = Column(Float, nullable=True)
+    voltage_after_boost = Column(Float, nullable=True)
+    mg1_inverter_temp = Column(Float, nullable=True)
+    mg2_inverter_temp = Column(Float, nullable=True)
+    transaxle_oil_temp = Column(Float, nullable=True)
+    mg1_rpm = Column(Float, nullable=True)
+    mg2_rpm = Column(Float, nullable=True)
+    mg2_torque = Column(Float, nullable=True)
+    regen_braking_torque = Column(Float, nullable=True)
+
+    # --- Engine & Powertrain ---
+    speed_kmh = Column(Float, nullable=True)
+    engine_rpm = Column(Float, nullable=True)
+    coolant_temp = Column(Float, nullable=True)
+    engine_oil_temp = Column(Float, nullable=True)
+    engine_oil_pressure = Column(Float, nullable=True)
+    electric_water_pump_rpm = Column(Float, nullable=True)
+    electric_water_pump_target_rpm = Column(Float, nullable=True)
+    intake_air_temp = Column(Float, nullable=True)
+    ambient_air_temp = Column(Float, nullable=True)
+    catalyst_temp = Column(Float, nullable=True)
+    catalyst_temp2 = Column(Float, nullable=True)
+    throttle_position = Column(Float, nullable=True)
+    relative_throttle_position = Column(Float, nullable=True)
+    commanded_throttle_actuator = Column(Float, nullable=True)
+    pedal_position_d = Column(Float, nullable=True)
+    pedal_position_e = Column(Float, nullable=True)
+    engine_load = Column(Float, nullable=True)
+    maf_g_s = Column(Float, nullable=True)
+    baro_kpa = Column(Float, nullable=True)
+    equivalence_ratio = Column(Float, nullable=True)
+    short_term_fuel_trim = Column(Float, nullable=True)
+    long_term_fuel_trim = Column(Float, nullable=True)
+    run_time_seconds = Column(Integer, nullable=True)
+
+    # --- 12V Aux Battery & Electrical ---
+    aux_12v_voltage = Column(Float, nullable=True)
+    aux_12v_current = Column(Float, nullable=True)
+    aux_12v_temp = Column(Float, nullable=True)
+    aux_12v_soc = Column(Float, nullable=True)
+    key_cycles = Column(Integer, nullable=True)
+
+    # --- Extensible Extra JSON ---
+    extra_json = Column(Text, nullable=True)
+
+    # --- Last Known Parking Location ---
+    parked_lat = Column(Float, nullable=True)
+    parked_lon = Column(Float, nullable=True)
+    parked_address = Column(String(256), nullable=True)
+    parked_at = Column(DateTime(timezone=True), nullable=True)
+
+    # --- Timestamps ---
+    obd_updated_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class ObdTelemetryLog(Base):
+    """Time-series OBD telemetry history snapshots for trend analysis."""
+
+    __tablename__ = "obd_telemetry_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False, index=True)
+    recorded_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    fuel_level_liters = Column(Float, nullable=True)
+    fuel_level_percent = Column(Float, nullable=True)
+    estimated_range_km = Column(Float, nullable=True)
+    total_odometer_km = Column(Float, nullable=True)
+    battery_soc = Column(Float, nullable=True)
+    battery_voltage = Column(Float, nullable=True)
+    battery_power_kw = Column(Float, nullable=True)
+    aux_12v_voltage = Column(Float, nullable=True)
+    speed_kmh = Column(Float, nullable=True)
+    engine_rpm = Column(Float, nullable=True)
+    coolant_temp = Column(Float, nullable=True)
+    ambient_air_temp = Column(Float, nullable=True)
+    payload_json = Column(Text, nullable=True)

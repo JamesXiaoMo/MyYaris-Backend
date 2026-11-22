@@ -13,6 +13,7 @@ from app.api.netease import router as netease_router
 from app.api.offline import router as offline_router
 from app.api.tasks import router as tasks_router
 from app.api.trips import router as trips_router
+from app.api.vehicle import router as vehicle_router
 from app.api.voice import router as voice_router
 from app.config import settings
 from app.repositories.database import Base, engine
@@ -56,6 +57,7 @@ app.include_router(destinations_router)
 app.include_router(nav_v1_router)
 app.include_router(tasks_router)
 app.include_router(trips_router)
+app.include_router(vehicle_router)
 app.include_router(voice_router)
 app.include_router(music_router)
 app.include_router(netease_router)
