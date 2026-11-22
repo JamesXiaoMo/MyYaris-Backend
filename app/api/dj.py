@@ -106,8 +106,7 @@ def _https_cover(raw: Any) -> str:
 
 def _guest_car_user(device_id: str) -> AuthenticatedUser:
     return AuthenticatedUser(
-        id=0,
-        username=f"guest_dj_{device_id}",
+        identity=f"guest_dj_{device_id}",
         role="car",
         device_id=device_id,
         has_device_control=True,
