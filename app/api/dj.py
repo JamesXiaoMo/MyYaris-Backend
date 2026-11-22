@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import secrets
 import time
 from typing import Any, Dict, List, Optional
@@ -13,7 +14,12 @@ from app.config import settings
 from app.repositories.database import get_db
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.control import MusicCommandParams, MusicCommandRequest
-from app.services.control_service import car_status_to_response, get_car_status_by_id
+from app.services.control_service import (
+    car_status_to_response,
+    get_car_status_by_id,
+    music_queue_snapshot_manager,
+    ws_manager,
+)
 from app.services.device_service import resolve_car_device_id
 from app.services.netease_service import netease_service
 
@@ -26,6 +32,7 @@ class _GuestSession:
         self.device_id = device_id
         self.expires_at = expires_at
         self.queue: List[Dict[str, Any]] = []
+        self.track_cache: Dict[str, Dict[str, Any]] = {}
 
 
 class _GuestDjStore:
@@ -152,6 +159,40 @@ def revoke_dj_session(
     return {"active": False, "device_id": target, "revoked": revoked}
 
 
+def _is_heartbeat_fresh(iso_str: Optional[str], max_age_sec: float = 35.0) -> bool:
+    if not iso_str:
+        return False
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= max_age_sec
+    except Exception:
+        return False
+
+
+def _resolve_track_meta(sess: _GuestSession, track_id: Optional[str]) -> Dict[str, str]:
+    if not track_id:
+        return {"title": "等待播放", "artist": "", "cover_url": ""}
+    cached = sess.track_cache.get(track_id)
+    if cached:
+        return {
+            "title": str(cached.get("title") or track_id),
+            "artist": str(cached.get("artist") or ""),
+            "cover_url": _https_cover(cached.get("cover_url")),
+        }
+    active_q = music_queue_snapshot_manager.get_active_queue(sess.device_id)
+    if active_q and getattr(active_q, "tracks", None):
+        for t in active_q.tracks:
+            tid = t.get("track_id") if isinstance(t, dict) else getattr(t, "track_id", None)
+            if tid == track_id:
+                title = t.get("title") if isinstance(t, dict) else getattr(t, "title", "")
+                artist = t.get("artist") if isinstance(t, dict) else getattr(t, "artist", "")
+                cover = t.get("cover_url") if isinstance(t, dict) else getattr(t, "cover_url", "")
+                return {"title": str(title or track_id), "artist": str(artist or ""), "cover_url": _https_cover(cover)}
+    return {"title": track_id, "artist": "", "cover_url": ""}
+
+
 @router.get("/api/v1/dj/status")
 def get_dj_status(
     token: str = Depends(_extract_token),
@@ -161,7 +202,7 @@ def get_dj_status(
     row = get_car_status_by_id(db, sess.device_id)
     if not row:
         return {
-            "online": False,
+            "online": bool(ws_manager.is_device_connected(sess.device_id)),
             "playing": False,
             "playback_state": "unknown",
             "title": "等待播放",
@@ -173,13 +214,18 @@ def get_dj_status(
         }
     resp = car_status_to_response(row)
     state = resp.playback_state or "unknown"
+    online = bool(
+        ws_manager.is_device_connected(sess.device_id)
+        or _is_heartbeat_fresh(resp.last_heartbeat_at)
+    )
+    meta = _resolve_track_meta(sess, resp.current_track_id)
     return {
-        "online": bool(resp.is_online),
+        "online": online,
         "playing": state == "playing",
         "playback_state": state,
-        "title": resp.current_track_title or "等待播放",
-        "artist": resp.current_track_artist or "",
-        "cover_url": _https_cover(resp.current_track_cover_url),
+        "title": meta["title"],
+        "artist": meta["artist"],
+        "cover_url": meta["cover_url"],
         "position_ms": int(resp.position_ms or 0),
         "duration_ms": int(resp.duration_ms or 0),
         "queue": sess.queue,
@@ -254,6 +300,7 @@ async def dj_play_song(
         "duration_ms": req.duration_ms,
         "cover_url": _https_cover(req.cover_url),
     }
+    sess.track_cache[f"netease_{req.song_id}"] = item
     if req.mode == "queue":
         if len(sess.queue) >= 30:
             raise HTTPException(status_code=400, detail="点歌队列已满（最多 30 首）")
@@ -413,7 +460,11 @@ function esc(s){return String(s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 async function api(path, opts={}){
   const res = await fetch(path, {...opts, headers: {...headers, ...(opts.headers||{})}});
   const data = await res.json().catch(()=>({}));
-  if(!res.ok) throw new Error(data.detail || "操作失败");
+  if(!res.ok){
+    const err = new Error(data.detail || "操作失败");
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -441,7 +492,7 @@ async function refreshStatus(){
     renderQueue(d.queue || []);
   }catch(e){
     document.getElementById("dot").className = "dot";
-    document.getElementById("st").textContent = "会话已失效";
+    document.getElementById("st").textContent = e.status === 401 ? "会话已失效" : "重连中…";
   }
 }
 
