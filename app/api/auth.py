@@ -85,20 +85,37 @@ def verify_token_string(token: Optional[str], db: Optional[Session] = None) -> A
                 is_legacy_token=False,
                 has_device_control=can_control,
             )
+
+        # 2. Fallback to pre-shared tokens (if enabled)
+        if settings.ENABLE_LEGACY_TOKEN_AUTH:
+            if settings.ADMIN_TOKEN and raw_token == settings.ADMIN_TOKEN:
+                primary_admin = (
+                    db.query(User)
+                    .filter(User.role == "admin", User.is_active == True)
+                    .order_by(User.created_at.asc())
+                    .first()
+                )
+                if primary_admin is not None:
+                    return AuthenticatedUser(
+                        identity=primary_admin.username,
+                        role="admin",
+                        user_id=primary_admin.id,
+                        username=primary_admin.username,
+                        is_legacy_token=False,
+                        has_device_control=True,
+                    )
+                return AuthenticatedUser(
+                    identity="admin",
+                    role="admin",
+                    is_legacy_token=True,
+                    has_device_control=True,
+                )
     finally:
         if close_db:
             db.close()
 
-    # 2. Fallback to transitional legacy pre-shared tokens (if enabled)
+    # 3. Remaining pre-shared device tokens (if enabled)
     if settings.ENABLE_LEGACY_TOKEN_AUTH:
-        if settings.ADMIN_TOKEN and raw_token == settings.ADMIN_TOKEN:
-            return AuthenticatedUser(
-                identity="admin",
-                role="admin",
-                is_legacy_token=True,
-                has_device_control=True,
-            )
-
         if settings.PHONE_TOKEN and raw_token == settings.PHONE_TOKEN:
             return AuthenticatedUser(
                 identity="phone_client",
