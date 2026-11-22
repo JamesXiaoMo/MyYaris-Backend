@@ -202,7 +202,7 @@ def get_dj_status(
     row = get_car_status_by_id(db, sess.device_id)
     if not row:
         return {
-            "online": bool(ws_manager.is_device_connected(sess.device_id)),
+            "online": bool(ws_manager.has_car_client(sess.device_id)),
             "playing": False,
             "playback_state": "unknown",
             "title": "等待播放",
@@ -215,7 +215,7 @@ def get_dj_status(
     resp = car_status_to_response(row)
     state = resp.playback_state or "unknown"
     online = bool(
-        ws_manager.is_device_connected(sess.device_id)
+        ws_manager.has_car_client(sess.device_id)
         or _is_heartbeat_fresh(resp.last_heartbeat_at)
     )
     meta = _resolve_track_meta(sess, resp.current_track_id)
@@ -241,7 +241,7 @@ async def search_dj_songs(
     dj_store.validate(token)
     raw = await netease_service.search(q.strip(), page=1, limit=limit)
     tracks: List[Dict[str, Any]] = []
-    for item in raw.get("tracks", []):
+    for item in (raw.get("songs") or raw.get("tracks") or []):
         sid = item.get("song_id") or item.get("id")
         if not isinstance(sid, int) or sid <= 0:
             continue
