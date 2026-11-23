@@ -17,12 +17,13 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import require_car_or_admin
 from app.api.control import process_and_dispatch_music_command
+from app.api.dj import _sync_dj_queue_to_car, dj_store
 from app.config import settings
 from app.repositories.database import get_db
 from app.repositories.models import VehicleState
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.control import MusicCommandParams, MusicCommandRequest
-from app.services.control_service import music_queue_snapshot_manager
+from app.services.control_service import get_car_status_by_id, music_queue_snapshot_manager
 from app.services.device_service import resolve_car_device_id
 from app.services.netease_service import netease_service
 from app.services.task_service import create_task_for_place
@@ -297,6 +298,65 @@ async def _dispatch_navigation_to_car(
     }
 
 
+def _score_netease_track(item: Dict[str, Any], query: str) -> int:
+    """Prefers original artist versions and penalizes covers/karaoke/DJ remixes."""
+    q_low = (query or "").lower()
+    title = str(item.get("title") or item.get("name") or "")
+    artist = str(item.get("artist") or "")
+    t_low = title.lower()
+    a_low = artist.lower()
+    score = 0
+
+    # Reward matching query tokens in artist & title
+    tokens = [tok for tok in re.split(r"[\s,，、/]+", q_low) if len(tok) >= 1]
+    for tok in tokens:
+        if tok in a_low:
+            score += 45
+        if tok in t_low:
+            score += 35
+
+    # Penalize covers / instrumentals / DJ remixes unless explicitly requested
+    penalties = [
+        ("翻唱", 80),
+        ("原唱", 85),
+        ("cover", 75),
+        ("伴奏", 100),
+        ("karaoke", 100),
+        ("铃声", 100),
+        ("beat", 95),
+        ("trap", 75),
+        ("dj版", 70),
+        ("dj ", 65),
+        ("remix", 45),
+        ("sped up", 60),
+        ("slowed", 60),
+        ("弦乐", 50),
+        ("钢琴", 40),
+        ("吉他", 40),
+        ("live", 25),
+        ("合唱", 30),
+    ]
+    for kw, pen in penalties:
+        if kw in t_low and kw not in q_low:
+            score -= pen
+
+    # Slightly prefer standard song length (1.5min - 8min)
+    dur_ms = int(item.get("duration_ms") or 0)
+    if 90_000 <= dur_ms <= 480_000:
+        score += 10
+    elif 0 < dur_ms < 60_000:
+        score -= 40
+    return score
+
+
+def _rank_netease_candidates(raw_items: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    playable = [
+        it for it in raw_items
+        if int(it.get("song_id") or it.get("id") or 0) > 0 and it.get("playable") is not False
+    ]
+    return sorted(playable, key=lambda it: _score_netease_track(it, query), reverse=True)
+
+
 async def _dispatch_music_search_and_play(
     db: Session,
     device_id: str,
@@ -314,10 +374,11 @@ async def _dispatch_music_search_and_play(
     seen_ids = set()
 
     if len(queries) == 1:
-        raw = await netease_service.search(queries[0], limit=8)
-        for item in raw.get("tracks") or raw.get("songs") or []:
+        raw = await netease_service.search(queries[0], limit=12)
+        ranked = _rank_netease_candidates(raw.get("tracks") or raw.get("songs") or [], queries[0])
+        for item in ranked:
             sid = int(item.get("song_id") or item.get("id") or 0)
-            if sid <= 0 or sid in seen_ids or item.get("playable") is False:
+            if sid <= 0 or sid in seen_ids:
                 continue
             seen_ids.add(sid)
             collected.append(
@@ -335,10 +396,11 @@ async def _dispatch_music_search_and_play(
     else:
         for q in queries[:8]:
             try:
-                raw = await netease_service.search(q, limit=3)
-                for item in raw.get("tracks") or raw.get("songs") or []:
+                raw = await netease_service.search(q, limit=6)
+                ranked = _rank_netease_candidates(raw.get("tracks") or raw.get("songs") or [], q)
+                for item in ranked:
                     sid = int(item.get("song_id") or item.get("id") or 0)
-                    if sid <= 0 or sid in seen_ids or item.get("playable") is False:
+                    if sid <= 0 or sid in seen_ids:
                         continue
                     seen_ids.add(sid)
                     collected.append(
@@ -358,6 +420,29 @@ async def _dispatch_music_search_and_play(
     if not collected:
         return f"没有在网易云找到与「{queries[0]}」相关的可播放歌曲。", []
 
+    first = collected[0]
+    artist_part = f"{first['artist']}的" if first["artist"] else ""
+
+    # If a Guest DJ session is currently active on this car and user asked for a single song,
+    # insert it into the active DJ queue instead of wiping out friends' queued tracks!
+    if len(queries) == 1:
+        dj_sess = dj_store._by_device.get(device_id)
+        car_row = get_car_status_by_id(db, device_id)
+        if dj_sess and dj_sess.queue and car_row and car_row.queue_id == dj_sess.queue_id:
+            existing_idx = next(
+                (i for i, x in enumerate(dj_sess.queue) if x.get("song_id") == first["song_id"]),
+                None,
+            )
+            if existing_idx is not None:
+                target_idx = existing_idx
+            else:
+                cur_idx = int(car_row.queue_index or 0)
+                insert_pos = min(max(cur_idx + 1, 0), len(dj_sess.queue))
+                dj_sess.queue.insert(insert_pos, first)
+                target_idx = insert_pos
+            await _sync_dj_queue_to_car(dj_sess, db, play_index=target_idx, play_now=True)
+            return f"好的，已为你插播{artist_part}{first['title']}，原扫码点歌队列已保留。", [first]
+
     queue_id = f"q_ai_{secrets.token_hex(5)}"
     snap = await music_queue_snapshot_manager.prepare_custom_queue(
         device_id=device_id,
@@ -368,7 +453,6 @@ async def _dispatch_music_search_and_play(
         activate=True,
         db=db,
     )
-    first = collected[0]
     sid = int(first["song_id"])
     cmd = MusicCommandRequest(
         device_id=device_id,
@@ -391,7 +475,6 @@ async def _dispatch_music_search_and_play(
     await process_and_dispatch_music_command(
         cmd, user, db, target_device=device_id, source_channel="ai_assistant"
     )
-    artist_part = f"{first['artist']}的" if first["artist"] else ""
     if len(collected) > 1 and len(queries) > 1:
         reply = f"好的，已为你精选{len(collected)}首歌，先播放{artist_part}{first['title']}。"
     else:
@@ -450,13 +533,13 @@ _DEEPSEEK_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "control_music",
-            "description": "控制车机当前音乐播放（暂停、继续播放、下一首、上一首）。",
+            "description": "控制车机当前音乐播放（暂停、继续播放、下一首、上一首、或切回我喜欢的音乐默认歌单）。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["pause", "resume", "next", "previous"],
+                        "enum": ["pause", "resume", "next", "previous", "return_favorites"],
                     }
                 },
                 "required": ["action"],
@@ -667,6 +750,24 @@ async def _handle_assistant_text(
 
     if fn == "control_music":
         action = str(args.get("action") or "").strip()
+        if action == "return_favorites":
+            cmd = MusicCommandRequest(
+                device_id=device_id,
+                action="switch_queue",
+                params=MusicCommandParams(source="netease_favorite"),
+            )
+            await process_and_dispatch_music_command(
+                cmd, user, db, target_device=device_id, source_channel="ai_assistant"
+            )
+            reply = "好的，已为你切回我喜欢的音乐。"
+            return {
+                "ok": True,
+                "transcript": clean_text,
+                "intent": "control_music",
+                "reply_text": reply,
+                "tts_url": await _synthesize_chinese_tts(reply),
+                "candidates": [],
+            }
         label_map = {
             "pause": "好的，已暂停音乐。",
             "resume": "好的，继续播放音乐。",
