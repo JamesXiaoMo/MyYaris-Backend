@@ -3,7 +3,8 @@ import asyncio
 from datetime import datetime, timezone
 import os
 from pathlib import Path
-from typing import Optional
+import time
+from typing import Dict, Optional, Set, Tuple
 
 from fastapi import (
     APIRouter,
@@ -624,6 +625,68 @@ async def _consume_200_for_range_slice(
     return body_bytes, out_content_range, dict(resp.headers)
 
 
+_SONG_URL_TTL_SECONDS = 600.0
+_song_url_cache: Dict[Tuple[int, str], Tuple[float, dict]] = {}
+_prefetch_inflight: Set[int] = set()
+
+
+async def _get_cached_song_url(song_id: int, level: str) -> dict:
+    key = (song_id, level)
+    now = time.monotonic()
+    cached = _song_url_cache.get(key)
+    if cached and (now - cached[0]) < _SONG_URL_TTL_SECONDS and cached[1].get("url"):
+        return cached[1]
+    url_info = await netease_service.get_song_url(song_id, level=level)
+    if url_info.get("url"):
+        if len(_song_url_cache) > 500:
+            _song_url_cache.clear()
+        _song_url_cache[key] = (now, url_info)
+    return url_info
+
+
+async def _prefetch_song_to_ssd(song_id: int, level: str = "exhigh") -> None:
+    if song_id <= 0 or song_id in _prefetch_inflight:
+        return
+    _prefetch_inflight.add(song_id)
+    try:
+        with SessionLocal() as db:
+            if cache_manager.get_cached_track(db, song_id) is not None:
+                return
+        url_info = await _get_cached_song_url(song_id, level)
+        cdn_url = url_info.get("url")
+        if not cdn_url:
+            return
+        metadata = {
+            "title": f"Netease Track {song_id}",
+            "artist": "Netease Cloud Music",
+            "type": url_info.get("type", "mp3"),
+            "bitrate_kbps": (url_info.get("br") or 320000) // 1000,
+        }
+        tee_gen = cache_manager.tee_stream_and_cache(song_id, cdn_url, metadata, SessionLocal)
+        try:
+            async for _ in tee_gen:
+                pass
+        finally:
+            await tee_gen.aclose()
+    except Exception:
+        pass
+    finally:
+        _prefetch_inflight.discard(song_id)
+
+
+@router.api_route("/netease/prefetch/{song_id}", methods=["GET", "POST"])
+async def prefetch_netease_audio(
+    song_id: int,
+    background_tasks: BackgroundTasks,
+    level: Optional[str] = Query(None),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Warms NetEase CDN URL & triggers background SSD caching so next-track switches are instant."""
+    effective_level = (level or "").strip().lower() or "exhigh"
+    background_tasks.add_task(_prefetch_song_to_ssd, song_id, effective_level)
+    return {"ok": True, "song_id": song_id, "scheduled": True}
+
+
 @router.api_route("/netease/stream/{song_id}", methods=["GET", "HEAD"])
 async def stream_netease_audio(
     song_id: int,
@@ -698,17 +761,17 @@ async def stream_netease_audio(
                 media_type=mime_type,
             )
 
-    # 2. Cache MISS: Fetch remote CDN url
-    url_info = await netease_service.get_song_url(
-        song_id,
-        level=requested_level if requested_level else "exhigh",
-    )
+    # 2. Cache MISS: Fetch remote CDN url (with 10-min in-memory TTL cache to avoid repeated NetEase API round-trips on Range probes)
+    effective_level = requested_level if requested_level else "exhigh"
+    url_info = await _get_cached_song_url(song_id, effective_level)
     cdn_url = url_info.get("url")
     if not cdn_url:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Audio stream not available for song {song_id} (VIP copyright or unavailable)",
         )
+    if request.method == "GET" and range is not None:
+        background_tasks.add_task(_prefetch_song_to_ssd, song_id, effective_level)
 
     known_size = int(url_info.get("size_bytes") or url_info.get("size") or 0)
 

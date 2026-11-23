@@ -193,30 +193,6 @@ def upload_trip_points(
 
     update_last_parking_spot(db, norm_device, last_pt.latitude, last_pt.longitude, recorded_at=last_ts)
 
-    # If this trip has not started yet and the batch shows no real movement (< 1 km/h), skip creating a fake trip
-    if trip is None:
-        batch_dist = 0.0
-        for idx in range(1, len(parsed_points)):
-            seg = _haversine_km(
-                parsed_points[idx - 1][1].latitude,
-                parsed_points[idx - 1][1].longitude,
-                parsed_points[idx][1].latitude,
-                parsed_points[idx][1].longitude,
-            )
-            if 0.005 <= seg <= 50.0:
-                batch_dist += seg
-        max_reported_spd = max(((p.speed_kmh or 0.0) for _, p in parsed_points), default=0.0)
-        batch_dur_sec = (parsed_points[-1][0] - parsed_points[0][0]).total_seconds()
-        batch_avg_spd = (batch_dist / batch_dur_sec) * 3600.0 if batch_dur_sec > 0 else 0.0
-        if max_reported_spd < MIN_VALID_AVG_SPEED_KMH and batch_avg_spd < MIN_VALID_AVG_SPEED_KMH:
-            db.commit()
-            return TripPointsUploadResponse(
-                trip_id=trip_id,
-                accepted=0,
-                point_count=0,
-                distance_km=0.0,
-            )
-
     if trip is None:
         first_ts, first_pt = parsed_points[0]
         trip = Trip(
@@ -278,7 +254,7 @@ def upload_trip_points(
     trip.distance_km = float(trip.distance_km or 0.0) + added_distance
 
     # Prune older finished stationary trips (< 1 km/h average speed) for this device
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
     stale_candidates = (
         db.query(Trip)
         .filter(Trip.device_id == norm_device, Trip.trip_id != trip.trip_id, Trip.ended_at < cutoff)
