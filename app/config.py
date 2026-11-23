@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     MAPS_PROVIDER: str = "nominatim"  # nominatim | google | none | mock (test only)
     GOOGLE_MAPS_API_KEY: str = ""
 
+    # AI Voice Assistant (DeepSeek + Google Places New + Whisper + Chinese Edge-TTS)
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+    DEEPSEEK_MODEL: str = "deepseek-chat"
+    GOOGLE_PLACES_API_KEY: str = ""
+    ASSISTANT_TTS_VOICE: str = "zh-CN-XiaoxiaoNeural"
+    WHISPER_MODEL_SIZE: str = "small"
+
     # Nominatim (OpenStreetMap) Provider Settings
     NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org/search"
     NOMINATIM_USER_AGENT: str = "MyYaris/1.0 (https://github.com/JamesXiaoMo/MyYaris)"
