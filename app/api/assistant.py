@@ -106,8 +106,48 @@ async def _synthesize_chinese_tts(text: str) -> Optional[str]:
         return None
 
 
+def _decode_audio_to_float32_16k(file_path: str):
+    import numpy as np
+
+    if file_path.lower().endswith(".wav"):
+        import wave
+
+        with wave.open(file_path, "rb") as wf:
+            n_ch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        if sw == 2:
+            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if n_ch > 1:
+                arr = arr.reshape(-1, n_ch).mean(axis=1)
+            if sr == 16000:
+                return arr
+
+    import av
+
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
+    chunks = []
+    with av.open(file_path, mode="r") as container:
+        stream = next((s for s in container.streams if s.type == "audio"), None)
+        if stream is None:
+            return np.zeros((0,), dtype=np.float32)
+        for frame in container.decode(stream):
+            for out_frame in resampler.resample(frame):
+                chunks.append(out_frame.to_ndarray().reshape(-1))
+        for out_frame in resampler.resample(None):
+            chunks.append(out_frame.to_ndarray().reshape(-1))
+    if not chunks:
+        return np.zeros((0,), dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32, copy=False)
+
+
 def _transcribe_audio_sync(file_path: str) -> str:
     global _WHISPER_MODEL
+    audio_arr = _decode_audio_to_float32_16k(file_path)
+    if audio_arr.size < 1600:
+        return ""
+
     if _WHISPER_MODEL is None:
         from faster_whisper import WhisperModel
 
@@ -119,13 +159,27 @@ def _transcribe_audio_sync(file_path: str) -> str:
             _WHISPER_MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
             logger.info("Loaded faster-whisper '%s' on CPU (int8)", model_size)
 
-    segments, _ = _WHISPER_MODEL.transcribe(
-        file_path,
-        beam_size=3,
-        vad_filter=True,
-        initial_prompt="以下是车载中文语音指令，可能包含日本地名、歌曲名或歌手名。",
-    )
-    return "".join(seg.text for seg in segments).strip()
+    try:
+        segments, _ = _WHISPER_MODEL.transcribe(
+            audio_arr,
+            beam_size=3,
+            vad_filter=True,
+            initial_prompt="以下是车载中文语音指令，可能包含日本地名、歌曲名或歌手名。",
+        )
+        return "".join(seg.text for seg in segments).strip()
+    except Exception as exc:
+        logger.warning("Whisper transcribe failed on active device (%s), falling back to CPU int8", exc)
+        from faster_whisper import WhisperModel
+
+        model_size = settings.WHISPER_MODEL_SIZE or "small"
+        _WHISPER_MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, _ = _WHISPER_MODEL.transcribe(
+            audio_arr,
+            beam_size=3,
+            vad_filter=True,
+            initial_prompt="以下是车载中文语音指令，可能包含日本地名、歌曲名或歌手名。",
+        )
+        return "".join(seg.text for seg in segments).strip()
 
 
 async def _transcribe_audio_bytes(audio_bytes: bytes, suffix: str = ".wav") -> str:
@@ -148,8 +202,8 @@ def _resolve_car_gps(
     if lat is not None and lng is not None and not (lat == 0 and lng == 0):
         return float(lat), float(lng)
     row = db.query(VehicleState).filter(VehicleState.device_id == device_id).first()
-    if row and row.last_lat is not None and row.last_lng is not None:
-        return float(row.last_lat), float(row.last_lng)
+    if row and row.parked_lat is not None and row.parked_lon is not None:
+        return float(row.parked_lat), float(row.parked_lon)
     return None, None
 
 
@@ -724,12 +778,14 @@ async def _handle_assistant_text(
             reply = "暂时还没有收到车辆的最新车况数据。"
         else:
             bits = []
-            if row.fuel_level_pct is not None:
-                bits.append(f"剩余油量约百分之{round(row.fuel_level_pct)}")
-            if row.coolant_temp_c is not None:
-                bits.append(f"水温{round(row.coolant_temp_c)}度")
-            if row.odometer_km is not None:
-                bits.append(f"总里程{round(row.odometer_km)}公里")
+            if row.fuel_level_percent is not None:
+                bits.append(f"剩余油量约百分之{round(row.fuel_level_percent)}")
+            if row.estimated_range_km is not None:
+                bits.append(f"预计还能行驶{round(row.estimated_range_km)}公里")
+            if row.coolant_temp is not None:
+                bits.append(f"水温{round(row.coolant_temp)}度")
+            if row.total_odometer_km is not None:
+                bits.append(f"总里程{round(row.total_odometer_km)}公里")
             reply = "当前车况：" + "，".join(bits) + "。" if bits else "车辆在线，但暂无详细传感器数值。"
         return {
             "ok": True,
