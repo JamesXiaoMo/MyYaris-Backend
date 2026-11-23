@@ -341,6 +341,72 @@ def get_daily_mileage_stats(
     )
 
 
+@router.get("/footprint")
+def get_trips_footprint(
+    device_id: Optional[str] = Query(default=None),
+    limit_trips: int = Query(default=60, ge=1, le=200),
+    max_points_per_trip: int = Query(default=120, ge=20, le=300),
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Returns all valid trip polylines (downsampled) and aggregate exploration metrics for the city footprint map."""
+    _require_trip_read_access(user)
+    query = db.query(Trip)
+    if device_id:
+        query = query.filter(Trip.device_id == resolve_car_device_id(device_id))
+    elif user.role == "car" and user.device_id:
+        query = query.filter(Trip.device_id == resolve_car_device_id(user.device_id))
+
+    candidates = query.order_by(Trip.started_at.desc()).limit(limit_trips * 3).all()
+    valid = [t for t in candidates if _is_valid_trip(t)][:limit_trips]
+
+    total_distance = 0.0
+    total_duration_sec = 0.0
+    anchor_lat: Optional[float] = None
+    anchor_lon: Optional[float] = None
+    max_span_km = 0.0
+    routes: List[List[Dict[str, float]]] = []
+
+    for trip in valid:
+        total_distance += float(trip.distance_km or 0.0)
+        if trip.started_at and trip.ended_at:
+            dur = (_parse_utc(_iso_utc(trip.ended_at)) - _parse_utc(_iso_utc(trip.started_at))).total_seconds()
+            if dur > 0:
+                total_duration_sec += dur
+        pts = (
+            db.query(TripPoint)
+            .filter(TripPoint.trip_id == trip.trip_id)
+            .order_by(TripPoint.recorded_at.asc(), TripPoint.id.asc())
+            .all()
+        )
+        if len(pts) < 2:
+            continue
+        if anchor_lat is None:
+            anchor_lat = pts[0].latitude
+            anchor_lon = pts[0].longitude
+        step = max(1, len(pts) // max_points_per_trip)
+        sampled = pts[::step]
+        if sampled[-1].id != pts[-1].id:
+            sampled.append(pts[-1])
+        route_pts: List[Dict[str, float]] = []
+        for p in sampled:
+            if anchor_lat is not None and anchor_lon is not None:
+                d_km = _haversine_km(anchor_lat, anchor_lon, p.latitude, p.longitude)
+                if d_km > max_span_km:
+                    max_span_km = d_km
+            route_pts.append({"latitude": p.latitude, "longitude": p.longitude})
+        routes.append(route_pts)
+
+    return {
+        "total_trips": len(valid),
+        "total_distance_km": round(total_distance, 2),
+        "total_duration_minutes": round(total_duration_sec / 60.0, 1),
+        "max_span_km": round(max_span_km, 2),
+        "route_count": len(routes),
+        "routes": routes,
+    }
+
+
 @router.get("", response_model=TripListResponse)
 def list_trips(
     device_id: Optional[str] = Query(default=None),

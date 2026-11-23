@@ -1,9 +1,14 @@
 from datetime import datetime, timezone
+import io
+import math
+import random
 import secrets
+import struct
 import time
 from typing import Any, Dict, List, Optional
+import wave
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -126,6 +131,199 @@ class DjPlayRequest(BaseModel):
 
 class DjControlRequest(BaseModel):
     action: str = Field(..., pattern="^(pause|resume|next)$")
+
+
+class DjSfxRequest(BaseModel):
+    sfx_id: str = Field(
+        ...,
+        pattern="^(applause|airhorn|cheer|rimshot|scratch|drumroll|ding|laugh)$",
+    )
+
+
+_SFX_CATALOG: Dict[str, str] = {
+    "applause": "鼓掌",
+    "airhorn": "DJ 气笛",
+    "cheer": "欢呼",
+    "rimshot": "梗点",
+    "scratch": "搓碟",
+    "drumroll": "鼓点",
+    "ding": "叮咚",
+    "laugh": "笑声",
+}
+_SFX_WAV_CACHE: Dict[str, bytes] = {}
+
+
+def _synth_sfx_wav(sfx_id: str) -> bytes:
+    """Synthesizes a crisp 16-bit 22050Hz mono WAV sound effect with zero external deps."""
+    if sfx_id in _SFX_WAV_CACHE:
+        return _SFX_WAV_CACHE[sfx_id]
+
+    sr = 22050
+    rng = random.Random(hash(sfx_id) & 0xFFFFFFFF)
+    samples: List[float] = []
+
+    def _add_buf(buf: List[float], start_s: float, vals: List[float]) -> None:
+        idx0 = int(start_s * sr)
+        need = idx0 + len(vals)
+        if need > len(buf):
+            buf.extend([0.0] * (need - len(buf)))
+        for k, v in enumerate(vals):
+            buf[idx0 + k] += v
+
+    if sfx_id == "airhorn":
+        # Classic DJ triple-blast airhorn chord (F#4 + A#4 + C#5 sawtooths)
+        dur = 1.45
+        samples = [0.0] * int(dur * sr)
+        blasts = [(0.0, 0.14), (0.18, 0.14), (0.36, 0.95)]
+        for start, length in blasts:
+            n = int(length * sr)
+            vals = []
+            for i in range(n):
+                t = i / sr
+                env = min(1.0, t / 0.012) * min(1.0, (length - t) / 0.08)
+                glide = 1.0 - 0.045 * (t / max(length, 0.01))
+                v = 0.0
+                for base_f in (370.0, 466.16, 554.37, 740.0):
+                    phase = (t * base_f * glide) % 1.0
+                    v += (2.0 * phase - 1.0) * 0.22
+                vals.append(v * env)
+            _add_buf(samples, start, vals)
+    elif sfx_id == "applause":
+        # Layered rhythmic clap bursts with warm bandpass feel
+        dur = 2.0
+        samples = [0.0] * int(dur * sr)
+        for _ in range(42):
+            st = rng.uniform(0.0, 1.55)
+            clap_len = int(rng.uniform(0.055, 0.11) * sr)
+            amp = rng.uniform(0.14, 0.28)
+            lp = 0.0
+            vals = []
+            for i in range(clap_len):
+                t = i / sr
+                env = math.exp(-t * 28.0)
+                noise = rng.uniform(-1.0, 1.0)
+                lp = lp * 0.55 + noise * 0.45
+                vals.append((noise - lp * 0.4) * env * amp)
+            _add_buf(samples, st, vals)
+    elif sfx_id == "cheer":
+        # Rising celebratory major chord fanfare + crowd shimmer
+        dur = 1.8
+        samples = [0.0] * int(dur * sr)
+        notes = [(0.0, 523.25), (0.10, 659.25), (0.20, 783.99), (0.32, 1046.50)]
+        for st, freq in notes:
+            n = int(0.85 * sr)
+            vals = [
+                (math.sin(2 * math.pi * freq * (i / sr)) + 0.35 * math.sin(4 * math.pi * freq * (i / sr)))
+                * math.exp(-(i / sr) * 2.8)
+                * 0.25
+                for i in range(n)
+            ]
+            _add_buf(samples, st, vals)
+        n_sh = int(1.6 * sr)
+        shimmer = []
+        lp = 0.0
+        for i in range(n_sh):
+            t = i / sr
+            env = math.sin(math.pi * min(1.0, t / 1.6)) * 0.22
+            lp = lp * 0.72 + rng.uniform(-1.0, 1.0) * 0.28
+            shimmer.append(lp * env)
+        _add_buf(samples, 0.1, shimmer)
+    elif sfx_id == "rimshot":
+        # Classic Ba-Dum-Tss
+        dur = 1.35
+        samples = [0.0] * int(dur * sr)
+        # Ba (snare)
+        n1 = int(0.16 * sr)
+        _add_buf(samples, 0.0, [
+            (math.sin(2 * math.pi * 190 * (i / sr)) * 0.55 + rng.uniform(-0.5, 0.5)) * math.exp(-(i / sr) * 22.0) * 0.75
+            for i in range(n1)
+        ])
+        # Dum (tom)
+        n2 = int(0.22 * sr)
+        _add_buf(samples, 0.22, [
+            math.sin(2 * math.pi * (145 - 45 * (i / n2)) * (i / sr)) * math.exp(-(i / sr) * 14.0) * 0.85
+            for i in range(n2)
+        ])
+        # Tss (crash cymbal)
+        n3 = int(0.82 * sr)
+        prev = 0.0
+        cym = []
+        for i in range(n3):
+            t = i / sr
+            raw = rng.uniform(-1.0, 1.0)
+            hp = raw - prev * 0.85
+            prev = raw
+            cym.append(hp * math.exp(-t * 4.5) * 0.55)
+        _add_buf(samples, 0.45, cym)
+    elif sfx_id == "scratch":
+        # DJ vinyl double-chirp scratch
+        dur = 0.95
+        samples = [0.0] * int(dur * sr)
+        for st, dir_up in [(0.0, True), (0.26, False), (0.50, True)]:
+            n = int(0.22 * sr)
+            phase = 0.0
+            vals = []
+            for i in range(n):
+                u = i / n
+                freq = (240.0 + 1300.0 * u) if dir_up else (1540.0 - 1250.0 * u)
+                phase += 2 * math.pi * freq / sr
+                env = math.sin(math.pi * u)
+                vals.append(math.tanh(math.sin(phase) * 2.2) * env * 0.55)
+            _add_buf(samples, st, vals)
+    elif sfx_id == "drumroll":
+        # Rapid snare drumroll crescendo
+        dur = 1.6
+        samples = [0.0] * int(dur * sr)
+        t_cur = 0.0
+        step = 0.055
+        while t_cur < 1.35:
+            amp = 0.25 + 0.6 * (t_cur / 1.35)
+            n = int(0.06 * sr)
+            _add_buf(samples, t_cur, [
+                (math.sin(2 * math.pi * 200 * (i / sr)) * 0.4 + rng.uniform(-0.6, 0.6))
+                * math.exp(-(i / sr) * 38.0) * amp * 0.55
+                for i in range(n)
+            ])
+            t_cur += step
+            step = max(0.032, step * 0.96)
+    elif sfx_id == "laugh":
+        # Playful bouncy "Ha-Ha-Ha-Ha" synth bursts
+        dur = 1.25
+        samples = [0.0] * int(dur * sr)
+        pitches = [660.0, 587.3, 622.2, 523.2, 466.2]
+        for idx, f in enumerate(pitches):
+            n = int(0.18 * sr)
+            vals = [
+                (math.sin(2 * math.pi * (f - 60 * (i / n)) * (i / sr))
+                 + 0.4 * math.sin(4 * math.pi * f * (i / sr)))
+                * math.sin(math.pi * (i / n)) * 0.48
+                for i in range(n)
+            ]
+            _add_buf(samples, idx * 0.21, vals)
+    else:  # ding
+        dur = 1.15
+        samples = [0.0] * int(dur * sr)
+        for st, f in [(0.0, 1046.5), (0.14, 1567.98)]:
+            n = int(0.95 * sr)
+            _add_buf(samples, st, [
+                (math.sin(2 * math.pi * f * (i / sr)) + 0.28 * math.sin(6 * math.pi * f * (i / sr)))
+                * math.exp(-(i / sr) * 4.5) * 0.55
+                for i in range(n)
+            ])
+
+    peak = max((abs(x) for x in samples), default=1.0)
+    scale = 29000.0 / max(peak, 1.0)
+    pcm = struct.pack("<" + "h" * len(samples), *(int(max(-32767, min(32767, x * scale))) for x in samples))
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm)
+    data = buf.getvalue()
+    _SFX_WAV_CACHE[sfx_id] = data
+    return data
 
 
 @router.post("/api/v1/dj/session")
@@ -398,6 +596,40 @@ async def dj_control(
     return {"ok": True, "action": req.action, "queue": sess.queue}
 
 
+@router.get("/api/v1/dj/sfx/{sfx_id}.wav")
+def get_dj_sfx_wav(sfx_id: str) -> Response:
+    if sfx_id not in _SFX_CATALOG:
+        raise HTTPException(status_code=404, detail="未知音效")
+    wav_bytes = _synth_sfx_wav(sfx_id)
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@router.post("/api/v1/dj/sfx")
+async def trigger_dj_sfx(
+    req: DjSfxRequest,
+    token: str = Depends(_extract_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    sess = dj_store.validate(token)
+    cmd = MusicCommandRequest(
+        device_id=sess.device_id,
+        action="play_sfx",
+        params=MusicCommandParams(
+            sfx_id=req.sfx_id,
+            sfx_url=f"/api/v1/dj/sfx/{req.sfx_id}.wav",
+            title=_SFX_CATALOG.get(req.sfx_id, req.sfx_id),
+        ),
+    )
+    await process_and_dispatch_music_command(
+        cmd, _guest_car_user(sess.device_id), db, target_device=sess.device_id, source_channel="dj_web"
+    )
+    return {"ok": True, "sfx_id": req.sfx_id, "label": _SFX_CATALOG.get(req.sfx_id, req.sfx_id)}
+
+
 _DJ_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -445,6 +677,12 @@ _DJ_HTML = """<!doctype html>
   .search-wrap input{flex:1;border:none;outline:none;font-size:15px;background:transparent;color:var(--ink);min-width:0;}
   .search-btn{border:none;background:var(--blue);color:#fff;font-weight:700;font-size:14px;padding:9px 18px;border-radius:999px;cursor:pointer;flex-shrink:0;}
   .search-btn:disabled{opacity:.55;}
+  .sfx-card{background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:12px 14px;margin-bottom:14px;}
+  .sfx-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:13.5px;font-weight:800;}
+  .sfx-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
+  .sfx-btn{border:1px solid var(--line);background:var(--canvas);color:var(--ink);border-radius:14px;padding:9px 4px;font-size:12px;font-weight:700;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;transition:transform .1s,background .15s;}
+  .sfx-btn:active{transform:scale(.93);background:var(--peri);color:var(--blue);}
+  .sfx-ico{font-size:18px;line-height:1.1;}
   .card{background:var(--paper);border:1px solid var(--line);border-radius:22px;padding:14px;}
   .card-title{font-size:16px;font-weight:800;margin:0 0 10px;}
   .row{display:flex;align-items:center;gap:11px;padding:10px 0;border-top:1px solid #F1EFE9;}
@@ -492,6 +730,20 @@ _DJ_HTML = """<!doctype html>
     <div class="ctrls">
       <button id="btnToggle" class="icon-btn" title="播放/暂停">▶</button>
       <button id="btnNext" class="icon-btn" title="下一曲">⏭</button>
+    </div>
+  </div>
+
+  <div class="sfx-card">
+    <div class="sfx-head"><span>车机氛围音效板</span><span style="font-size:11.5px;color:var(--muted);font-weight:600">点击即在车内叠加播放</span></div>
+    <div class="sfx-grid">
+      <button class="sfx-btn" type="button" onclick="playSfx('applause','鼓掌')"><span class="sfx-ico">👏</span><span>鼓掌</span></button>
+      <button class="sfx-btn" type="button" onclick="playSfx('airhorn','DJ气笛')"><span class="sfx-ico">📯</span><span>DJ气笛</span></button>
+      <button class="sfx-btn" type="button" onclick="playSfx('cheer','欢呼')"><span class="sfx-ico">🎉</span><span>欢呼</span></button>
+      <button class="sfx-btn" type="button" onclick="playSfx('scratch','搓碟')"><span class="sfx-ico">💿</span><span>搓碟</span></button>
+      <button class="sfx-btn" type="button" onclick="playSfx('rimshot','梗点')"><span class="sfx-ico">🥁</span><span>梗点</span></button>
+      <button class="sfx-btn" type="button" onclick="playSfx('drumroll','鼓点')"><span class="sfx-ico">⚡</span><span>鼓点</span></button>
+      <button class="sfx-btn" type="button" onclick="playSfx('laugh','笑声')"><span class="sfx-ico">😂</span><span>笑声</span></button>
+      <button class="sfx-btn" type="button" onclick="playSfx('ding','叮咚')"><span class="sfx-ico">✨</span><span>叮咚</span></button>
     </div>
   </div>
 
@@ -598,6 +850,13 @@ document.getElementById("dockHead").onclick = ()=>{
   const el = document.getElementById("qList");
   const open = el.classList.toggle("open");
   document.getElementById("qArrow").textContent = open ? "▼" : "▲";
+};
+
+window.playSfx = async (id, label)=>{
+  try{
+    await api("/api/v1/dj/sfx", {method:"POST", body:JSON.stringify({sfx_id: id})});
+    toast(`已发送音效：${label}`);
+  }catch(e){ toast(e.message); }
 };
 
 let lastTracks = [];

@@ -79,6 +79,7 @@ VALID_ACTIONS = {
     "set_volume",
     "set_playback_mode",
     "switch_queue",
+    "play_sfx",
 }
 
 
