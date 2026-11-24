@@ -195,32 +195,65 @@ def upload_trip_points(
 
     if trip is None:
         first_ts, first_pt = parsed_points[0]
-        trip = Trip(
-            trip_id=trip_id,
-            device_id=norm_device,
-            started_at=first_ts,
-            ended_at=first_ts,
-            point_count=0,
-            distance_km=0.0,
-            start_lat=first_pt.latitude,
-            start_lon=first_pt.longitude,
-            end_lat=first_pt.latitude,
-            end_lon=first_pt.longitude,
-            status="recording",
+        # Auto-merge into the most recent trip for this device if within 15 minutes
+        # (prevents 1 continuous drive from splitting into multiple trips on app restart)
+        recent = (
+            db.query(Trip)
+            .filter(Trip.device_id == norm_device)
+            .order_by(Trip.ended_at.desc())
+            .first()
         )
-        db.add(trip)
-        db.flush()
+        if recent is not None and recent.ended_at is not None:
+            recent_end = _parse_utc(_iso_utc(recent.ended_at))
+            gap_sec = (first_ts - recent_end).total_seconds()
+            if -60.0 <= gap_sec <= 15 * 60.0:
+                trip = recent
+
+        if trip is None:
+            trip = Trip(
+                trip_id=trip_id,
+                device_id=norm_device,
+                started_at=first_ts,
+                ended_at=first_ts,
+                point_count=0,
+                distance_km=0.0,
+                start_lat=first_pt.latitude,
+                start_lon=first_pt.longitude,
+                end_lat=first_pt.latitude,
+                end_lon=first_pt.longitude,
+                status="recording",
+            )
+            db.add(trip)
+            db.flush()
     elif not is_same_device(trip.device_id, norm_device):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: Trip belongs to another device",
         )
 
+    # Idempotent dedup: skip points whose recorded_at is already stored for this trip
+    existing_ts_set = {
+        _iso_utc(r[0])
+        for r in db.query(TripPoint.recorded_at)
+        .filter(
+            TripPoint.trip_id == trip.trip_id,
+            TripPoint.recorded_at >= parsed_points[0][0],
+            TripPoint.recorded_at <= parsed_points[-1][0],
+        )
+        .all()
+    }
+
     prev_lat = trip.end_lat if trip.point_count > 0 else None
     prev_lon = trip.end_lon if trip.point_count > 0 else None
     added_distance = 0.0
+    accepted_count = 0
 
     for ts, p in parsed_points:
+        ts_key = _iso_utc(ts)
+        if ts_key in existing_ts_set:
+            continue
+        existing_ts_set.add(ts_key)
+        accepted_count += 1
         if prev_lat is not None and prev_lon is not None:
             seg = _haversine_km(prev_lat, prev_lon, p.latitude, p.longitude)
             # Ignore stationary GPS jitter (<5m) and impossible teleport jumps (>50km per 10s sample)
@@ -250,7 +283,7 @@ def upload_trip_points(
         if trip.ended_at is None or ts > _parse_utc(_iso_utc(trip.ended_at)):
             trip.ended_at = ts
 
-    trip.point_count = (trip.point_count or 0) + len(parsed_points)
+    trip.point_count = (trip.point_count or 0) + accepted_count
     trip.distance_km = float(trip.distance_km or 0.0) + added_distance
 
     # Prune older finished stationary trips (< 1 km/h average speed) for this device
