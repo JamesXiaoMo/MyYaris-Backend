@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from collections import OrderedDict
 import json
 import logging
@@ -610,8 +611,16 @@ def _format_navitime_prompt_hint(navitime_context: Optional[Dict[str, Any]]) -> 
     parts: List[str] = []
     dest = str(navitime_context.get("next_destination_name") or "").strip()
     dest_dist = str(navitime_context.get("next_destination_distance") or "").strip()
+    turn_dir = str(navitime_context.get("next_turn_direction") or "").strip()
     if dest or dest_dist:
-        parts.append(f"下一关键目标：{dest}（{dest_dist}）")
+        parts.append(f"下一关键目标：{dest}（{dest_dist}{'，' + turn_dir if turn_dir else ''}）")
+    two_dist = str(navitime_context.get("two_ahead_distance") or "").strip()
+    two_dir = str(navitime_context.get("two_ahead_direction") or "").strip()
+    if two_dist:
+        parts.append(f"再下一个路口：{two_dist}（{two_dir or '连续转向'}）")
+    speed_limit = navitime_context.get("speed_limit_kmh")
+    if isinstance(speed_limit, (int, float)) and speed_limit > 0:
+        parts.append(f"当前路段限速：{int(speed_limit)} km/h")
     eta = str(navitime_context.get("arrival_time") or "").strip()
     rem = str(navitime_context.get("remaining_distance_km") or "").strip()
     if eta or rem:
@@ -1023,6 +1032,72 @@ async def assistant_text_command(
         }
 
 
+_VISUAL_NAV_RE = re.compile(
+    r"(前面怎么走|怎么走|哪条道|哪条车道|走哪边|看图|路牌|匝道|立交|分岔|高速口|路口|限速|堵不堵|拥堵)"
+)
+
+
+async def _try_vision_nav_explain(
+    user_text: str,
+    navitime_context: Optional[Dict[str, Any]],
+    screenshot_bytes: Optional[bytes],
+) -> Optional[str]:
+    if not screenshot_bytes or not _VISUAL_NAV_RE.search(user_text or ""):
+        return None
+    vision_key = (os.getenv("VISION_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+    if not vision_key:
+        return None
+    vision_url = (
+        os.getenv("VISION_API_URL") or "https://api.openai.com/v1/chat/completions"
+    ).strip()
+    vision_model = (os.getenv("VISION_MODEL") or "gpt-4o-mini").strip()
+    b64_img = base64.b64encode(screenshot_bytes).decode("ascii")
+    ctx_hint = _format_navitime_prompt_hint(navitime_context)
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是丰田 Yaris Hybrid 车载导航副驾助手。请结合 CAR NAVITIME 实时画面和文字数据，"
+                    "用1到2句极其简洁自然的纯中文口语告诉驾驶员怎么走、走哪条蓝色推荐车道、以及路况。"
+                    "禁止使用 Markdown 或表情符号。" + ctx_hint
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"},
+                    },
+                ],
+            },
+        ],
+        "max_tokens": 180,
+        "temperature": 0.2,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.post(
+                vision_url,
+                headers={
+                    "Authorization": f"Bearer {vision_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+    except Exception as exc:
+        logger.warning("Vision nav explain fallback: %s", exc)
+    return None
+
+
 @router.post("/voice")
 async def assistant_voice_command(
     audio: UploadFile = File(...),
@@ -1030,6 +1105,7 @@ async def assistant_voice_command(
     lng: Optional[float] = Form(None),
     device_id: Optional[str] = Form(None),
     navitime_context: Optional[str] = Form(None),
+    navitime_screenshot: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_car_or_admin),
 ) -> Dict[str, Any]:
@@ -1058,8 +1134,26 @@ async def assistant_voice_command(
         except Exception:
             parsed_nav_ctx = None
 
+    screenshot_bytes: Optional[bytes] = None
+    if navitime_screenshot is not None:
+        raw_shot = await navitime_screenshot.read()
+        if raw_shot and len(raw_shot) <= 2 * 1024 * 1024:
+            screenshot_bytes = raw_shot
+
     try:
         transcript = await _transcribe_audio_bytes(audio_bytes, suffix=suffix)
+        vision_reply = await _try_vision_nav_explain(
+            transcript, parsed_nav_ctx, screenshot_bytes
+        )
+        if vision_reply:
+            return {
+                "ok": True,
+                "transcript": transcript,
+                "intent": "vision_nav_guide",
+                "reply_text": vision_reply,
+                "tts_url": await _synthesize_chinese_tts(vision_reply),
+                "candidates": [],
+            }
         return await _handle_assistant_text(
             text=transcript,
             db=db,
