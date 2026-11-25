@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,7 @@ from app.services.media_service import (
     record_track_access,
     scan_local_tracks,
 )
+from app.services.netease_service import favorite_catalog, netease_service
 
 router = APIRouter(prefix="/api/v1/music", tags=["Music & Media Streaming"])
 
@@ -89,14 +91,105 @@ def list_tracks(
     return TrackListResponse(total=total, tracks=items)
 
 
+def _is_placeholder_netease_meta(track: Optional[MediaTrack]) -> bool:
+    if track is None:
+        return True
+    title = (track.title or "").strip()
+    artist = (track.artist or "").strip()
+    if not title or title.startswith("Netease Track ") or title.startswith("Track "):
+        return True
+    if artist in ("", "Netease Cloud Music", "Unknown Artist"):
+        return True
+    if not (track.cover_url or "").strip():
+        return True
+    return False
+
+
+async def _resolve_netease_metadata(song_id: int) -> Optional[dict]:
+    # 1. Fast in-memory check in favorite_catalog snapshot
+    try:
+        snap = getattr(favorite_catalog, "_snap", None)
+        if snap is not None:
+            for item in getattr(snap, "tracks", ()):
+                if isinstance(item, dict) and item.get("song_id") == song_id:
+                    title = (item.get("title") or "").strip()
+                    if title:
+                        return {
+                            "title": title,
+                            "artist": (item.get("artist") or "Unknown Artist").strip(),
+                            "album": item.get("album"),
+                            "duration_ms": int(item.get("duration_ms") or 0),
+                            "cover_url": item.get("cover_url"),
+                        }
+    except Exception:
+        pass
+
+    # 2. Fetch live metadata from NetEase upstream /song/detail
+    try:
+        detail = await netease_service.get_song_detail(song_id)
+        name = (detail.get("name") or "").strip()
+        if name and name != f"Track {song_id}":
+            return {
+                "title": name,
+                "artist": (detail.get("artist") or "Unknown Artist").strip(),
+                "album": detail.get("album"),
+                "duration_ms": int(detail.get("duration_ms") or 0),
+                "cover_url": detail.get("cover_url"),
+            }
+    except Exception:
+        pass
+    return None
+
+
 @router.get("/tracks/{track_id}", response_model=TrackResponse)
-def get_track_detail(
+async def get_track_detail(
     track_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Get metadata details of a single track."""
+    """Get metadata details of a single track, auto-enriching placeholder NetEase entries."""
     track = db.query(MediaTrack).filter(MediaTrack.track_id == track_id).first()
+
+    netease_song_id: Optional[int] = None
+    if track_id.startswith("netease_"):
+        try:
+            netease_song_id = int(track_id.split("_", 1)[1])
+        except ValueError:
+            netease_song_id = None
+
+    if netease_song_id is not None and _is_placeholder_netease_meta(track):
+        resolved = await _resolve_netease_metadata(netease_song_id)
+        if resolved:
+            if track is not None:
+                track.title = resolved["title"]
+                track.artist = resolved["artist"]
+                if resolved.get("album"):
+                    track.album = resolved["album"]
+                if resolved.get("duration_ms"):
+                    track.duration_ms = resolved["duration_ms"]
+                if resolved.get("cover_url"):
+                    track.cover_url = resolved["cover_url"]
+                db.commit()
+                db.refresh(track)
+            else:
+                base_url = str(request.base_url).rstrip("/")
+                now = datetime.now(timezone.utc)
+                return TrackResponse(
+                    track_id=track_id,
+                    source="netease_cache",
+                    title=resolved["title"],
+                    artist=resolved["artist"],
+                    album=resolved.get("album"),
+                    duration_ms=resolved.get("duration_ms") or 0,
+                    file_size_bytes=0,
+                    bitrate_kbps=320,
+                    cover_url=resolved.get("cover_url"),
+                    hit_count=0,
+                    stream_url=f"{base_url}/api/v1/music/netease/stream/{netease_song_id}",
+                    created_at=now,
+                    last_accessed_at=now,
+                )
+
     if not track:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
 
