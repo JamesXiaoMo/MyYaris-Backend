@@ -50,6 +50,11 @@ class AssistantTextRequest(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
     device_id: Optional[str] = None
+    navitime_context: Optional[Dict[str, Any]] = None
+
+
+class AssistantTtsRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=300)
 
 
 def _https_cover(raw: Any) -> str:
@@ -599,8 +604,46 @@ _DEEPSEEK_TOOLS: List[Dict[str, Any]] = [
 ]
 
 
+def _format_navitime_prompt_hint(navitime_context: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(navitime_context, dict) or not navitime_context:
+        return ""
+    parts: List[str] = []
+    dest = str(navitime_context.get("next_destination_name") or "").strip()
+    dest_dist = str(navitime_context.get("next_destination_distance") or "").strip()
+    if dest or dest_dist:
+        parts.append(f"下一关键目标：{dest}（{dest_dist}）")
+    eta = str(navitime_context.get("arrival_time") or "").strip()
+    rem = str(navitime_context.get("remaining_distance_km") or "").strip()
+    if eta or rem:
+        parts.append(f"预计到达：{eta}，剩余总里程：{rem}km")
+    items = navitime_context.get("upcoming_intersections")
+    if isinstance(items, list) and items:
+        traffic_cn = {"smooth": "畅通", "slow": "缓行", "congested": "拥堵"}
+        lines = []
+        for it in items[:5]:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("inter_name") or "").strip()
+            dist = str(it.get("distance_text") or "").strip()
+            t_label = traffic_cn.get(str(it.get("traffic") or ""), "")
+            lane = str(it.get("lane_summary") or "").strip()
+            seg = f"- {name or '前方路口'} {dist}"
+            if t_label:
+                seg += f"（路况:{t_label}）"
+            if lane:
+                seg += f"【车道:{lane}】"
+            lines.append(seg)
+        if lines:
+            parts.append("前方路口与车道：\n" + "\n".join(lines))
+    if not parts:
+        return ""
+    return "\n当前 CAR NAVITIME 实时导航状态：\n" + "\n".join(parts)
+
+
 async def _call_deepseek(
-    user_text: str, pending_places: Optional[List[Dict[str, Any]]]
+    user_text: str,
+    pending_places: Optional[List[Dict[str, Any]]],
+    navitime_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     api_key = (settings.DEEPSEEK_API_KEY or "").strip()
     if not api_key:
@@ -614,14 +657,18 @@ async def _call_deepseek(
         ]
         pending_hint = "\n当前待用户选择的候选地点：\n" + "\n".join(lines)
 
+    nav_hint = _format_navitime_prompt_hint(navitime_context)
+
     system_prompt = (
         "你是丰田 Yaris Hybrid 车载 AI 语音助手。"
         "你必须严格遵守以下规则：\n"
         "1. 所有回复必须使用简短、自然、口语化的纯中文（1~2句话），禁止使用 Markdown、表情符号或多余寒暄。\n"
         "2. 用户想找地点或导航时，调用 search_place_and_navigate；注意把模糊搜索（附近拉面店、加油站、咖啡厅、便利店等）的 is_fuzzy 设为 true，明确地标设为 false。\n"
         "3. 用户想听歌、换歌、找氛围歌单时，调用 play_music 或 control_music。\n"
-        "4. 用户在候选列表中选择第几个时，调用 select_place_candidate。"
+        "4. 用户在候选列表中选择第几个时，调用 select_place_candidate。\n"
+        "5. 如果用户询问前方走哪条车道、前面堵不堵、下个路口、还有多久到等导航问题，直接结合下方的 CAR NAVITIME 实时导航状态用自然中文回答，不要调用导航搜索工具。"
         + pending_hint
+        + nav_hint
     )
 
     body = {
@@ -659,6 +706,7 @@ async def _handle_assistant_text(
     device_id: str,
     lat: Optional[float],
     lng: Optional[float],
+    navitime_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     clean_text = (text or "").strip()
     if not clean_text:
@@ -706,7 +754,7 @@ async def _handle_assistant_text(
             }
 
     # Ask DeepSeek for tool call or direct Chinese response
-    ds_resp = await _call_deepseek(clean_text, pending)
+    ds_resp = await _call_deepseek(clean_text, pending, navitime_context=navitime_context)
     choice = (ds_resp.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     tool_calls = msg.get("tool_calls") or []
@@ -933,6 +981,17 @@ def get_assistant_tts(clip_id: str) -> Response:
     )
 
 
+@router.post("/tts")
+async def synthesize_assistant_tts(
+    req: AssistantTtsRequest,
+    user: AuthenticatedUser = Depends(require_car_or_admin),
+) -> Dict[str, Any]:
+    tts_url = await _synthesize_chinese_tts(req.text)
+    if not tts_url:
+        raise HTTPException(status_code=503, detail="语音合成暂不可用")
+    return {"ok": True, "tts_url": tts_url}
+
+
 @router.post("/text")
 async def assistant_text_command(
     req: AssistantTextRequest,
@@ -942,7 +1001,13 @@ async def assistant_text_command(
     device_id = resolve_car_device_id(req.device_id or user.device_id)
     try:
         return await _handle_assistant_text(
-            text=req.text, db=db, user=user, device_id=device_id, lat=req.lat, lng=req.lng
+            text=req.text,
+            db=db,
+            user=user,
+            device_id=device_id,
+            lat=req.lat,
+            lng=req.lng,
+            navitime_context=req.navitime_context,
         )
     except Exception as exc:
         logger.exception("Assistant text error")
@@ -964,6 +1029,7 @@ async def assistant_voice_command(
     lat: Optional[float] = Form(None),
     lng: Optional[float] = Form(None),
     device_id: Optional[str] = Form(None),
+    navitime_context: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     user: AuthenticatedUser = Depends(require_car_or_admin),
 ) -> Dict[str, Any]:
@@ -983,6 +1049,14 @@ async def assistant_voice_command(
 
     suffix = os.path.splitext(audio.filename or "voice.wav")[1] or ".wav"
     target_device = resolve_car_device_id(device_id or user.device_id)
+    parsed_nav_ctx: Optional[Dict[str, Any]] = None
+    if navitime_context and navitime_context.strip():
+        try:
+            raw_ctx = json.loads(navitime_context)
+            if isinstance(raw_ctx, dict):
+                parsed_nav_ctx = raw_ctx
+        except Exception:
+            parsed_nav_ctx = None
 
     try:
         transcript = await _transcribe_audio_bytes(audio_bytes, suffix=suffix)
@@ -993,6 +1067,7 @@ async def assistant_voice_command(
             device_id=target_device,
             lat=lat,
             lng=lng,
+            navitime_context=parsed_nav_ctx,
         )
     except Exception as exc:
         logger.exception("Assistant voice error")
