@@ -1,6 +1,7 @@
 import asyncio
 import base64
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import math
@@ -21,7 +22,7 @@ from app.api.control import process_and_dispatch_music_command
 from app.api.dj import _sync_dj_queue_to_car, dj_store
 from app.config import settings
 from app.repositories.database import get_db
-from app.repositories.models import Favorite, FavoriteFolder, VehicleState
+from app.repositories.models import Favorite, FavoriteFolder, Trip, VehicleState
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.control import MusicCommandParams, MusicCommandRequest
 from app.services.control_service import get_car_status_by_id, music_queue_snapshot_manager
@@ -56,6 +57,12 @@ class AssistantTextRequest(BaseModel):
 
 class AssistantTtsRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=300)
+
+
+class AssistantBriefingRequest(BaseModel):
+    device_id: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
 
 
 def _https_cover(raw: Any) -> str:
@@ -608,14 +615,30 @@ _DEEPSEEK_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "control_music",
-            "description": "控制车机当前音乐播放（暂停、继续播放、下一首、上一首、或切回我喜欢的音乐默认歌单）。",
+            "description": "控制车机音乐播放、音量、收藏或离线缓存（暂停、继续播放、下一首、上一首、播放我喜欢的歌、喜欢/收藏当前歌曲、把当前歌曲加入本地缓存、调大或调小音乐/AI播报音量）。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["pause", "resume", "next", "previous", "return_favorites"],
-                    }
+                        "enum": [
+                            "pause",
+                            "resume",
+                            "next",
+                            "previous",
+                            "return_favorites",
+                            "like_current",
+                            "cache_current",
+                            "like_and_cache_current",
+                            "volume_up",
+                            "volume_down",
+                        ],
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["music", "ai"],
+                        "description": "仅用于 volume_up / volume_down：调节音乐音量选 music（默认），调节 AI 播报音量选 ai。",
+                    },
                 },
                 "required": ["action"],
             },
@@ -667,8 +690,17 @@ _DEEPSEEK_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "query_vehicle_status",
-            "description": "查询当前 Yaris 车辆状态（油量、水温、车速、里程等）。",
-            "parameters": {"type": "object", "properties": {}},
+            "description": "查询当前 Yaris 车辆状态（剩余油量、续航里程、12V 电瓶电压是否正常、水温、今天开了多少公里及油耗等）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "enum": ["all", "fuel", "battery", "today_trips", "temp"],
+                        "description": "用户重点询问的项目：油量/续航选 fuel，电瓶电压选 battery，今日里程/油耗选 today_trips，水温选 temp，综合询问选 all。",
+                    }
+                },
+            },
         },
     },
 ]
@@ -840,9 +872,10 @@ async def _call_deepseek(
         "你必须严格遵守以下规则：\n"
         "1. 所有回复必须使用简短、自然、口语化的纯中文（1~2句话），禁止使用 Markdown、表情符号或多余寒暄。\n"
         "2. 用户想找地点或导航时，调用 search_place_and_navigate；注意把模糊搜索（附近拉面店、加油站、咖啡厅、便利店等）的 is_fuzzy 设为 true，明确地标或用户收藏地址设为 false。\n"
-        "3. 用户想听歌、换歌、找氛围歌单时，调用 play_music 或 control_music。\n"
-        "4. 用户在候选列表中选择第几个时，调用 select_place_candidate。\n"
-        "5. 如果用户询问前方走哪条车道、前面堵不堵、下个路口、还有多久到等导航问题，直接结合下方的 CAR NAVITIME 实时导航状态用自然中文回答，不要调用导航搜索工具。"
+        "3. 用户想听歌、换歌、暂停、继续、播放我喜欢的歌、喜欢/收藏/缓存当前歌曲、或调大调小音乐/AI声音时，调用 play_music 或 control_music。\n"
+        "4. 用户询问油量、续航、电瓶电压、水温、今天开了多少公里或油耗等车况时，调用 query_vehicle_status。\n"
+        "5. 用户在候选列表中选择第几个时，调用 select_place_candidate。\n"
+        "6. 如果用户询问前方走哪条车道、前面堵不堵、下个路口、还有多久到等导航问题，直接结合下方的 CAR NAVITIME 实时导航状态用自然中文回答，不要调用导航搜索工具。"
         + pending_hint
         + fav_hint
         + nav_hint
@@ -981,6 +1014,10 @@ async def _handle_assistant_text(
 
     if fn == "control_music":
         action = str(args.get("action") or "").strip()
+        target = str(args.get("target") or "music").strip().lower()
+        if target not in ("music", "ai"):
+            target = "music"
+
         if action == "return_favorites":
             cmd = MusicCommandRequest(
                 device_id=device_id,
@@ -990,7 +1027,7 @@ async def _handle_assistant_text(
             await process_and_dispatch_music_command(
                 cmd, user, db, target_device=device_id, source_channel="ai_assistant"
             )
-            reply = "好的，已为你切回我喜欢的音乐。"
+            reply = "好的，已为你播放我喜欢的音乐。"
             return {
                 "ok": True,
                 "transcript": clean_text,
@@ -999,6 +1036,69 @@ async def _handle_assistant_text(
                 "tts_url": await _synthesize_chinese_tts(reply),
                 "candidates": [],
             }
+
+        if action in ("volume_up", "volume_down"):
+            delta = 0.15 if action == "volume_up" else -0.15
+            label = "AI 播报音量" if target == "ai" else "音乐音量"
+            reply = f"好的，已帮你调{'大' if delta > 0 else '小'}一点{label}。"
+            return {
+                "ok": True,
+                "transcript": clean_text,
+                "intent": "control_music",
+                "reply_text": reply,
+                "tts_url": await _synthesize_chinese_tts(reply),
+                "client_action": {
+                    "type": "adjust_volume",
+                    "target": target,
+                    "delta": delta,
+                },
+                "candidates": [],
+            }
+
+        if action in ("like_current", "cache_current", "like_and_cache_current"):
+            car_row = get_car_status_by_id(db, device_id)
+            raw_tid = (car_row.current_track_id or "").strip() if car_row else ""
+            m = re.search(r"(\d+)", raw_tid)
+            song_id = int(m.group(1)) if m else 0
+            liked_ok = False
+            if action in ("like_current", "like_and_cache_current"):
+                if song_id > 0:
+                    try:
+                        liked_ok = await netease_service.like_song(song_id, like=True)
+                    except Exception as exc:
+                        logger.warning("Voice like_song(%s) failed: %s", song_id, exc)
+            client_action = (
+                {"type": "cache_current"}
+                if action in ("cache_current", "like_and_cache_current")
+                else None
+            )
+            if action == "cache_current":
+                reply = "好的，正在把这首歌缓存到本地存储卡。"
+            elif action == "like_and_cache_current":
+                reply = (
+                    "好的，已把这首歌加入网易云喜欢，并开始缓存到本地。"
+                    if liked_ok
+                    else "好的，正在把这首歌缓存到本地，网易云收藏暂未成功。"
+                )
+            else:
+                if song_id <= 0:
+                    reply = "当前没有识别到正在播放的网易云歌曲。"
+                elif liked_ok:
+                    reply = "好的，已把这首歌加入你的网易云喜欢。"
+                else:
+                    reply = "收藏这首歌时出了点问题，请稍后再试。"
+            resp_obj: Dict[str, Any] = {
+                "ok": True,
+                "transcript": clean_text,
+                "intent": "control_music",
+                "reply_text": reply,
+                "tts_url": await _synthesize_chinese_tts(reply),
+                "candidates": [],
+            }
+            if client_action:
+                resp_obj["client_action"] = client_action
+            return resp_obj
+
         label_map = {
             "pause": "好的，已暂停音乐。",
             "resume": "好的，继续播放音乐。",
@@ -1154,20 +1254,13 @@ async def _handle_assistant_text(
         }
 
     if fn == "query_vehicle_status":
+        focus = str(args.get("focus") or "all").strip().lower()
         row = db.query(VehicleState).filter(VehicleState.device_id == device_id).first()
-        if not row:
+        today_km, today_trips = _query_today_trip_summary(db, device_id)
+        if not row and today_trips == 0:
             reply = "暂时还没有收到车辆的最新车况数据。"
         else:
-            bits = []
-            if row.fuel_level_percent is not None:
-                bits.append(f"剩余油量约百分之{round(row.fuel_level_percent)}")
-            if row.estimated_range_km is not None:
-                bits.append(f"预计还能行驶{round(row.estimated_range_km)}公里")
-            if row.coolant_temp is not None:
-                bits.append(f"水温{round(row.coolant_temp)}度")
-            if row.total_odometer_km is not None:
-                bits.append(f"总里程{round(row.total_odometer_km)}公里")
-            reply = "当前车况：" + "，".join(bits) + "。" if bits else "车辆在线，但暂无详细传感器数值。"
+            reply = _build_vehicle_status_reply(row, focus, today_km, today_trips)
         return {
             "ok": True,
             "transcript": clean_text,
@@ -1185,6 +1278,222 @@ async def _handle_assistant_text(
         "reply_text": reply,
         "tts_url": await _synthesize_chinese_tts(reply),
         "candidates": [],
+    }
+
+
+_JST = timezone(timedelta(hours=9))
+
+
+def _query_today_trip_summary(db: Session, device_id: str) -> Tuple[float, int]:
+    """Returns (total_distance_km, trip_count) for today in JST (UTC+9)."""
+    try:
+        now_jst = datetime.now(_JST)
+        start_jst = now_jst.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = start_jst.astimezone(timezone.utc)
+        rows = (
+            db.query(Trip.distance_km)
+            .filter(Trip.device_id == device_id, Trip.started_at >= start_utc)
+            .all()
+        )
+        total_km = sum(float(r[0] or 0.0) for r in rows)
+        return round(total_km, 1), len(rows)
+    except Exception as exc:
+        logger.warning("Today trip summary query failed: %s", exc)
+        return 0.0, 0
+
+
+def _extract_km_per_l(row: Optional[VehicleState]) -> Optional[float]:
+    if not row:
+        return None
+    if row.extra_json:
+        try:
+            extra = json.loads(row.extra_json)
+            if isinstance(extra, dict):
+                for key in ("avg_km_per_l", "km_per_l", "fuel_economy_km_l"):
+                    v = extra.get(key)
+                    if isinstance(v, (int, float)) and 3.0 <= v <= 60.0:
+                        return round(float(v), 1)
+        except Exception:
+            pass
+    if (
+        row.estimated_range_km is not None
+        and row.fuel_level_liters is not None
+        and row.fuel_level_liters >= 2.0
+    ):
+        est = row.estimated_range_km / row.fuel_level_liters
+        if 5.0 <= est <= 50.0:
+            return round(est, 1)
+    return None
+
+
+def _build_vehicle_status_reply(
+    row: Optional[VehicleState],
+    focus: str,
+    today_km: float,
+    today_trips: int,
+) -> str:
+    km_per_l = _extract_km_per_l(row)
+
+    if focus == "battery":
+        v = row.aux_12v_voltage if row else None
+        if v is None:
+            return "目前还没有读到 12 伏电瓶电压数据，请确认蓝牙 OBD 已连接。"
+        if v >= 12.4:
+            status = "非常健康"
+        elif v >= 12.0:
+            status = "略微偏低，建议多留意"
+        else:
+            status = "偏低，注意亏电风险"
+        return f"当前 12 伏电瓶电压是 {v:.2f} 伏，状态{status}。"
+
+    if focus == "fuel":
+        bits = []
+        if row and row.fuel_level_percent is not None:
+            bits.append(f"剩余油量约百分之{round(row.fuel_level_percent)}")
+        if row and row.fuel_level_liters is not None:
+            bits.append(f"约 {row.fuel_level_liters:.1f} 升")
+        if row and row.estimated_range_km is not None:
+            bits.append(f"预计还能行驶 {round(row.estimated_range_km)} 公里")
+        return "，".join(bits) + "。" if bits else "暂时还没有读到油量数据。"
+
+    if focus == "today_trips":
+        parts = []
+        if today_trips > 0:
+            parts.append(f"今天一共开了 {today_trips} 段行程，合计 {today_km:.1f} 公里")
+        else:
+            parts.append("今天还没有记录到行驶里程")
+        if km_per_l is not None:
+            l_per_100 = round(100.0 / km_per_l, 1)
+            parts.append(f"近期参考油耗约每升 {km_per_l:.1f} 公里，折合百公里 {l_per_100:.1f} 升")
+        return "，".join(parts) + "。"
+
+    if focus == "temp":
+        if row and row.coolant_temp is not None:
+            return f"当前发动机水温 {round(row.coolant_temp)} 度。"
+        return "暂时还没有读到水温数据。"
+
+    bits = []
+    if row and row.fuel_level_percent is not None:
+        bits.append(f"剩余油量百分之{round(row.fuel_level_percent)}")
+    if row and row.estimated_range_km is not None:
+        bits.append(f"续航约 {round(row.estimated_range_km)} 公里")
+    if row and row.aux_12v_voltage is not None:
+        bits.append(f"电瓶 {row.aux_12v_voltage:.1f} 伏")
+    if today_trips > 0:
+        bits.append(f"今天已行驶 {today_km:.1f} 公里")
+    if km_per_l is not None:
+        bits.append(f"参考油耗每升 {km_per_l:.1f} 公里")
+    if row and row.coolant_temp is not None:
+        bits.append(f"水温 {round(row.coolant_temp)} 度")
+    return "当前车况：" + "，".join(bits) + "。" if bits else "车辆在线，但暂无详细传感器数值。"
+
+
+def _wmo_weather_cn(code: Optional[int]) -> str:
+    if code is None:
+        return ""
+    if code == 0:
+        return "晴朗"
+    if code in (1, 2):
+        return "多云"
+    if code == 3:
+        return "阴天"
+    if code in (45, 48):
+        return "有雾"
+    if code in (51, 53, 55, 56, 57):
+        return "有毛毛雨"
+    if code in (61, 63, 65, 66, 67, 80, 81, 82):
+        return "有雨"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "有雪"
+    if code in (95, 96, 99):
+        return "有雷阵雨"
+    return ""
+
+
+async def _fetch_brief_weather(lat: Optional[float], lng: Optional[float]) -> Optional[str]:
+    if lat is None or lng is None:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=3.5) as client:
+            resp = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": round(lat, 4),
+                    "longitude": round(lng, 4),
+                    "current": "temperature_2m,weather_code",
+                    "daily": "precipitation_probability_max",
+                    "forecast_days": 1,
+                    "timezone": "Asia/Tokyo",
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            cur = data.get("current") or {}
+            temp = cur.get("temperature_2m")
+            wcode = cur.get("weather_code")
+            desc = _wmo_weather_cn(int(wcode)) if isinstance(wcode, (int, float)) else ""
+            daily = data.get("daily") or {}
+            probs = daily.get("precipitation_probability_max") or []
+            rain_prob = int(probs[0]) if probs and isinstance(probs[0], (int, float)) else None
+
+            segs = []
+            if desc and isinstance(temp, (int, float)):
+                segs.append(f"车外{desc}，气温 {round(temp)} 度")
+            elif isinstance(temp, (int, float)):
+                segs.append(f"车外气温 {round(temp)} 度")
+            if rain_prob is not None and rain_prob >= 40:
+                segs.append(f"今天降水概率百分之{rain_prob}，注意雨天路滑")
+            return "，".join(segs) if segs else None
+    except Exception as exc:
+        logger.debug("Open-Meteo weather fetch skipped: %s", exc)
+        return None
+
+
+@router.post("/briefing")
+async def assistant_startup_briefing(
+    req: AssistantBriefingRequest,
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_car_or_admin),
+) -> Dict[str, Any]:
+    device_id = resolve_car_device_id(req.device_id or user.device_id)
+    now_jst = datetime.now(_JST)
+    hour = now_jst.hour
+    if 5 <= hour < 11:
+        greeting = "早上好"
+    elif 11 <= hour < 14:
+        greeting = "中午好"
+    elif 14 <= hour < 18:
+        greeting = "下午好"
+    else:
+        greeting = "晚上好"
+
+    car_lat, car_lng = _resolve_car_gps(db, device_id, req.lat, req.lng)
+    row = db.query(VehicleState).filter(VehicleState.device_id == device_id).first()
+    weather_txt = await _fetch_brief_weather(car_lat, car_lng)
+
+    parts = [greeting]
+    if row and row.fuel_level_percent is not None:
+        fuel_pct = round(row.fuel_level_percent)
+        if row.estimated_range_km is not None:
+            parts.append(f"油量百分之{fuel_pct}，预计续航 {round(row.estimated_range_km)} 公里")
+        else:
+            parts.append(f"油量百分之{fuel_pct}")
+        if fuel_pct <= 20:
+            parts.append("油量偏低记得顺路加油")
+    if row and row.aux_12v_voltage is not None and row.aux_12v_voltage < 12.2:
+        parts.append(f"12伏电瓶电压 {row.aux_12v_voltage:.1f} 伏略偏低")
+    if weather_txt:
+        parts.append(weather_txt)
+    parts.append("祝你一路顺风")
+
+    reply = "，".join(parts) + "。"
+    tts_url = await _synthesize_chinese_tts(reply)
+    return {
+        "ok": True,
+        "intent": "startup_briefing",
+        "reply_text": reply,
+        "tts_url": tts_url,
     }
 
 

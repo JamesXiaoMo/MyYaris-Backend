@@ -759,6 +759,19 @@ class NeteaseService:
             raise NeteaseUpstreamError("Upstream likelist returned an unexpected body", status_code=502)
         return ids
 
+    async def like_song(self, song_id: int, like: bool = True) -> bool:
+        """Add or remove a song from the logged-in NetEase user's favorite list."""
+        data = await self._upstream_json(
+            "/like",
+            {"id": int(song_id), "like": "true" if like else "false"},
+            timeout=10.0,
+            what="like",
+        )
+        ok = int(data.get("code") or 0) == 200
+        if ok:
+            self.invalidate_favorite_cache()
+        return ok
+
     async def fetch_favorite_playlist_detail(self, playlist_id: int) -> Dict[str, Any]:
         """One ordered fetch: ids, metadata and privileges come from a single /playlist/detail call.
 
