@@ -90,24 +90,93 @@ def _store_tts_clip(mp3_bytes: bytes) -> str:
     return f"/api/v1/assistant/tts/{clip_id}.mp3"
 
 
+_TTS_TEXT_CACHE: "OrderedDict[str, Tuple[float, str]]" = OrderedDict()
+_LOCAL_TTS_URL = (os.getenv("LOCAL_TTS_URL") or "http://127.0.0.1:8012/tts").strip()
+
+
+def _normalize_spoken_chinese(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # Convert common Japanese road/facility terms into natural spoken Chinese
+    replacements = [
+        ("ランプ", "匝道口"),
+        ("インター", "高速口"),
+        ("サービスエリア", "服务区"),
+        ("パーキングエリア", "停车区"),
+        ("パーキング", "停车区"),
+        ("道の駅", "公路休息站"),
+        ("ジャンクション", "立交桥"),
+        ("JCT", "立交"),
+        ("IC", "高速口"),
+        ("ＩＣ", "高速口"),
+        ("SA", "服务区"),
+        ("PA", "停车区"),
+        ("方面", "方向"),
+        ("km/h", "公里每小时"),
+        ("km", "公里"),
+    ]
+    for src, dst in replacements:
+        s = s.replace(src, dst)
+    # Remove markdown, brackets, and stray Japanese kana that confuse Chinese TTS
+    s = re.sub(r"[*#`~\[\]()（）<>]", "", s)
+    s = re.sub(r"[\u3040-\u309F\u30A0-\u30FF]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:260]
+
+
 async def _synthesize_chinese_tts(text: str) -> Optional[str]:
-    clean = re.sub(r"[*#`~\[\]()（）<>]", "", (text or "")).strip()
+    clean = _normalize_spoken_chinese(text)
     if not clean:
         return None
-    if len(clean) > 260:
-        clean = clean[:260]
+
+    # 0. Fast in-memory text cache hit (0ms for repeated lane/turn phrases)
+    now = time.time()
+    cached = _TTS_TEXT_CACHE.get(clean)
+    if cached and (now - cached[0]) < _TTS_TTL_SECONDS:
+        clip_id = cached[1].rsplit("/", 1)[-1].replace(".mp3", "")
+        if clip_id in _TTS_CACHE:
+            return cached[1]
+
+    # 1. Primary: Local R9000P GPU neural Chinese TTS (Kokoro-82M-v1.1-zh)
+    if _LOCAL_TTS_URL:
+        try:
+            async with httpx.AsyncClient(timeout=4.5) as client:
+                resp = await client.post(
+                    _LOCAL_TTS_URL,
+                    json={"text": clean},
+                )
+                if resp.status_code == 200 and resp.content and len(resp.content) > 512:
+                    url = _store_tts_clip(resp.content)
+                    _TTS_TEXT_CACHE[clean] = (now, url)
+                    while len(_TTS_TEXT_CACHE) > 64:
+                        _TTS_TEXT_CACHE.popitem(last=False)
+                    return url
+        except Exception as exc:
+            logger.debug("Local GPU TTS unavailable, falling back to edge-tts: %s", exc)
+
+    # 2. Fallback: edge-tts with strict 6s timeout & natural Xiaoyi voice
     try:
         import edge_tts
 
-        voice = settings.ASSISTANT_TTS_VOICE or "zh-CN-XiaoxiaoNeural"
-        communicate = edge_tts.Communicate(clean, voice=voice, rate="+6%")
-        chunks: List[bytes] = []
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio" and chunk.get("data"):
-                chunks.append(chunk["data"])
-        if not chunks:
+        voice = settings.ASSISTANT_TTS_VOICE or "zh-CN-XiaoyiNeural"
+
+        async def _run_edge() -> bytes:
+            communicate = edge_tts.Communicate(clean, voice=voice, rate="+0%")
+            chunks: List[bytes] = []
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio" and chunk.get("data"):
+                    chunks.append(chunk["data"])
+            return b"".join(chunks)
+
+        audio_bytes = await asyncio.wait_for(_run_edge(), timeout=6.0)
+        if not audio_bytes:
             return None
-        return _store_tts_clip(b"".join(chunks))
+        url = _store_tts_clip(audio_bytes)
+        _TTS_TEXT_CACHE[clean] = (now, url)
+        while len(_TTS_TEXT_CACHE) > 64:
+            _TTS_TEXT_CACHE.popitem(last=False)
+        return url
     except Exception as exc:
         logger.warning("Edge-TTS synthesis failed: %s", exc)
         return None
