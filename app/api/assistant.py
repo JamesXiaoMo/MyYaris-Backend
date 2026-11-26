@@ -21,7 +21,7 @@ from app.api.control import process_and_dispatch_music_command
 from app.api.dj import _sync_dj_queue_to_car, dj_store
 from app.config import settings
 from app.repositories.database import get_db
-from app.repositories.models import VehicleState
+from app.repositories.models import Favorite, FavoriteFolder, VehicleState
 from app.schemas.auth import AuthenticatedUser
 from app.schemas.control import MusicCommandParams, MusicCommandRequest
 from app.services.control_service import get_car_status_by_id, music_queue_snapshot_manager
@@ -718,10 +718,104 @@ def _format_navitime_prompt_hint(navitime_context: Optional[Dict[str, Any]]) -> 
     return "\n当前 CAR NAVITIME 实时导航状态：\n" + "\n".join(parts)
 
 
+def _norm_place_text(raw: str) -> str:
+    return re.sub(r"[\s\-_·・()（）\[\]【】.,，。'\"`]+", "", (raw or "").strip().lower())
+
+
+def _list_saved_favorite_names(db: Session, limit: int = 35) -> List[str]:
+    try:
+        rows = (
+            db.query(Favorite.name)
+            .filter(Favorite.name.isnot(None))
+            .order_by(Favorite.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip()]
+    except Exception:
+        return []
+
+
+def _search_saved_favorites(
+    db: Session,
+    query: str,
+    car_lat: Optional[float],
+    car_lng: Optional[float],
+) -> List[Dict[str, Any]]:
+    q_norm = _norm_place_text(query)
+    if not q_norm or len(q_norm) < 1:
+        return []
+    try:
+        rows = (
+            db.query(Favorite, FavoriteFolder.name)
+            .outerjoin(FavoriteFolder, Favorite.folder_id == FavoriteFolder.id)
+            .all()
+        )
+    except Exception as exc:
+        logger.warning("Saved favorites query failed: %s", exc)
+        return []
+
+    # Extract meaningful alphanumeric & CJK chunks for fuzzy matching
+    tokens = [
+        t for t in re.findall(r"[a-z0-9]{2,}|[\u4e00-\u9fff\u3040-\u30ff]{2,}", query.lower())
+        if t
+    ]
+
+    matches: List[Dict[str, Any]] = []
+    for fav, folder_name in rows:
+        name = (fav.name or "").strip()
+        addr = (fav.address or "").strip()
+        folder = (folder_name or "").strip()
+        if not name and not addr:
+            continue
+        name_norm = _norm_place_text(name)
+        hay_norm = _norm_place_text(f"{name} {addr} {folder}")
+
+        score = 0
+        if name_norm and q_norm == name_norm:
+            score = 100
+        elif name_norm and (q_norm in name_norm or (len(name_norm) >= 2 and name_norm in q_norm)):
+            score = 85
+        elif q_norm in hay_norm:
+            score = 75
+        elif tokens:
+            hit_name = sum(1 for t in tokens if t in name_norm)
+            hit_hay = sum(1 for t in tokens if t in hay_norm)
+            if hit_name == len(tokens):
+                score = 80
+            elif hit_hay == len(tokens):
+                score = 68
+            elif hit_name > 0 and hit_name >= (len(tokens) + 1) // 2:
+                score = 55
+
+        if score <= 0:
+            continue
+
+        dist_km: Optional[float] = None
+        if car_lat is not None and car_lng is not None:
+            dist_km = round(_haversine_km(car_lat, car_lng, fav.latitude, fav.longitude), 1)
+        matches.append(
+            {
+                "name": name or addr,
+                "address": addr or name,
+                "lat": float(fav.latitude),
+                "lng": float(fav.longitude),
+                "rating": None,
+                "distance_km": dist_km,
+                "from_favorites": True,
+                "_score": score,
+            }
+        )
+
+    matches.sort(key=lambda m: (-m["_score"], m["distance_km"] if m["distance_km"] is not None else 99999.0))
+    return matches[:5]
+
+
 async def _call_deepseek(
     user_text: str,
     pending_places: Optional[List[Dict[str, Any]]],
     navitime_context: Optional[Dict[str, Any]] = None,
+    saved_place_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     api_key = (settings.DEEPSEEK_API_KEY or "").strip()
     if not api_key:
@@ -735,17 +829,22 @@ async def _call_deepseek(
         ]
         pending_hint = "\n当前待用户选择的候选地点：\n" + "\n".join(lines)
 
+    fav_hint = ""
+    if saved_place_names:
+        fav_hint = "\n用户已保存的常用收藏地址（用户提到这些地点时请直接把最接近的收藏名作为 search_place_and_navigate 的 query，且 is_fuzzy 设为 false）：\n" + "、".join(saved_place_names[:35])
+
     nav_hint = _format_navitime_prompt_hint(navitime_context)
 
     system_prompt = (
         "你是丰田 Yaris Hybrid 车载 AI 语音助手。"
         "你必须严格遵守以下规则：\n"
         "1. 所有回复必须使用简短、自然、口语化的纯中文（1~2句话），禁止使用 Markdown、表情符号或多余寒暄。\n"
-        "2. 用户想找地点或导航时，调用 search_place_and_navigate；注意把模糊搜索（附近拉面店、加油站、咖啡厅、便利店等）的 is_fuzzy 设为 true，明确地标设为 false。\n"
+        "2. 用户想找地点或导航时，调用 search_place_and_navigate；注意把模糊搜索（附近拉面店、加油站、咖啡厅、便利店等）的 is_fuzzy 设为 true，明确地标或用户收藏地址设为 false。\n"
         "3. 用户想听歌、换歌、找氛围歌单时，调用 play_music 或 control_music。\n"
         "4. 用户在候选列表中选择第几个时，调用 select_place_candidate。\n"
         "5. 如果用户询问前方走哪条车道、前面堵不堵、下个路口、还有多久到等导航问题，直接结合下方的 CAR NAVITIME 实时导航状态用自然中文回答，不要调用导航搜索工具。"
         + pending_hint
+        + fav_hint
         + nav_hint
     )
 
@@ -832,7 +931,13 @@ async def _handle_assistant_text(
             }
 
     # Ask DeepSeek for tool call or direct Chinese response
-    ds_resp = await _call_deepseek(clean_text, pending, navitime_context=navitime_context)
+    saved_names = _list_saved_favorite_names(db)
+    ds_resp = await _call_deepseek(
+        clean_text,
+        pending,
+        navitime_context=navitime_context,
+        saved_place_names=saved_names,
+    )
     choice = (ds_resp.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     tool_calls = msg.get("tool_calls") or []
@@ -947,6 +1052,55 @@ async def _handle_assistant_text(
         query = str(args.get("query") or clean_text).strip()
         is_fuzzy = bool(args.get("is_fuzzy", False))
         radius = int(args.get("radius_meters") or 5000)
+
+        # 1. Search user's saved favorite addresses FIRST
+        fav_matches = _search_saved_favorites(db, query, car_lat, car_lng)
+        if fav_matches:
+            top_score = fav_matches[0]["_score"]
+            clear_winner = (
+                len(fav_matches) == 1
+                or (top_score >= 80 and fav_matches[0]["_score"] > fav_matches[1]["_score"])
+                or not is_fuzzy
+            )
+            if clear_winner:
+                chosen = {k: v for k, v in fav_matches[0].items() if k != "_score"}
+                _PENDING_PLACES.pop(device_id, None)
+                nav_data = await _dispatch_navigation_to_car(db, device_id, chosen)
+                dist_txt = (
+                    f"，距离{chosen['distance_km']}公里"
+                    if chosen.get("distance_km") is not None
+                    else ""
+                )
+                reply = f"在你的收藏地址里找到了{chosen['name']}{dist_txt}，已为你发送导航。"
+                return {
+                    "ok": True,
+                    "transcript": clean_text,
+                    "intent": "navigate",
+                    "reply_text": reply,
+                    "tts_url": await _synthesize_chinese_tts(reply),
+                    "navigation": nav_data,
+                    "candidates": [],
+                }
+            top_favs = [{k: v for k, v in m.items() if k != "_score"} for m in fav_matches[:3]]
+            _PENDING_PLACES[device_id] = {"ts": time.time(), "places": top_favs}
+            ordinals = ["第一个", "第二个", "第三个"]
+            parts = []
+            for i, p in enumerate(top_favs):
+                seg = f"{ordinals[i]}{p['name']}"
+                if p.get("distance_km") is not None:
+                    seg += f"，距离{p['distance_km']}公里"
+                parts.append(seg)
+            reply = f"在你的收藏地址里找到{len(top_favs)}个地点：" + "；".join(parts) + "。你想去第几个？"
+            return {
+                "ok": True,
+                "transcript": clean_text,
+                "intent": "navigate_candidates",
+                "reply_text": reply,
+                "tts_url": await _synthesize_chinese_tts(reply),
+                "candidates": top_favs,
+            }
+
+        # 2. Fallback to Google Places if not found in saved addresses
         places = await _search_google_places(
             query=query, lat=car_lat, lng=car_lng, radius_meters=radius, max_results=3
         )
