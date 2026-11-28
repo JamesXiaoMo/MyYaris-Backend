@@ -565,15 +565,23 @@ async def _dispatch_music_search_and_play(
 
 
 def _check_pending_selection_shortcut(text: str) -> Optional[int]:
-    """Fast local parser for '去第一家 / 第二个 / 选3 / 取消' when candidates exist."""
-    t = text.strip()
-    if any(k in t for k in ("取消", "算了", "不去", "不用了")):
+    """Fast local parser for explicit '去第一家 / 第二个 / 选3 / 取消' when candidates exist."""
+    t = re.sub(r"[\s，。！？,.!?]+", "", (text or "").strip())
+    if not t:
+        return None
+    if re.fullmatch(r"(?:取消|算了|不去|不用了|不要了|都不去)", t):
         return -1
-    if re.search(r"(第?一|第?1|第一个|第一家|首个)", t):
+    if re.fullmatch(r"(?:去|选|要|到|导航到?)?首个(?:吧|呢)?", t):
         return 1
-    if re.search(r"(第?二|第?2|第二个|第二家)", t):
+    m = re.fullmatch(r"(?:去|选|要|到|导航到?)?(?:第)?([一二三123])(?:个|家|号)?(?:吧|呢|啊)?", t)
+    if not m:
+        return None
+    tok = m.group(1)
+    if tok in ("一", "1"):
+        return 1
+    if tok in ("二", "2"):
         return 2
-    if re.search(r"(第?三|第?3|第三个|第三家)", t):
+    if tok in ("三", "3"):
         return 3
     return None
 
@@ -1123,7 +1131,10 @@ async def _handle_assistant_text(
         }
 
     if fn == "select_place_candidate":
-        idx = int(args.get("index") or 0)
+        try:
+            idx = int(args.get("index") or 0)
+        except (TypeError, ValueError):
+            idx = 0
         if pending and 1 <= idx <= len(pending):
             chosen = pending[idx - 1]
             _PENDING_PLACES.pop(device_id, None)
@@ -1151,16 +1162,19 @@ async def _handle_assistant_text(
     if fn == "search_place_and_navigate":
         query = str(args.get("query") or clean_text).strip()
         is_fuzzy = bool(args.get("is_fuzzy", False))
-        radius = int(args.get("radius_meters") or 5000)
+        try:
+            radius = int(args.get("radius_meters") or 5000)
+        except (TypeError, ValueError):
+            radius = 5000
 
         # 1. Search user's saved favorite addresses FIRST
         fav_matches = _search_saved_favorites(db, query, car_lat, car_lng)
-        if fav_matches:
+        if fav_matches and fav_matches[0]["_score"] >= 70:
             top_score = fav_matches[0]["_score"]
             clear_winner = (
                 len(fav_matches) == 1
                 or (top_score >= 80 and fav_matches[0]["_score"] > fav_matches[1]["_score"])
-                or not is_fuzzy
+                or (not is_fuzzy and top_score >= 75)
             )
             if clear_winner:
                 chosen = {k: v for k, v in fav_matches[0].items() if k != "_score"}

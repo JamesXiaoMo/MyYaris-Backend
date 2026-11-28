@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -941,7 +942,7 @@ class CacheManager:
         return self.cache_dir / f"netease_{song_id}.{ext}"
 
     def get_temp_path(self, song_id: int) -> Path:
-        return self.cache_dir / f"netease_{song_id}.tmp"
+        return self.cache_dir / f"netease_{song_id}_{secrets.token_hex(4)}.tmp"
 
     async def _get_song_lock(self, song_id: int) -> asyncio.Lock:
         async with self._meta_lock:
@@ -958,52 +959,70 @@ class CacheManager:
     ) -> AsyncGenerator[bytes, None]:
         """
         Streams audio chunks directly to client while simultaneously saving to disk.
-        Atomic move and database indexing occur once stream is fully buffered.
+        Uses a per-song lock and unique temp file so concurrent streams never corrupt cache.
         """
-        tmp_path = self.get_temp_path(song_id)
-        final_path = self.get_target_path(song_id, metadata.get("type", "mp3"))
-
-        try:
+        lock = await self._get_song_lock(song_id)
+        if lock.locked():
+            # Another request is already caching this song — pass through without writing to disk
             async with httpx.AsyncClient(timeout=30.0) as client:
                 async with client.stream("GET", remote_url) as resp:
                     resp.raise_for_status()
-                    total_bytes = 0
                     first_chunk = True
-                    with open(tmp_path, "wb") as f:
-                        async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            if not chunk:
-                                continue
-                            if first_chunk:
-                                if not is_valid_audio_magic(chunk):
-                                    logger.error(f"Upstream stream for song {song_id} failed audio magic check: {chunk[:32]!r}")
-                                    raise ValueError(f"Upstream returned non-audio stream for song {song_id} (error/HTML masquerade)")
-                                first_chunk = False
-                            f.write(chunk)
-                            total_bytes += len(chunk)
-                            if total_bytes > self.MAX_CACHE_TRACK_BYTES:
-                                raise ValueError(f"Upstream stream exceeded max track size for song {song_id}")
-                            yield chunk
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        if first_chunk:
+                            if not is_valid_audio_magic(chunk):
+                                raise ValueError(f"Upstream returned non-audio stream for song {song_id}")
+                            first_chunk = False
+                        yield chunk
+            return
 
-            # Download finished successfully - move to final destination
-            if total_bytes > 0:
-                os.replace(tmp_path, final_path)
-                logger.info(f"Successfully cached Netease song {song_id} ({total_bytes} bytes) -> {final_path}")
+        async with lock:
+            tmp_path = self.get_temp_path(song_id)
+            final_path = self.get_target_path(song_id, metadata.get("type", "mp3"))
 
-                # Register in SQLite database
-                db = db_factory()
-                try:
-                    self._register_cached_track(db, song_id, str(final_path), total_bytes, metadata)
-                    self.enforce_lru_quota(db)
-                finally:
-                    db.close()
-        except Exception as e:
-            logger.error(f"Error during tee streaming for song {song_id}: {type(e).__name__}")
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-            raise
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    async with client.stream("GET", remote_url) as resp:
+                        resp.raise_for_status()
+                        total_bytes = 0
+                        first_chunk = True
+                        with open(tmp_path, "wb") as f:
+                            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                if not chunk:
+                                    continue
+                                if first_chunk:
+                                    if not is_valid_audio_magic(chunk):
+                                        logger.error(f"Upstream stream for song {song_id} failed audio magic check: {chunk[:32]!r}")
+                                        raise ValueError(f"Upstream returned non-audio stream for song {song_id} (error/HTML masquerade)")
+                                    first_chunk = False
+                                f.write(chunk)
+                                total_bytes += len(chunk)
+                                if total_bytes > self.MAX_CACHE_TRACK_BYTES:
+                                    raise ValueError(f"Upstream stream exceeded max track size for song {song_id}")
+                                yield chunk
+
+                # Download finished successfully - move to final destination
+                if total_bytes > 0:
+                    os.replace(tmp_path, final_path)
+                    logger.info(f"Successfully cached Netease song {song_id} ({total_bytes} bytes) -> {final_path}")
+
+                    # Register in SQLite database
+                    db = db_factory()
+                    try:
+                        self._register_cached_track(db, song_id, str(final_path), total_bytes, metadata)
+                        self.enforce_lru_quota(db)
+                    finally:
+                        db.close()
+            except Exception as e:
+                logger.error(f"Error during tee streaming for song {song_id}: {type(e).__name__}")
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                raise
 
     async def cache_track_background(
         self,

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -430,3 +430,85 @@ def get_vehicle_telemetry_history(
         for r in rows
     ]
     return {"device_id": norm_device, "count": len(items), "items": items}
+
+
+@router.get("/fuel-history")
+def get_vehicle_fuel_history(
+    device_id: Optional[str] = Query(None),
+    days: int = Query(30, ge=1, le=90),
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Returns median-smoothed fuel level trend over the past [days] days (default 30),
+    filtering out raw tank-slosh glitches and tagging refueling jumps."""
+    from datetime import timedelta
+    from statistics import median
+
+    _require_vehicle_read_access(user)
+    norm_device = resolve_car_device_id(device_id, user.device_id)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    rows = (
+        db.query(
+            ObdTelemetryLog.recorded_at,
+            ObdTelemetryLog.fuel_level_liters,
+            ObdTelemetryLog.fuel_level_percent,
+        )
+        .filter(
+            ObdTelemetryLog.device_id == norm_device,
+            ObdTelemetryLog.recorded_at >= since,
+            ObdTelemetryLog.fuel_level_liters.isnot(None),
+        )
+        .order_by(ObdTelemetryLog.recorded_at.asc())
+        .all()
+    )
+
+    # Bucket into 2-hour windows (JST) and take the median of each bucket to eliminate float slosh
+    jst = timezone(timedelta(hours=9))
+    buckets: Dict[str, List[Tuple[datetime, float, float]]] = {}
+    for rec_at, liters, pct in rows:
+        if rec_at is None or liters is None or liters < 0 or liters > 45.0:
+            continue
+        dt_utc = rec_at if rec_at.tzinfo is not None else rec_at.replace(tzinfo=timezone.utc)
+        dt_jst = dt_utc.astimezone(jst)
+        b_hour = (dt_jst.hour // 2) * 2
+        b_key = f"{dt_jst.year:04d}-{dt_jst.month:02d}-{dt_jst.day:02d}T{b_hour:02d}"
+        eff_pct = (
+            float(pct)
+            if pct is not None and 0.0 <= pct <= 100.0
+            else round(max(0.0, min(100.0, (float(liters) / YARIS_TANK_LITERS) * 100.0)), 1)
+        )
+        buckets.setdefault(b_key, []).append((dt_utc, float(liters), eff_pct))
+
+    points: List[Dict[str, Any]] = []
+    prev_liters: Optional[float] = None
+    for b_key in sorted(buckets.keys()):
+        samples = buckets[b_key]
+        med_liters = round(median(s[1] for s in samples), 2)
+        med_pct = round(median(s[2] for s in samples), 1)
+        mid_ts = samples[len(samples) // 2][0]
+
+        # Reject isolated single-sample downward glitch (>6L drop) if single sample in bucket
+        if len(samples) == 1 and prev_liters is not None and (prev_liters - med_liters) > 6.0:
+            continue
+
+        delta_l = round(med_liters - prev_liters, 2) if prev_liters is not None else 0.0
+        refueled = prev_liters is not None and delta_l >= 4.0
+        points.append(
+            {
+                "recorded_at": _iso_utc(mid_ts),
+                "fuel_level_liters": med_liters,
+                "fuel_level_percent": med_pct,
+                "sample_count": len(samples),
+                "refueled": refueled,
+                "delta_liters": delta_l,
+            }
+        )
+        prev_liters = med_liters
+
+    return {
+        "device_id": norm_device,
+        "days": days,
+        "count": len(points),
+        "items": points,
+    }
